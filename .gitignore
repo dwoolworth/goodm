@@ -1,0 +1,6 @@
+.env
+*.exe
+*.test
+*.out
+.DS_Store
+/goodm
