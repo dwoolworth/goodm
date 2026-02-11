@@ -1,5 +1,11 @@
 # goodm
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/dwoolworth/goodm.svg)](https://pkg.go.dev/github.com/dwoolworth/goodm)
+[![Go Report Card](https://goreportcard.com/badge/github.com/dwoolworth/goodm)](https://goreportcard.com/report/github.com/dwoolworth/goodm)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![Go Version](https://img.shields.io/badge/Go-1.19+-00ADD8?logo=go&logoColor=white)](https://go.dev/)
+[![MongoDB](https://img.shields.io/badge/MongoDB-4.0+-47A248?logo=mongodb&logoColor=white)](https://www.mongodb.com/)
+
 A schema-driven ODM for MongoDB in Go. Define your models as Go structs, and goodm handles validation, hooks, indexes, immutability, references, middleware, aggregation, bulk operations, and transactions.
 
 ```go
@@ -15,6 +21,22 @@ func init() {
     goodm.Register(&User{}, "users")
 }
 ```
+
+## Why goodm?
+
+Go has a strong MongoDB driver, but no mature ODM that treats Go structs as the schema contract. The ecosystem gap is real:
+
+- **Prisma dropped Go support.** If you were looking to Prisma for structured data modeling in Go, that door is closed.
+- **The official mongo-driver is low-level.** You get `bson.D` and `Collection.InsertOne` — everything else (validation, hooks, timestamps, immutability, index management) is left to you.
+- **Mongoose proved the pattern.** Node.js developers have had schema-as-code with lifecycle hooks, population, and middleware for over a decade. Go deserves the same.
+
+goodm fills that gap. Your Go struct *is* the schema. Tags declare constraints, indexes, and references. The ODM enforces them on every write — no separate schema files, no code generation step, no runtime surprises.
+
+**What you get:**
+- **One source of truth.** The struct definition *is* the database contract. Add `goodm:"unique,required"` and the index exists, the validation runs, the error is typed.
+- **Full write lifecycle.** Create and Update automatically handle ID generation, timestamps, hook execution, validation, and immutable field enforcement. You don't wire any of it.
+- **Escape hatches.** `UpdateOne`, `DeleteOne`, `UpdateMany`, `DeleteMany` bypass the ODM and hit MongoDB directly when you need raw performance.
+- **Schema-aware CLI.** `goodm discover` reverse-engineers an existing database into Go structs. `goodm migrate` diffs your structs against a live database and syncs indexes.
 
 ## Install
 
@@ -184,10 +206,35 @@ Requires a MongoDB replica set. All goodm operations inside the callback partici
 
 ## Requirements
 
-- Go 1.21+
+- Go 1.19+
 - MongoDB 4.0+ (6.0+ recommended)
 - Replica set required for transactions
 
+## Contributing
+
+Contributions are welcome! Here's how to get started:
+
+1. **Fork** the repository
+2. **Clone** your fork: `git clone https://github.com/<you>/goodm.git`
+3. **Create a branch**: `git checkout -b my-feature`
+4. **Make your changes** and add tests
+5. **Run tests**: `go test ./...` (requires a running MongoDB instance)
+6. **Commit**: `git commit -m "Add my feature"`
+7. **Push**: `git push origin my-feature`
+8. **Open a Pull Request** against `main`
+
+### Guidelines
+
+- Follow existing code style and patterns
+- Add tests for new features — integration tests use a local MongoDB
+- Keep PRs focused on a single change
+- Update documentation in `docs/` if you add or change behavior
+- Run `go vet ./...` before submitting
+
+### Reporting Issues
+
+Found a bug or have a feature request? [Open an issue](https://github.com/dwoolworth/goodm/issues) with a clear description and, if applicable, steps to reproduce.
+
 ## License
 
-MIT
+[MIT](LICENSE)
