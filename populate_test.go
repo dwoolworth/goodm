@@ -101,6 +101,96 @@ func TestPopulate_InvalidField(t *testing.T) {
 	}
 }
 
+func TestBatchPopulate_Integration(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	// Create two profiles
+	p1 := &testProfile{Bio: "Bio one"}
+	p2 := &testProfile{Bio: "Bio two"}
+	if err := Create(ctx, p1); err != nil {
+		t.Fatalf("create p1: %v", err)
+	}
+	if err := Create(ctx, p2); err != nil {
+		t.Fatalf("create p2: %v", err)
+	}
+
+	// Create users referencing them
+	users := []testUser{
+		{Email: "a@test.com", Name: "A", Age: 20, Role: "user", ProfileID: p1.ID},
+		{Email: "b@test.com", Name: "B", Age: 21, Role: "user", ProfileID: p2.ID},
+		{Email: "c@test.com", Name: "C", Age: 22, Role: "user", ProfileID: p1.ID}, // duplicate ref
+	}
+	for i := range users {
+		if err := Create(ctx, &users[i]); err != nil {
+			t.Fatalf("create user %d: %v", i, err)
+		}
+	}
+
+	// BatchPopulate profiles
+	var profiles []testProfile
+	if err := BatchPopulate(ctx, users, "profile", &profiles); err != nil {
+		t.Fatalf("batch populate: %v", err)
+	}
+
+	if len(profiles) != 2 {
+		t.Fatalf("expected 2 profiles, got %d", len(profiles))
+	}
+
+	bios := map[string]bool{}
+	for _, p := range profiles {
+		bios[p.Bio] = true
+	}
+	if !bios["Bio one"] || !bios["Bio two"] {
+		t.Fatalf("unexpected profiles: %v", profiles)
+	}
+}
+
+func TestBatchPopulate_EmptySlice(t *testing.T) {
+	registerTestModels()
+	defer unregisterTestModels()
+
+	var profiles []testProfile
+	if err := BatchPopulate(context.Background(), []testUser{}, "profile", &profiles); err != nil {
+		t.Fatalf("batch populate empty slice should not error: %v", err)
+	}
+}
+
+func TestBatchPopulate_NoRefTag(t *testing.T) {
+	registerTestModels()
+	defer unregisterTestModels()
+
+	users := []testUser{{Email: "a@test.com", Name: "A", Age: 20, Role: "user"}}
+	var profiles []testProfile
+	err := BatchPopulate(context.Background(), users, "email", &profiles)
+	if err == nil {
+		t.Fatal("expected error for field without ref tag")
+	}
+}
+
+func TestBatchPopulate_AllZeroRefs(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	users := []testUser{
+		{Email: "a@test.com", Name: "A", Age: 20, Role: "user"},
+		{Email: "b@test.com", Name: "B", Age: 21, Role: "user"},
+	}
+	for i := range users {
+		if err := Create(ctx, &users[i]); err != nil {
+			t.Fatalf("create user %d: %v", i, err)
+		}
+	}
+
+	var profiles []testProfile
+	if err := BatchPopulate(ctx, users, "profile", &profiles); err != nil {
+		t.Fatalf("batch populate all-zero refs should not error: %v", err)
+	}
+	if len(profiles) != 0 {
+		t.Fatalf("expected 0 profiles, got %d", len(profiles))
+	}
+}
+
 func TestPopulate_DanglingRef(t *testing.T) {
 	ctx, _, cleanup := setupTestDB(t)
 	defer cleanup()

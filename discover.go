@@ -124,7 +124,7 @@ func sampleDocuments(ctx context.Context, coll *mongo.Collection, sampleSize int
 	if err != nil {
 		return nil, fmt.Errorf("failed to sample documents: %w", err)
 	}
-	defer cursor.Close(ctx)
+	defer func() { _ = cursor.Close(ctx) }()
 
 	trackers := make(map[string]*fieldTracker) // bsonName → tracker
 	fieldOrder := []string{}                   // preserve insertion order
@@ -173,7 +173,7 @@ func detectIndexes(ctx context.Context, coll *mongo.Collection) ([]DiscoveredInd
 	if err != nil {
 		return nil, fmt.Errorf("failed to list indexes: %w", err)
 	}
-	defer cursor.Close(ctx)
+	defer func() { _ = cursor.Close(ctx) }()
 
 	var indexes []DiscoveredIndex
 	for cursor.Next(ctx) {
@@ -209,7 +209,7 @@ func detectIndexes(ctx context.Context, coll *mongo.Collection) ([]DiscoveredInd
 
 // inferGoType maps a BSON runtime value to a Go type string.
 func inferGoType(v interface{}) string {
-	switch v.(type) {
+	switch v := v.(type) {
 	case string:
 		return "string"
 	case int32:
@@ -227,7 +227,7 @@ func inferGoType(v interface{}) string {
 	case bson.D:
 		return "bson.M"
 	case bson.A:
-		return inferArrayType(v.(bson.A))
+		return inferArrayType(v)
 	case []byte:
 		return "[]byte"
 	case bson.Decimal128:
@@ -235,6 +235,7 @@ func inferGoType(v interface{}) string {
 	case nil:
 		return "null"
 	default:
+		_ = v // used by type switch
 		return "interface{}"
 	}
 }

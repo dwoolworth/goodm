@@ -41,7 +41,7 @@ func Validate(model interface{}, schema *Schema) []ValidationError {
 
 		// Enum: value must be in the allowed set
 		if len(fs.Enum) > 0 && !fv.IsZero() {
-			strVal := fmt.Sprintf("%v", fv.Interface())
+			strVal := stringValue(fv)
 			found := false
 			for _, allowed := range fs.Enum {
 				if strVal == allowed {
@@ -57,9 +57,16 @@ func Validate(model interface{}, schema *Schema) []ValidationError {
 			}
 		}
 
-		// Min/Max: numeric boundaries
+		// Min/Max: numeric or string length boundaries
 		if fs.Min != nil && !fv.IsZero() {
-			if intVal, ok := toInt(fv); ok {
+			if fv.Kind() == reflect.String {
+				if fv.Len() < *fs.Min {
+					errs = append(errs, ValidationError{
+						Field:   fs.BSONName,
+						Message: fmt.Sprintf("length %d is less than minimum %d", fv.Len(), *fs.Min),
+					})
+				}
+			} else if intVal, ok := toInt(fv); ok {
 				if intVal < *fs.Min {
 					errs = append(errs, ValidationError{
 						Field:   fs.BSONName,
@@ -70,7 +77,14 @@ func Validate(model interface{}, schema *Schema) []ValidationError {
 		}
 
 		if fs.Max != nil && !fv.IsZero() {
-			if intVal, ok := toInt(fv); ok {
+			if fv.Kind() == reflect.String {
+				if fv.Len() > *fs.Max {
+					errs = append(errs, ValidationError{
+						Field:   fs.BSONName,
+						Message: fmt.Sprintf("length %d exceeds maximum %d", fv.Len(), *fs.Max),
+					})
+				}
+			} else if intVal, ok := toInt(fv); ok {
 				if intVal > *fs.Max {
 					errs = append(errs, ValidationError{
 						Field:   fs.BSONName,
@@ -82,6 +96,15 @@ func Validate(model interface{}, schema *Schema) []ValidationError {
 	}
 
 	return errs
+}
+
+// stringValue extracts a string representation of a value for enum comparison.
+// For string kinds, returns the string directly. For other types, uses fmt.Sprintf.
+func stringValue(v reflect.Value) string {
+	if v.Kind() == reflect.String {
+		return v.String()
+	}
+	return fmt.Sprintf("%v", v.Interface())
 }
 
 // toInt attempts to extract an integer value from a reflect.Value.

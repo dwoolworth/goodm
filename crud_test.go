@@ -10,6 +10,17 @@ import (
 
 // --- unit tests (no DB) ---
 
+func TestRegister_Duplicate(t *testing.T) {
+	registerTestModels()
+	defer unregisterTestModels()
+
+	// Second registration of the same model should error
+	err := Register(&testUser{}, "test_users")
+	if err == nil {
+		t.Fatal("expected error for duplicate registration")
+	}
+}
+
 func TestGetSchemaForModel(t *testing.T) {
 	registerTestModels()
 	defer unregisterTestModels()

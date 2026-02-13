@@ -174,7 +174,7 @@ func Find(ctx context.Context, filter interface{}, results interface{}, opts ...
 		if err != nil {
 			return fmt.Errorf("goodm: find failed: %w", err)
 		}
-		defer cursor.Close(ctx)
+		defer func() { _ = cursor.Close(ctx) }()
 
 		if err := cursor.All(ctx, results); err != nil {
 			return fmt.Errorf("goodm: cursor decode failed: %w", err)
@@ -261,13 +261,20 @@ func Update(ctx context.Context, model interface{}, opts ...UpdateOptions) error
 
 		coll := db.Collection(schema.Collection)
 
-		// Fetch existing document for immutable field comparison
-		existing := reflect.New(reflect.TypeOf(model).Elem()).Interface()
-		if err := coll.FindOne(ctx, bson.D{{Key: "_id", Value: id}}).Decode(existing); err != nil {
-			if err == mongo.ErrNoDocuments {
-				return ErrNotFound
+		// Only fetch the existing document if immutable fields need checking.
+		// This avoids an extra query when no fields are marked immutable.
+		if hasImmutableFields(schema) {
+			existing := reflect.New(reflect.TypeOf(model).Elem()).Interface()
+			if err := coll.FindOne(ctx, bson.D{{Key: "_id", Value: id}}).Decode(existing); err != nil {
+				if err == mongo.ErrNoDocuments {
+					return ErrNotFound
+				}
+				return fmt.Errorf("goodm: failed to fetch existing document: %w", err)
 			}
-			return fmt.Errorf("goodm: failed to fetch existing document: %w", err)
+
+			if immutableErrs := validateImmutable(existing, model, schema); len(immutableErrs) > 0 {
+				return ValidationErrors(immutableErrs)
+			}
 		}
 
 		// BeforeSave hook
@@ -275,11 +282,6 @@ func Update(ctx context.Context, model interface{}, opts ...UpdateOptions) error
 			if err := hook.BeforeSave(ctx); err != nil {
 				return err
 			}
-		}
-
-		// Check immutable fields
-		if immutableErrs := validateImmutable(existing, model, schema); len(immutableErrs) > 0 {
-			return ValidationErrors(immutableErrs)
 		}
 
 		// Validate
@@ -566,4 +568,14 @@ func validateImmutable(old, new interface{}, schema *Schema) []ValidationError {
 	}
 
 	return errs
+}
+
+// hasImmutableFields returns true if any field in the schema is marked immutable.
+func hasImmutableFields(schema *Schema) bool {
+	for _, f := range schema.Fields {
+		if f.Immutable {
+			return true
+		}
+	}
+	return false
 }

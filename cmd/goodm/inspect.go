@@ -181,7 +181,7 @@ func printDiff(schema *goodm.Schema) error {
 		return err
 	}
 
-	drifts := goodm.DetectDrift(ctx, db, schema)
+	drifts := goodm.DetectDrift(ctx, db, schema, goodm.DefaultDriftSampleSize)
 	if len(drifts) == 0 {
 		fmt.Println("  Drift: ✓ No drift detected")
 	} else {

@@ -19,9 +19,13 @@ const (
 	DriftFatal                     // detect drift, return error if any found
 )
 
+// DefaultDriftSampleSize is the number of documents sampled for drift detection.
+const DefaultDriftSampleSize = 100
+
 // EnforceOptions configures the behavior of Enforce.
 type EnforceOptions struct {
 	DriftPolicy    DriftPolicy
+	DriftSampleSize int                // documents to sample for drift detection (default 100)
 	OnDriftWarning func(d DriftError) // called for each drift when policy is DriftWarn
 }
 
@@ -45,7 +49,11 @@ func Enforce(ctx context.Context, db *mongo.Database, opts ...EnforceOptions) er
 			continue
 		}
 
-		drifts := DetectDrift(ctx, db, schema)
+		sampleSize := opt.DriftSampleSize
+		if sampleSize <= 0 {
+			sampleSize = DefaultDriftSampleSize
+		}
+		drifts := DetectDrift(ctx, db, schema, sampleSize)
 		if len(drifts) == 0 {
 			continue
 		}
@@ -141,17 +149,21 @@ func enforceSchema(ctx context.Context, db *mongo.Database, schema *Schema) erro
 }
 
 // DetectDrift samples documents from the collection and reports fields
-// that exist in the database but not in the schema.
-func DetectDrift(ctx context.Context, db *mongo.Database, schema *Schema) []DriftError {
+// that exist in the database but not in the schema. The sampleSize parameter
+// controls how many documents are sampled (use DefaultDriftSampleSize if unsure).
+func DetectDrift(ctx context.Context, db *mongo.Database, schema *Schema, sampleSize int) []DriftError {
 	var drifts []DriftError
 	coll := db.Collection(schema.Collection)
 
-	// Sample up to 100 documents
-	cursor, err := coll.Find(ctx, bson.D{}, options.Find().SetLimit(100))
+	if sampleSize <= 0 {
+		sampleSize = DefaultDriftSampleSize
+	}
+
+	cursor, err := coll.Find(ctx, bson.D{}, options.Find().SetLimit(int64(sampleSize)))
 	if err != nil {
 		return drifts
 	}
-	defer cursor.Close(ctx)
+	defer func() { _ = cursor.Close(ctx) }()
 
 	knownFields := make(map[string]bool)
 	for _, f := range schema.Fields {
@@ -187,7 +199,7 @@ func ListExistingIndexes(ctx context.Context, coll *mongo.Collection) (map[strin
 	if err != nil {
 		return nil, err
 	}
-	defer cursor.Close(ctx)
+	defer func() { _ = cursor.Close(ctx) }()
 
 	for cursor.Next(ctx) {
 		var idx bson.M
