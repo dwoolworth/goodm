@@ -163,7 +163,7 @@ func DetectDrift(ctx context.Context, db *mongo.Database, schema *Schema, sample
 	if err != nil {
 		return drifts
 	}
-	defer cursor.Close(ctx)
+	defer func() { _ = cursor.Close(ctx) }()
 
 	knownFields := make(map[string]bool)
 	for _, f := range schema.Fields {
@@ -199,7 +199,7 @@ func ListExistingIndexes(ctx context.Context, coll *mongo.Collection) (map[strin
 	if err != nil {
 		return nil, err
 	}
-	defer cursor.Close(ctx)
+	defer func() { _ = cursor.Close(ctx) }()
 
 	for cursor.Next(ctx) {
 		var idx bson.M

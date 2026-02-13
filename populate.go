@@ -177,7 +177,7 @@ func BatchPopulate(ctx context.Context, models interface{}, field string, result
 	if err != nil {
 		return fmt.Errorf("goodm: batch populate %q failed: %w", field, err)
 	}
-	defer cursor.Close(ctx)
+	defer func() { _ = cursor.Close(ctx) }()
 
 	if err := cursor.All(ctx, results); err != nil {
 		return fmt.Errorf("goodm: batch populate decode failed: %w", err)

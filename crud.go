@@ -174,7 +174,7 @@ func Find(ctx context.Context, filter interface{}, results interface{}, opts ...
 		if err != nil {
 			return fmt.Errorf("goodm: find failed: %w", err)
 		}
-		defer cursor.Close(ctx)
+		defer func() { _ = cursor.Close(ctx) }()
 
 		if err := cursor.All(ctx, results); err != nil {
 			return fmt.Errorf("goodm: cursor decode failed: %w", err)
