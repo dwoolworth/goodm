@@ -75,29 +75,28 @@ goodm.Populate(ctx, post, goodm.Refs{"author": author}, goodm.PopulateOptions{
 
 ## Batch Population
 
-For populating references across a slice of models, collect the IDs and use `Find` with `$in`:
+Use `BatchPopulate` to resolve a ref field across a slice of models in a single `$in` query, avoiding N+1 overhead:
 
 ```go
 var posts []Post
 goodm.Find(ctx, bson.D{}, &posts)
 
-// Collect unique author IDs
-ids := make(map[bson.ObjectID]bool)
-for _, p := range posts {
-    ids[p.AuthorID] = true
-}
-idSlice := make([]bson.ObjectID, 0, len(ids))
-for id := range ids {
-    idSlice = append(idSlice, id)
-}
-
-// Batch fetch
 var authors []User
-goodm.Find(ctx, bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: idSlice}}}}, &authors)
+err := goodm.BatchPopulate(ctx, posts, "author", &authors)
+```
 
-// Build lookup map
+This collects unique IDs from the `author` field, fetches all referenced documents in one query, and decodes them into the `authors` slice. To map authors back to posts, build a lookup map:
+
+```go
 authorMap := make(map[bson.ObjectID]*User)
 for i := range authors {
     authorMap[authors[i].ID] = &authors[i]
 }
+
+for _, post := range posts {
+    author := authorMap[post.AuthorID]
+    // ...
+}
 ```
+
+> **Note:** `Populate` makes one query per ref field on a single model. For slices of models, always prefer `BatchPopulate` to avoid N+1 queries.

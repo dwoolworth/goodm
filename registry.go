@@ -61,6 +61,10 @@ func Register(model interface{}, collection string) error {
 	schema.Hooks = detectHooks(model)
 
 	registryMu.Lock()
+	if _, exists := registry[schema.ModelName]; exists {
+		registryMu.Unlock()
+		return fmt.Errorf("goodm: model %q is already registered", schema.ModelName)
+	}
 	registry[schema.ModelName] = schema
 	registryMu.Unlock()
 

@@ -110,6 +110,7 @@ func setupTestDB(t *testing.T) (context.Context, *mongo.Database, func()) {
 }
 
 func registerTestModels() {
+	unregisterTestModels()
 	_ = Register(&testUser{}, "test_users")
 	_ = Register(&testProfile{}, "test_profiles")
 	_ = Register(&testHookUser{}, "test_hook_users")

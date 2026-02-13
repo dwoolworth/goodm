@@ -6,7 +6,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const version = "0.1.0"
+// version is set at build time via -ldflags "-X main.version=x.y.z".
+// Falls back to "dev" when built without ldflags.
+var version = "dev"
 
 var versionCmd = &cobra.Command{
 	Use:   "version",
