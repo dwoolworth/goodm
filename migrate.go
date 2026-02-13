@@ -91,7 +91,7 @@ func PlanMigration(ctx context.Context, db *mongo.Database, schemas map[string]*
 		}
 
 		// Detect field drift
-		drifts := DetectDrift(ctx, db, schema)
+		drifts := DetectDrift(ctx, db, schema, DefaultDriftSampleSize)
 		for _, d := range drifts {
 			plan.Actions = append(plan.Actions, MigrationAction{
 				Type:        ActionFieldDrift,
