@@ -54,6 +54,7 @@ var modelTmpl = template.Must(template.New("model").Funcs(template.FuncMap{
 }).Parse(`package {{ .Package }}
 
 import (
+	"log"
 {{- if .NeedsTime }}
 	"time"
 {{- end }}
@@ -90,7 +91,7 @@ func (m *{{ .StructName }}) Indexes() []goodm.CompoundIndex {
 {{ end }}
 func init() {
 	if err := goodm.Register(&{{ .StructName }}{}, "{{ .CollectionName }}"); err != nil {
-		panic(err)
+		log.Fatalf("goodm: failed to register {{ .StructName }}: %v", err)
 	}
 }
 `))
