@@ -59,7 +59,7 @@ goodm.Use(func(ctx context.Context, op *goodm.OpInfo, next func(context.Context)
 
 **What they are in Mongoose:** When a field is missing from a document in the database, Mongoose fills in the schema default when reading.
 
-**Why goodm skips them:** Go structs already have zero values, and the `default` tag in goodm is informational metadata used by code generation and the CLI inspect command. Silently mutating data on read creates a mismatch between what's in the database and what's in memory, making debugging harder. If you need defaults applied on creation, use a `BeforeCreate` hook.
+**What goodm does instead:** goodm applies `default=X` values at creation time — during `Create` and `CreateMany`, zero-valued fields are set to their schema default before hooks and validation run. This means the default is persisted to the database, so reads always return exactly what's stored. Read-time defaults (silently filling in missing values on query) are still omitted because they create a mismatch between what's in the database and what's in memory, making debugging harder.
 
 ### Discriminators (Single-Collection Inheritance)
 
@@ -72,6 +72,23 @@ goodm.Use(func(ctx context.Context, op *goodm.OpInfo, next func(context.Context)
 **What it is in Mongoose:** Automatically casts query values to match schema types (e.g., string `"5"` becomes number `5`).
 
 **Why goodm skips it:** Go is statically typed. If you pass an `int` to a filter, it's already an `int`. Query casting exists in Mongoose because JavaScript is dynamically typed and values from HTTP requests arrive as strings. In Go, you parse input at the boundary (HTTP handler) and work with typed values from there.
+
+## Mongoose Schema Options
+
+Mongoose schemas accept many options. Here's how goodm handles each:
+
+| Option | Status | Rationale |
+|--------|--------|-----------|
+| `strict` | N/A | Go structs are inherently strict — only declared fields are serialized. There's no "loose mode" to toggle. |
+| `versionKey` | **Implemented** | goodm uses `__v` (same as Mongoose) for optimistic concurrency control. See [CRUD docs](crud.md) for details. |
+| `autoIndex` | Omitted | goodm uses explicit `Enforce()` to create indexes on demand, giving you full control over when index creation happens (e.g., deploy scripts vs. app startup). |
+| `toJSON` / `toObject` | Omitted | Use Go's `json.Marshaler` interface or custom methods on your struct. The language already provides this. |
+| `minimize` | Omitted | Use `bson:",omitempty"` on struct tags to skip zero-valued fields. This is more granular than a schema-level flag. |
+| `capped` | Omitted | Capped collections are a MongoDB admin concern. Create them using the MongoDB driver directly: `db.CreateCollection(ctx, name, options.CreateCollection().SetCapped(true).SetSizeInBytes(size))`. |
+| `read` / `writeConcern` | **Implemented** | Per-schema read/write concern via the `Configurable` interface. Implement `CollectionOptions()` on your model to set read preference, read concern, and write concern. All CRUD, bulk, and pipeline operations automatically use the configured options. |
+| `shardKey` | Omitted | Shard keys are a database administration concern configured at the MongoDB level, not the application level. |
+| `validateBeforeSave` | Always on | goodm always validates before Create and Update. To bypass validation, use raw passthroughs (`UpdateOne`, `DeleteOne`, `UpdateMany`, `DeleteMany`). |
+| `selectPopulatedPaths` | N/A | goodm's `Populate` is explicit — you specify exactly which fields to populate. There's no automatic path selection to configure. |
 
 ## Design Principles
 

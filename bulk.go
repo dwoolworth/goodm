@@ -90,6 +90,14 @@ func CreateMany(ctx context.Context, models interface{}, opts ...CreateOptions) 
 			// Set timestamps
 			setTimestamps(model, now)
 
+			// Apply schema defaults to zero-valued fields
+			if err := applyDefaults(model, schema); err != nil {
+				return err
+			}
+
+			// Initialize version to 0
+			setModelVersion(model, 0)
+
 			// BeforeCreate hook
 			if hook, ok := model.(BeforeCreate); ok {
 				if err := hook.BeforeCreate(ctx); err != nil {
@@ -105,7 +113,7 @@ func CreateMany(ctx context.Context, models interface{}, opts ...CreateOptions) 
 			docs[i] = model
 		}
 
-		coll := db.Collection(schema.Collection)
+		coll := getCollection(db, schema)
 		if _, err := coll.InsertMany(ctx, docs); err != nil {
 			return fmt.Errorf("goodm: insert many failed: %w", err)
 		}
@@ -159,7 +167,7 @@ func UpdateMany(ctx context.Context, filter, update interface{}, model interface
 		Model:      model,
 		Filter:     filter,
 	}, func(ctx context.Context) error {
-		coll := db.Collection(schema.Collection)
+		coll := getCollection(db, schema)
 		res, err := coll.UpdateMany(ctx, filter, update)
 		if err != nil {
 			return fmt.Errorf("goodm: update many failed: %w", err)
@@ -201,7 +209,7 @@ func DeleteMany(ctx context.Context, filter interface{}, model interface{}, opts
 		ModelName:  schema.ModelName,
 		Filter:     filter,
 	}, func(ctx context.Context) error {
-		coll := db.Collection(schema.Collection)
+		coll := getCollection(db, schema)
 		res, err := coll.DeleteMany(ctx, filter)
 		if err != nil {
 			return fmt.Errorf("goodm: delete many failed: %w", err)

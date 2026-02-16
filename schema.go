@@ -1,5 +1,19 @@
 package goodm
 
+import (
+	"go.mongodb.org/mongo-driver/v2/mongo/readconcern"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
+	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
+)
+
+// CollectionOptions configures per-schema MongoDB collection behavior.
+// Implement the Configurable interface on your model to set these.
+type CollectionOptions struct {
+	ReadPreference *readpref.ReadPref
+	ReadConcern    *readconcern.ReadConcern
+	WriteConcern   *writeconcern.WriteConcern
+}
+
 // FieldSchema describes a single field parsed from struct tags.
 type FieldSchema struct {
 	Name      string   // Go field name
@@ -18,11 +32,12 @@ type FieldSchema struct {
 
 // Schema is the parsed representation of a model struct.
 type Schema struct {
-	ModelName       string          // Go struct name
-	Collection      string          // MongoDB collection name
-	Fields          []FieldSchema   // parsed fields
-	CompoundIndexes []CompoundIndex // compound indexes from Indexes() method
-	Hooks           []string        // hook interface names the model implements
+	ModelName       string            // Go struct name
+	Collection      string            // MongoDB collection name
+	Fields          []FieldSchema     // parsed fields
+	CompoundIndexes []CompoundIndex   // compound indexes from Indexes() method
+	Hooks           []string          // hook interface names the model implements
+	CollOptions     CollectionOptions // per-schema read/write concern and read preference
 }
 
 // HasField returns true if the schema contains a field with the given BSON name.
@@ -48,4 +63,19 @@ func (s *Schema) GetField(bsonName string) *FieldSchema {
 // Indexable is implemented by models that define compound indexes.
 type Indexable interface {
 	Indexes() []CompoundIndex
+}
+
+// Configurable is implemented by models that define per-schema collection options
+// such as read preference, read concern, and write concern.
+//
+// Example:
+//
+//	func (u *User) CollectionOptions() goodm.CollectionOptions {
+//	    return goodm.CollectionOptions{
+//	        ReadPreference: readpref.SecondaryPreferred(),
+//	        WriteConcern:   writeconcern.Majority(),
+//	    }
+//	}
+type Configurable interface {
+	CollectionOptions() CollectionOptions
 }

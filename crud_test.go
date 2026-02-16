@@ -411,6 +411,250 @@ func TestHooks_Integration(t *testing.T) {
 	}
 }
 
+// --- collection options unit tests ---
+
+func TestRegister_ConfigurableInterface(t *testing.T) {
+	registerTestModels()
+	defer unregisterTestModels()
+
+	schema, ok := Get("testConfiguredModel")
+	if !ok {
+		t.Fatal("testConfiguredModel not registered")
+	}
+
+	if schema.CollOptions.ReadPreference == nil {
+		t.Fatal("expected ReadPreference to be set")
+	}
+	if schema.CollOptions.WriteConcern == nil {
+		t.Fatal("expected WriteConcern to be set")
+	}
+	if schema.CollOptions.ReadConcern != nil {
+		t.Fatal("expected ReadConcern to be nil (not set)")
+	}
+}
+
+func TestRegister_NoConfigurable(t *testing.T) {
+	registerTestModels()
+	defer unregisterTestModels()
+
+	schema, ok := Get("testUser")
+	if !ok {
+		t.Fatal("testUser not registered")
+	}
+
+	if schema.CollOptions.ReadPreference != nil {
+		t.Fatal("expected ReadPreference to be nil for non-configurable model")
+	}
+	if schema.CollOptions.WriteConcern != nil {
+		t.Fatal("expected WriteConcern to be nil for non-configurable model")
+	}
+}
+
+// --- version helper unit tests ---
+
+func TestGetModelVersion(t *testing.T) {
+	u := &testUser{}
+	u.Version = 5
+
+	v, err := getModelVersion(u)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if v != 5 {
+		t.Fatalf("expected 5, got %d", v)
+	}
+}
+
+func TestSetModelVersion(t *testing.T) {
+	u := &testUser{}
+	setModelVersion(u, 3)
+
+	if u.Version != 3 {
+		t.Fatalf("expected 3, got %d", u.Version)
+	}
+}
+
+// --- defaults integration tests ---
+
+func TestCreate_AppliesDefaults(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	u := &testUser{
+		Email: "defaults@test.com",
+		Name:  "Defaults",
+		Age:   25,
+		// Role left empty — should get default "user"
+	}
+	if err := Create(ctx, u); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if u.Role != "user" {
+		t.Fatalf("expected Role 'user', got %q", u.Role)
+	}
+
+	// Verify in DB
+	found := &testUser{}
+	if err := FindOne(ctx, bson.D{{Key: "_id", Value: u.ID}}, found); err != nil {
+		t.Fatalf("find: %v", err)
+	}
+	if found.Role != "user" {
+		t.Fatalf("expected Role 'user' in DB, got %q", found.Role)
+	}
+}
+
+func TestCreateMany_AppliesDefaults(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	users := []testUser{
+		{Email: "def1@test.com", Name: "Def1", Age: 20},
+		{Email: "def2@test.com", Name: "Def2", Age: 21, Role: "admin"},
+	}
+	if err := CreateMany(ctx, users); err != nil {
+		t.Fatalf("create many: %v", err)
+	}
+
+	if users[0].Role != "user" {
+		t.Fatalf("expected default Role 'user', got %q", users[0].Role)
+	}
+	if users[1].Role != "admin" {
+		t.Fatalf("expected Role 'admin' (not overwritten), got %q", users[1].Role)
+	}
+}
+
+// --- versioning integration tests ---
+
+func TestCreate_SetsVersionZero(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	u := &testUser{Email: "v0@test.com", Name: "V0", Age: 25, Role: "user"}
+	if err := Create(ctx, u); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if u.Version != 0 {
+		t.Fatalf("expected Version 0, got %d", u.Version)
+	}
+
+	// Verify in DB
+	found := &testUser{}
+	if err := FindOne(ctx, bson.D{{Key: "_id", Value: u.ID}}, found); err != nil {
+		t.Fatalf("find: %v", err)
+	}
+	if found.Version != 0 {
+		t.Fatalf("expected Version 0 in DB, got %d", found.Version)
+	}
+}
+
+func TestUpdate_IncrementsVersion(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	u := &testUser{Email: "vinc@test.com", Name: "VInc", Age: 25, Role: "user"}
+	if err := Create(ctx, u); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	u.Age = 26
+	if err := Update(ctx, u); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if u.Version != 1 {
+		t.Fatalf("expected Version 1, got %d", u.Version)
+	}
+
+	// Verify in DB
+	found := &testUser{}
+	if err := FindOne(ctx, bson.D{{Key: "_id", Value: u.ID}}, found); err != nil {
+		t.Fatalf("find: %v", err)
+	}
+	if found.Version != 1 {
+		t.Fatalf("expected Version 1 in DB, got %d", found.Version)
+	}
+}
+
+func TestUpdate_MultipleIncrements(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	u := &testUser{Email: "vmulti@test.com", Name: "VMulti", Age: 25, Role: "user"}
+	if err := Create(ctx, u); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	for i := 0; i < 3; i++ {
+		u.Age = 26 + i
+		if err := Update(ctx, u); err != nil {
+			t.Fatalf("update %d: %v", i, err)
+		}
+	}
+
+	if u.Version != 3 {
+		t.Fatalf("expected Version 3, got %d", u.Version)
+	}
+}
+
+func TestUpdate_VersionConflict(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	u := &testUser{Email: "conflict@test.com", Name: "Conflict", Age: 25, Role: "user"}
+	if err := Create(ctx, u); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// Load the same doc a second time
+	u2 := &testUser{}
+	if err := FindOne(ctx, bson.D{{Key: "_id", Value: u.ID}}, u2); err != nil {
+		t.Fatalf("find: %v", err)
+	}
+
+	// First update succeeds
+	u.Age = 26
+	if err := Update(ctx, u); err != nil {
+		t.Fatalf("first update: %v", err)
+	}
+
+	// Second update with stale version should conflict
+	u2.Age = 27
+	err := Update(ctx, u2)
+	if !errors.Is(err, ErrVersionConflict) {
+		t.Fatalf("expected ErrVersionConflict, got %v", err)
+	}
+}
+
+func TestUpdate_VersionConflict_RollsBack(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	u := &testUser{Email: "rollback@test.com", Name: "Rollback", Age: 25, Role: "user"}
+	if err := Create(ctx, u); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// Load the same doc twice
+	u2 := &testUser{}
+	if err := FindOne(ctx, bson.D{{Key: "_id", Value: u.ID}}, u2); err != nil {
+		t.Fatalf("find: %v", err)
+	}
+
+	// First update succeeds (version 0 -> 1)
+	u.Age = 26
+	if err := Update(ctx, u); err != nil {
+		t.Fatalf("first update: %v", err)
+	}
+
+	// Second update fails with version conflict
+	u2.Age = 27
+	_ = Update(ctx, u2)
+
+	// u2's version should be rolled back to 0 (its pre-conflict state)
+	if u2.Version != 0 {
+		t.Fatalf("expected version rolled back to 0, got %d", u2.Version)
+	}
+}
+
 func TestMiddleware_WithCRUD_Integration(t *testing.T) {
 	ctx, _, cleanup := setupTestDB(t)
 	defer cleanup()

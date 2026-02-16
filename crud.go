@@ -11,6 +11,27 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
+// getCollection returns a *mongo.Collection for the schema, applying any
+// per-schema read/write concern or read preference configured via the
+// Configurable interface.
+func getCollection(db *mongo.Database, schema *Schema) *mongo.Collection {
+	opts := schema.CollOptions
+	if opts.ReadPreference == nil && opts.ReadConcern == nil && opts.WriteConcern == nil {
+		return db.Collection(schema.Collection)
+	}
+	collOpts := options.Collection()
+	if opts.ReadPreference != nil {
+		collOpts.SetReadPreference(opts.ReadPreference)
+	}
+	if opts.ReadConcern != nil {
+		collOpts.SetReadConcern(opts.ReadConcern)
+	}
+	if opts.WriteConcern != nil {
+		collOpts.SetWriteConcern(opts.WriteConcern)
+	}
+	return db.Collection(schema.Collection, collOpts)
+}
+
 // CreateOptions configures the Create operation.
 type CreateOptions struct {
 	DB *mongo.Database
@@ -67,6 +88,14 @@ func Create(ctx context.Context, model interface{}, opts ...CreateOptions) error
 		// Set timestamps
 		setTimestamps(model, time.Now())
 
+		// Apply schema defaults to zero-valued fields
+		if err := applyDefaults(model, schema); err != nil {
+			return err
+		}
+
+		// Initialize version to 0
+		setModelVersion(model, 0)
+
 		// BeforeCreate hook
 		if hook, ok := model.(BeforeCreate); ok {
 			if err := hook.BeforeCreate(ctx); err != nil {
@@ -80,7 +109,7 @@ func Create(ctx context.Context, model interface{}, opts ...CreateOptions) error
 		}
 
 		// Insert
-		coll := db.Collection(schema.Collection)
+		coll := getCollection(db, schema)
 		if _, err := coll.InsertOne(ctx, model); err != nil {
 			return fmt.Errorf("goodm: insert failed: %w", err)
 		}
@@ -117,7 +146,7 @@ func FindOne(ctx context.Context, filter interface{}, result interface{}, opts .
 			return err
 		}
 
-		coll := db.Collection(schema.Collection)
+		coll := getCollection(db, schema)
 		if err := coll.FindOne(ctx, filter).Decode(result); err != nil {
 			if err == mongo.ErrNoDocuments {
 				return ErrNotFound
@@ -169,7 +198,7 @@ func Find(ctx context.Context, filter interface{}, results interface{}, opts ...
 			findOpts.SetSort(opt.Sort)
 		}
 
-		coll := db.Collection(schema.Collection)
+		coll := getCollection(db, schema)
 		cursor, err := coll.Find(ctx, filter, findOpts)
 		if err != nil {
 			return fmt.Errorf("goodm: find failed: %w", err)
@@ -217,7 +246,7 @@ func FindCursor(ctx context.Context, filter interface{}, model interface{}, opts
 			findOpts.SetSort(opt.Sort)
 		}
 
-		coll := db.Collection(schema.Collection)
+		coll := getCollection(db, schema)
 		c, err := coll.Find(ctx, filter, findOpts)
 		if err != nil {
 			return fmt.Errorf("goodm: find cursor failed: %w", err)
@@ -259,7 +288,7 @@ func Update(ctx context.Context, model interface{}, opts ...UpdateOptions) error
 			return err
 		}
 
-		coll := db.Collection(schema.Collection)
+		coll := getCollection(db, schema)
 
 		// Only fetch the existing document if immutable fields need checking.
 		// This avoids an extra query when no fields are marked immutable.
@@ -289,16 +318,48 @@ func Update(ctx context.Context, model interface{}, opts ...UpdateOptions) error
 			return ValidationErrors(errs)
 		}
 
+		// Read current version and increment
+		oldVersion, _ := getModelVersion(model)
+		setModelVersion(model, oldVersion+1)
+
 		// Set UpdatedAt
 		setUpdatedAt(model, time.Now())
 
+		// Build filter with version check for optimistic concurrency.
+		// When oldVersion == 0, also match documents without __v (legacy compat).
+		var filter bson.D
+		if oldVersion == 0 {
+			filter = bson.D{
+				{Key: "_id", Value: id},
+				{Key: "$or", Value: bson.A{
+					bson.D{{Key: "__v", Value: 0}},
+					bson.D{{Key: "__v", Value: bson.D{{Key: "$exists", Value: false}}}},
+				}},
+			}
+		} else {
+			filter = bson.D{
+				{Key: "_id", Value: id},
+				{Key: "__v", Value: oldVersion},
+			}
+		}
+
 		// Replace
-		result, err := coll.ReplaceOne(ctx, bson.D{{Key: "_id", Value: id}}, model)
+		result, err := coll.ReplaceOne(ctx, filter, model)
 		if err != nil {
+			setModelVersion(model, oldVersion) // roll back on error
 			return fmt.Errorf("goodm: update failed: %w", err)
 		}
 		if result.MatchedCount == 0 {
-			return ErrNotFound
+			setModelVersion(model, oldVersion) // roll back version
+			// Disambiguate: does the doc exist at all?
+			count, countErr := coll.CountDocuments(ctx, bson.D{{Key: "_id", Value: id}})
+			if countErr != nil {
+				return fmt.Errorf("goodm: update failed: %w", countErr)
+			}
+			if count == 0 {
+				return ErrNotFound
+			}
+			return ErrVersionConflict
 		}
 
 		// AfterSave hook
@@ -339,7 +400,7 @@ func UpdateOne(ctx context.Context, filter interface{}, update interface{}, mode
 			return err
 		}
 
-		coll := db.Collection(schema.Collection)
+		coll := getCollection(db, schema)
 		result, err := coll.UpdateOne(ctx, filter, update)
 		if err != nil {
 			return fmt.Errorf("goodm: update one failed: %w", err)
@@ -389,7 +450,7 @@ func Delete(ctx context.Context, model interface{}, opts ...DeleteOptions) error
 			}
 		}
 
-		coll := db.Collection(schema.Collection)
+		coll := getCollection(db, schema)
 		result, err := coll.DeleteOne(ctx, bson.D{{Key: "_id", Value: id}})
 		if err != nil {
 			return fmt.Errorf("goodm: delete failed: %w", err)
@@ -434,7 +495,7 @@ func DeleteOne(ctx context.Context, filter interface{}, model interface{}, opts 
 			return err
 		}
 
-		coll := db.Collection(schema.Collection)
+		coll := getCollection(db, schema)
 		result, err := coll.DeleteOne(ctx, filter)
 		if err != nil {
 			return fmt.Errorf("goodm: delete one failed: %w", err)
@@ -578,4 +639,28 @@ func hasImmutableFields(schema *Schema) bool {
 		}
 	}
 	return false
+}
+
+// getModelVersion extracts the Version field from a model via reflection.
+func getModelVersion(model interface{}) (int, error) {
+	v := reflect.ValueOf(model)
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
+	f := v.FieldByName("Version")
+	if !f.IsValid() {
+		return 0, fmt.Errorf("goodm: model has no Version field")
+	}
+	return int(f.Int()), nil
+}
+
+// setModelVersion sets the Version field on a model via reflection.
+func setModelVersion(model interface{}, version int) {
+	v := reflect.ValueOf(model)
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
+	if f := v.FieldByName("Version"); f.IsValid() && f.CanSet() {
+		f.SetInt(int64(version))
+	}
 }

@@ -133,7 +133,7 @@ func (p *Pipeline) Execute(ctx context.Context, results interface{}) error {
 		return err
 	}
 
-	coll := db.Collection(schema.Collection)
+	coll := getCollection(db, schema)
 	cursor, err := coll.Aggregate(ctx, p.stages)
 	if err != nil {
 		return fmt.Errorf("goodm: aggregate failed: %w", err)
@@ -161,7 +161,7 @@ func (p *Pipeline) Cursor(ctx context.Context) (*mongo.Cursor, error) {
 		return nil, err
 	}
 
-	coll := db.Collection(schema.Collection)
+	coll := getCollection(db, schema)
 	cursor, err := coll.Aggregate(ctx, p.stages)
 	if err != nil {
 		return nil, fmt.Errorf("goodm: aggregate cursor failed: %w", err)

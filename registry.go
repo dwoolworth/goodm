@@ -57,6 +57,11 @@ func Register(model interface{}, collection string) error {
 		schema.CompoundIndexes = indexable.Indexes()
 	}
 
+	// Check for Configurable interface (per-schema collection options)
+	if configurable, ok := model.(Configurable); ok {
+		schema.CollOptions = configurable.CollectionOptions()
+	}
+
 	// Detect hook implementations
 	schema.Hooks = detectHooks(model)
 

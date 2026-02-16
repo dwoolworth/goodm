@@ -12,10 +12,12 @@ Inserts a new document with the full ODM lifecycle:
 
 1. Generates `ID` (if zero)
 2. Sets `CreatedAt` (if zero) and `UpdatedAt`
-3. Runs `BeforeCreate` hook
-4. Validates against schema (required, enum, min/max)
-5. Inserts into MongoDB
-6. Runs `AfterCreate` hook
+3. Applies schema defaults to zero-valued fields
+4. Sets `Version` to 0
+5. Runs `BeforeCreate` hook
+6. Validates against schema (required, enum, min/max)
+7. Inserts into MongoDB
+8. Runs `AfterCreate` hook
 
 ```go
 user := &User{Email: "alice@example.com", Name: "Alice", Age: 30}
@@ -96,13 +98,14 @@ func Update(ctx context.Context, model interface{}, opts ...UpdateOptions) error
 Replaces an existing document with the full ODM lifecycle:
 
 1. Requires non-zero `ID`
-2. Fetches existing document from DB
-3. Runs `BeforeSave` hook
-4. Validates immutable fields (compares with existing doc)
+2. Fetches existing document from DB (only if immutable fields exist)
+3. Validates immutable fields (compares with existing doc)
+4. Runs `BeforeSave` hook
 5. Validates against schema
-6. Sets `UpdatedAt`
-7. Replaces document in MongoDB
-8. Runs `AfterSave` hook
+6. Increments `Version` and sets `UpdatedAt`
+7. Replaces document in MongoDB with version check (`__v` filter)
+8. Returns `ErrVersionConflict` if another process modified the document
+9. Runs `AfterSave` hook
 
 ```go
 user.Age = 31
@@ -184,4 +187,5 @@ goodm.Delete(ctx, user, goodm.DeleteOptions{DB: otherDB})
 |-------|------|
 | `ErrNotFound` | FindOne/Update/Delete finds no matching document |
 | `ErrNoDatabase` | No database connection (Connect not called) |
+| `ErrVersionConflict` | Update detects another process modified the document (optimistic concurrency) |
 | `ValidationErrors` | Validation or immutable check failure |
