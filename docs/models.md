@@ -126,6 +126,36 @@ func (u *User) Indexes() []goodm.CompoundIndex {
 
 Compound indexes are created by `Enforce()` alongside single-field indexes.
 
+## Collection Options (Read/Write Concern)
+
+For per-schema read preference, read concern, and write concern, implement the `Configurable` interface:
+
+```go
+import (
+    "go.mongodb.org/mongo-driver/v2/mongo/readpref"
+    "go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
+)
+
+func (u *User) CollectionOptions() goodm.CollectionOptions {
+    return goodm.CollectionOptions{
+        ReadPreference: readpref.SecondaryPreferred(),
+        WriteConcern:   writeconcern.Majority(),
+    }
+}
+```
+
+All CRUD, bulk, and pipeline operations automatically use the configured options. This is useful for separating read/write patterns in clustered deployments — for example, routing reads for an analytics model to secondaries while keeping user writes on majority concern.
+
+Available options:
+
+| Field | Type | Example |
+|-------|------|---------|
+| `ReadPreference` | `*readpref.ReadPref` | `readpref.SecondaryPreferred()`, `readpref.Nearest()` |
+| `ReadConcern` | `*readconcern.ReadConcern` | `readconcern.Majority()`, `readconcern.Local()` |
+| `WriteConcern` | `*writeconcern.WriteConcern` | `writeconcern.Majority()`, `writeconcern.W1()` |
+
+Models without `CollectionOptions()` use whatever concern is configured on the `*mongo.Database`.
+
 ## Registration
 
 Models must be registered before use. The convention is to register in `init()`:
@@ -138,12 +168,13 @@ func init() {
 }
 ```
 
-`Register` parses the struct tags, detects hook implementations, and stores the schema in an internal registry. The registry is used by all CRUD operations to:
+`Register` parses the struct tags, detects hook and interface implementations, and stores the schema in an internal registry. The registry is used by all CRUD operations to:
 
 - Look up the collection name for a model type
 - Validate fields on write operations
 - Enforce immutable fields on updates
-- Detect compound indexes
+- Detect compound indexes (`Indexable`)
+- Apply per-schema collection options (`Configurable`)
 
 ## Inspecting Schemas
 

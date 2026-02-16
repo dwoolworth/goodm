@@ -411,6 +411,45 @@ func TestHooks_Integration(t *testing.T) {
 	}
 }
 
+// --- collection options unit tests ---
+
+func TestRegister_ConfigurableInterface(t *testing.T) {
+	registerTestModels()
+	defer unregisterTestModels()
+
+	schema, ok := Get("testConfiguredModel")
+	if !ok {
+		t.Fatal("testConfiguredModel not registered")
+	}
+
+	if schema.CollOptions.ReadPreference == nil {
+		t.Fatal("expected ReadPreference to be set")
+	}
+	if schema.CollOptions.WriteConcern == nil {
+		t.Fatal("expected WriteConcern to be set")
+	}
+	if schema.CollOptions.ReadConcern != nil {
+		t.Fatal("expected ReadConcern to be nil (not set)")
+	}
+}
+
+func TestRegister_NoConfigurable(t *testing.T) {
+	registerTestModels()
+	defer unregisterTestModels()
+
+	schema, ok := Get("testUser")
+	if !ok {
+		t.Fatal("testUser not registered")
+	}
+
+	if schema.CollOptions.ReadPreference != nil {
+		t.Fatal("expected ReadPreference to be nil for non-configurable model")
+	}
+	if schema.CollOptions.WriteConcern != nil {
+		t.Fatal("expected WriteConcern to be nil for non-configurable model")
+	}
+}
+
 // --- version helper unit tests ---
 
 func TestGetModelVersion(t *testing.T) {

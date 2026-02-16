@@ -10,6 +10,8 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
+	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
 )
 
 // --- test models ---
@@ -38,6 +40,18 @@ type testPost struct {
 	Title    string          `bson:"title"  goodm:"required"`
 	AuthorID bson.ObjectID   `bson:"author" goodm:"ref=test_users"`
 	TagIDs   []bson.ObjectID `bson:"tags"   goodm:"ref=test_tags"`
+}
+
+type testConfiguredModel struct {
+	Model `bson:",inline"`
+	Name  string `bson:"name" goodm:"required"`
+}
+
+func (m *testConfiguredModel) CollectionOptions() CollectionOptions {
+	return CollectionOptions{
+		ReadPreference: readpref.SecondaryPreferred(),
+		WriteConcern:   writeconcern.Majority(),
+	}
 }
 
 type testHookUser struct {
@@ -128,6 +142,7 @@ func registerTestModels() {
 	_ = Register(&testTag{}, "test_tags")
 	_ = Register(&testPost{}, "test_posts")
 	_ = Register(&testHookUser{}, "test_hook_users")
+	_ = Register(&testConfiguredModel{}, "test_configured")
 }
 
 func unregisterTestModels() {
@@ -137,5 +152,6 @@ func unregisterTestModels() {
 	delete(registry, "testTag")
 	delete(registry, "testPost")
 	delete(registry, "testHookUser")
+	delete(registry, "testConfiguredModel")
 	registryMu.Unlock()
 }

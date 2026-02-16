@@ -85,7 +85,7 @@ Mongoose schemas accept many options. Here's how goodm handles each:
 | `toJSON` / `toObject` | Omitted | Use Go's `json.Marshaler` interface or custom methods on your struct. The language already provides this. |
 | `minimize` | Omitted | Use `bson:",omitempty"` on struct tags to skip zero-valued fields. This is more granular than a schema-level flag. |
 | `capped` | Omitted | Capped collections are a MongoDB admin concern. Create them using the MongoDB driver directly: `db.CreateCollection(ctx, name, options.CreateCollection().SetCapped(true).SetSizeInBytes(size))`. |
-| `read` / `writeConcern` | **Planned** | Per-schema read/write concern is a natural fit for goodm's declarative model — separating read and write patterns per collection is a common performance optimization in clustered deployments, and the intent should be visible in the schema, not buried in driver setup code. |
+| `read` / `writeConcern` | **Implemented** | Per-schema read/write concern via the `Configurable` interface. Implement `CollectionOptions()` on your model to set read preference, read concern, and write concern. All CRUD, bulk, and pipeline operations automatically use the configured options. |
 | `shardKey` | Omitted | Shard keys are a database administration concern configured at the MongoDB level, not the application level. |
 | `validateBeforeSave` | Always on | goodm always validates before Create and Update. To bypass validation, use raw passthroughs (`UpdateOne`, `DeleteOne`, `UpdateMany`, `DeleteMany`). |
 | `selectPopulatedPaths` | N/A | goodm's `Populate` is explicit — you specify exactly which fields to populate. There's no automatic path selection to configure. |
