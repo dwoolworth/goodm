@@ -191,6 +191,124 @@ func TestBatchPopulate_AllZeroRefs(t *testing.T) {
 	}
 }
 
+func TestPopulate_ArrayRef(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	// Create tags
+	t1 := &testTag{Label: "go"}
+	t2 := &testTag{Label: "mongodb"}
+	t3 := &testTag{Label: "odm"}
+	for _, tag := range []*testTag{t1, t2, t3} {
+		if err := Create(ctx, tag); err != nil {
+			t.Fatalf("create tag: %v", err)
+		}
+	}
+
+	// Create a post with array of tag refs
+	post := &testPost{
+		Title:  "Array Refs",
+		TagIDs: []bson.ObjectID{t1.ID, t2.ID, t3.ID},
+	}
+	if err := Create(ctx, post); err != nil {
+		t.Fatalf("create post: %v", err)
+	}
+
+	// Populate array ref
+	var tags []testTag
+	if err := Populate(ctx, post, Refs{"tags": &tags}); err != nil {
+		t.Fatalf("populate array ref: %v", err)
+	}
+
+	if len(tags) != 3 {
+		t.Fatalf("expected 3 tags, got %d", len(tags))
+	}
+
+	labels := map[string]bool{}
+	for _, tag := range tags {
+		labels[tag.Label] = true
+	}
+	if !labels["go"] || !labels["mongodb"] || !labels["odm"] {
+		t.Fatalf("unexpected tags: %v", tags)
+	}
+}
+
+func TestPopulate_ArrayRefEmpty(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	// Post with empty tag array
+	post := &testPost{
+		Title:  "No Tags",
+		TagIDs: []bson.ObjectID{},
+	}
+	if err := Create(ctx, post); err != nil {
+		t.Fatalf("create post: %v", err)
+	}
+
+	var tags []testTag
+	if err := Populate(ctx, post, Refs{"tags": &tags}); err != nil {
+		t.Fatalf("populate empty array ref should not error: %v", err)
+	}
+	if len(tags) != 0 {
+		t.Fatalf("expected 0 tags, got %d", len(tags))
+	}
+}
+
+func TestPopulate_ArrayRefNil(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	// Post with nil tag array
+	post := &testPost{
+		Title: "Nil Tags",
+	}
+	if err := Create(ctx, post); err != nil {
+		t.Fatalf("create post: %v", err)
+	}
+
+	var tags []testTag
+	if err := Populate(ctx, post, Refs{"tags": &tags}); err != nil {
+		t.Fatalf("populate nil array ref should not error: %v", err)
+	}
+}
+
+func TestBatchPopulate_ArrayRef(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	// Create tags
+	t1 := &testTag{Label: "alpha"}
+	t2 := &testTag{Label: "beta"}
+	t3 := &testTag{Label: "gamma"}
+	for _, tag := range []*testTag{t1, t2, t3} {
+		if err := Create(ctx, tag); err != nil {
+			t.Fatalf("create tag: %v", err)
+		}
+	}
+
+	// Create posts with overlapping tag refs
+	posts := []testPost{
+		{Title: "Post A", TagIDs: []bson.ObjectID{t1.ID, t2.ID}},
+		{Title: "Post B", TagIDs: []bson.ObjectID{t2.ID, t3.ID}},
+	}
+	for i := range posts {
+		if err := Create(ctx, &posts[i]); err != nil {
+			t.Fatalf("create post %d: %v", i, err)
+		}
+	}
+
+	// BatchPopulate should deduplicate and fetch all 3 unique tags
+	var tags []testTag
+	if err := BatchPopulate(ctx, posts, "tags", &tags); err != nil {
+		t.Fatalf("batch populate array ref: %v", err)
+	}
+
+	if len(tags) != 3 {
+		t.Fatalf("expected 3 tags, got %d", len(tags))
+	}
+}
+
 func TestPopulate_DanglingRef(t *testing.T) {
 	ctx, _, cleanup := setupTestDB(t)
 	defer cleanup()

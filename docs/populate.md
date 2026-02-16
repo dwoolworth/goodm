@@ -4,18 +4,24 @@ Population resolves `ref=` tagged fields by fetching the referenced documents fr
 
 ## Setup
 
-Tag an `ObjectID` field with `ref=collection` to mark it as a reference:
+Tag an `ObjectID` field with `ref=collection` to mark it as a reference. Both single refs and array refs are supported:
 
 ```go
 type Post struct {
     goodm.Model `bson:",inline"`
-    Title       string        `bson:"title"  goodm:"required"`
-    AuthorID    bson.ObjectID `bson:"author" goodm:"ref=users"`
+    Title       string            `bson:"title"  goodm:"required"`
+    AuthorID    bson.ObjectID     `bson:"author" goodm:"ref=users"`
+    TagIDs      []bson.ObjectID   `bson:"tags"   goodm:"ref=tags"`
 }
 
 type User struct {
     goodm.Model `bson:",inline"`
     Name        string `bson:"name" goodm:"required"`
+}
+
+type Tag struct {
+    goodm.Model `bson:",inline"`
+    Label       string `bson:"label" goodm:"required"`
 }
 ```
 
@@ -57,9 +63,36 @@ err := goodm.Populate(ctx, post, goodm.Refs{
 })
 ```
 
+## Array References
+
+For `[]bson.ObjectID` fields, pass a pointer to a slice as the target. All referenced documents are fetched in a single `$in` query:
+
+```go
+var tags []Tag
+err := goodm.Populate(ctx, post, goodm.Refs{
+    "tags": &tags,
+})
+
+for _, tag := range tags {
+    fmt.Println(tag.Label)
+}
+```
+
+You can mix single and array refs in one call:
+
+```go
+author := &User{}
+var tags []Tag
+err := goodm.Populate(ctx, post, goodm.Refs{
+    "author": author,
+    "tags":   &tags,
+})
+```
+
 ## Behavior
 
 - **Zero refs** are skipped — if the `ObjectID` field is zero, the target struct is left untouched.
+- **Empty/nil array refs** are skipped — the target slice is left empty.
 - **Dangling refs** (ID points to a nonexistent document) are skipped silently. The target struct remains at its zero value.
 - **Missing field** or **no ref tag** returns an error immediately.
 

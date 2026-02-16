@@ -23,13 +23,15 @@ type PopulateOptions struct {
 // with goodm:"ref=collection", and the corresponding value is a pointer to a struct
 // where the referenced document will be decoded.
 //
-// Example:
-//
-//	user := &User{}
-//	goodm.FindOne(ctx, bson.D{{Key: "email", Value: "alice@example.com"}}, user)
+// For single refs (bson.ObjectID), the target should be a pointer to a struct:
 //
 //	profile := &Profile{}
 //	err := goodm.Populate(ctx, user, goodm.Refs{"profile": profile})
+//
+// For array refs ([]bson.ObjectID), the target should be a pointer to a slice:
+//
+//	var tags []Tag
+//	err := goodm.Populate(ctx, post, goodm.Refs{"tags": &tags})
 func Populate(ctx context.Context, model interface{}, refs Refs, opts ...PopulateOptions) error {
 	schema, err := getSchemaForModel(model)
 	if err != nil {
@@ -64,15 +66,35 @@ func Populate(ctx context.Context, model interface{}, refs Refs, opts ...Populat
 			return fmt.Errorf("goodm: field %q not found in model struct", field.Name)
 		}
 
+		coll := db.Collection(field.Ref)
+
+		// Array ref: []bson.ObjectID → fetch all via $in
+		if refIDs, ok := fv.Interface().([]bson.ObjectID); ok {
+			ids := filterNonZeroIDs(refIDs)
+			if len(ids) == 0 {
+				continue
+			}
+			cursor, err := coll.Find(ctx, bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}})
+			if err != nil {
+				return fmt.Errorf("goodm: populate %q failed: %w", bsonName, err)
+			}
+			if err := cursor.All(ctx, target); err != nil {
+				_ = cursor.Close(ctx)
+				return fmt.Errorf("goodm: populate %q decode failed: %w", bsonName, err)
+			}
+			_ = cursor.Close(ctx)
+			continue
+		}
+
+		// Single ref: bson.ObjectID → fetch one
 		refID, ok := fv.Interface().(bson.ObjectID)
 		if !ok {
-			return fmt.Errorf("goodm: ref field %q is not bson.ObjectID", bsonName)
+			return fmt.Errorf("goodm: ref field %q is not bson.ObjectID or []bson.ObjectID", bsonName)
 		}
 		if refID.IsZero() {
 			continue // skip unset refs
 		}
 
-		coll := db.Collection(field.Ref)
 		if err := coll.FindOne(ctx, bson.D{{Key: "_id", Value: refID}}).Decode(target); err != nil {
 			if err == mongo.ErrNoDocuments {
 				continue // referenced document not found, leave target as zero
@@ -82,6 +104,17 @@ func Populate(ctx context.Context, model interface{}, refs Refs, opts ...Populat
 	}
 
 	return nil
+}
+
+// filterNonZeroIDs returns a new slice with zero ObjectIDs removed.
+func filterNonZeroIDs(ids []bson.ObjectID) []bson.ObjectID {
+	var result []bson.ObjectID
+	for _, id := range ids {
+		if !id.IsZero() {
+			result = append(result, id)
+		}
+	}
+	return result
 }
 
 // BatchPopulate resolves a single ref field across a slice of models in one query.
@@ -138,7 +171,7 @@ func BatchPopulate(ctx context.Context, models interface{}, field string, result
 		return fmt.Errorf("goodm: field %q has no ref tag", field)
 	}
 
-	// Collect unique non-zero IDs
+	// Collect unique non-zero IDs (supports both bson.ObjectID and []bson.ObjectID)
 	seen := make(map[bson.ObjectID]bool)
 	var ids []bson.ObjectID
 	for i := 0; i < mv.Len(); i++ {
@@ -150,6 +183,19 @@ func BatchPopulate(ctx context.Context, models interface{}, field string, result
 		if !fv.IsValid() {
 			continue
 		}
+
+		// Array ref: []bson.ObjectID
+		if refIDs, ok := fv.Interface().([]bson.ObjectID); ok {
+			for _, refID := range refIDs {
+				if !refID.IsZero() && !seen[refID] {
+					seen[refID] = true
+					ids = append(ids, refID)
+				}
+			}
+			continue
+		}
+
+		// Single ref: bson.ObjectID
 		refID, ok := fv.Interface().(bson.ObjectID)
 		if !ok || refID.IsZero() || seen[refID] {
 			continue

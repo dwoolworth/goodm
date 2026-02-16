@@ -28,6 +28,18 @@ type testProfile struct {
 	Bio   string `bson:"bio"`
 }
 
+type testTag struct {
+	Model `bson:",inline"`
+	Label string `bson:"label" goodm:"required"`
+}
+
+type testPost struct {
+	Model    `bson:",inline"`
+	Title    string          `bson:"title"  goodm:"required"`
+	AuthorID bson.ObjectID   `bson:"author" goodm:"ref=test_users"`
+	TagIDs   []bson.ObjectID `bson:"tags"   goodm:"ref=test_tags"`
+}
+
 type testHookUser struct {
 	Model  `bson:",inline"`
 	Email  string `bson:"email" goodm:"required"`
@@ -113,6 +125,8 @@ func registerTestModels() {
 	unregisterTestModels()
 	_ = Register(&testUser{}, "test_users")
 	_ = Register(&testProfile{}, "test_profiles")
+	_ = Register(&testTag{}, "test_tags")
+	_ = Register(&testPost{}, "test_posts")
 	_ = Register(&testHookUser{}, "test_hook_users")
 }
 
@@ -120,6 +134,8 @@ func unregisterTestModels() {
 	registryMu.Lock()
 	delete(registry, "testUser")
 	delete(registry, "testProfile")
+	delete(registry, "testTag")
+	delete(registry, "testPost")
 	delete(registry, "testHookUser")
 	registryMu.Unlock()
 }
