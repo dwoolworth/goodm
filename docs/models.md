@@ -22,13 +22,14 @@ func init() {
 
 ## Base Model
 
-`goodm.Model` provides three fields automatically:
+`goodm.Model` provides four fields automatically:
 
 | Field | BSON | Type | Behavior |
 |-------|------|------|----------|
 | `ID` | `_id` | `bson.ObjectID` | Auto-generated on Create if zero |
 | `CreatedAt` | `created_at` | `time.Time` | Set on Create (only if zero) |
 | `UpdatedAt` | `updated_at` | `time.Time` | Set on Create, refreshed on Update |
+| `Version` | `__v` | `int` | Set to 0 on Create, incremented on each Update (optimistic concurrency) |
 
 Always embed with `bson:",inline"` to flatten the fields into the document.
 
@@ -70,7 +71,7 @@ Username string `bson:"username" goodm:"immutable"`
 
 ### `default=X`
 
-Annotates the default value. This is metadata for documentation and code generation — goodm does not automatically apply defaults.
+Sets the default value for a field. During `Create` and `CreateMany`, if the field is zero-valued, goodm sets it to this default before hooks and validation run. Supported types: string, bool, int/int8-64, uint/uint8-64, float32/float64.
 
 ```go
 Role string `bson:"role" goodm:"default=user"`

@@ -12,6 +12,11 @@ var (
 
 	// ErrNoDatabase is returned when no database connection is available.
 	ErrNoDatabase = errors.New("goodm: no database connection (call Connect first)")
+
+	// ErrVersionConflict is returned when an update fails due to a version mismatch
+	// (optimistic concurrency control). This means another process modified the
+	// document between your read and write.
+	ErrVersionConflict = errors.New("goodm: version conflict (document was modified by another process)")
 )
 
 // DriftError indicates a field exists in the database but not in the schema.

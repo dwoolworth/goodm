@@ -90,6 +90,14 @@ func CreateMany(ctx context.Context, models interface{}, opts ...CreateOptions) 
 			// Set timestamps
 			setTimestamps(model, now)
 
+			// Apply schema defaults to zero-valued fields
+			if err := applyDefaults(model, schema); err != nil {
+				return err
+			}
+
+			// Initialize version to 0
+			setModelVersion(model, 0)
+
 			// BeforeCreate hook
 			if hook, ok := model.(BeforeCreate); ok {
 				if err := hook.BeforeCreate(ctx); err != nil {
