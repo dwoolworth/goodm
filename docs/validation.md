@@ -61,6 +61,33 @@ Example messages:
 - `"value 200 exceeds maximum 120"`
 - `"field is immutable and cannot be changed"`
 
+## Subdocument Validation
+
+Validation recurses into nested structs and slice elements. Error paths use dot notation for nested fields and bracket notation for slice indexes:
+
+```go
+order := &Order{
+    Name: "Order1",
+    Address: Address{Street: ""}, // required — will fail
+    Items: []OrderItem{
+        {Name: "", Quantity: 2}, // required — will fail
+    },
+}
+err := goodm.Create(ctx, order)
+
+// Errors:
+// - Field: "address.street", Message: "field is required"
+// - Field: "address.city",   Message: "field is required"
+// - Field: "items[0].name",  Message: "field is required"
+```
+
+Path format examples:
+- `address.street` — nested struct field
+- `items[0].name` — first element of a slice
+- `shipping.address.city` — deeply nested (subdoc within subdoc)
+
+Nil pointer subdocuments are skipped during inner validation (the field-level `required` check catches their absence). Empty slices produce no inner validation errors.
+
 ## When Validation Runs
 
 | Operation | Validates? | Immutable Check? |

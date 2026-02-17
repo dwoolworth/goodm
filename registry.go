@@ -31,26 +31,8 @@ func Register(model interface{}, collection string) error {
 		Collection: collection,
 	}
 
-	// Parse struct fields
-	fields := internal.StructFields(t)
-	for _, f := range fields {
-		bsonTag := f.Tag.Get("bson")
-		bsonName, _ := ParseBSONTag(bsonTag)
-		if bsonName == "" {
-			bsonName = strings.ToLower(f.Name)
-		}
-		if bsonName == "-" {
-			continue
-		}
-
-		goodmTag := f.Tag.Get("goodm")
-		fs := ParseGoodmTag(goodmTag)
-		fs.Name = f.Name
-		fs.BSONName = bsonName
-		fs.Type = internal.TypeName(f.Type)
-
-		schema.Fields = append(schema.Fields, fs)
-	}
+	// Parse struct fields (recursively handles subdocuments)
+	schema.Fields = parseFields(t, nil)
 
 	// Check for Indexable interface (compound indexes)
 	if indexable, ok := model.(Indexable); ok {
@@ -94,6 +76,59 @@ func Get(name string) (*Schema, bool) {
 	defer registryMu.RUnlock()
 	s, ok := registry[name]
 	return s, ok
+}
+
+// parseFields recursively parses struct fields into FieldSchema slices.
+// The seen map tracks types being parsed to prevent infinite recursion on circular references.
+func parseFields(t reflect.Type, seen map[reflect.Type]bool) []FieldSchema {
+	if seen == nil {
+		seen = make(map[reflect.Type]bool)
+	}
+
+	fields := internal.StructFields(t)
+	var result []FieldSchema
+
+	for _, f := range fields {
+		bsonTag := f.Tag.Get("bson")
+		bsonName, _ := ParseBSONTag(bsonTag)
+		if bsonName == "" {
+			bsonName = strings.ToLower(f.Name)
+		}
+		if bsonName == "-" {
+			continue
+		}
+
+		goodmTag := f.Tag.Get("goodm")
+		fs := ParseGoodmTag(goodmTag)
+		fs.Name = f.Name
+		fs.BSONName = bsonName
+		fs.Type = internal.TypeName(f.Type)
+
+		// Determine underlying type (deref pointers, unwrap slices)
+		fieldType := f.Type
+		isSlice := false
+		if fieldType.Kind() == reflect.Slice {
+			isSlice = true
+			fieldType = fieldType.Elem()
+		}
+		if fieldType.Kind() == reflect.Ptr {
+			fieldType = fieldType.Elem()
+		}
+
+		// Recurse into struct types that aren't leaf types
+		if fieldType.Kind() == reflect.Struct && !isLeafType(fieldType) {
+			fs.IsSlice = isSlice
+			if !seen[fieldType] {
+				seen[fieldType] = true
+				fs.SubFields = parseFields(fieldType, seen)
+				delete(seen, fieldType)
+			}
+		}
+
+		result = append(result, fs)
+	}
+
+	return result
 }
 
 // detectHooks checks which hook interfaces a model implements.

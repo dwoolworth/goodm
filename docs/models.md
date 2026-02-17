@@ -156,6 +156,40 @@ Available options:
 
 Models without `CollectionOptions()` use whatever concern is configured on the `*mongo.Database`.
 
+## Subdocuments
+
+Nested structs are treated as subdocuments. goodm recursively parses `goodm` tags on nested struct fields, so validation, defaults, and schema introspection work at any depth.
+
+```go
+type Address struct {
+    Street string `bson:"street" goodm:"required"`
+    City   string `bson:"city"   goodm:"required"`
+    Zip    string `bson:"zip"    goodm:"default=00000"`
+}
+
+type OrderItem struct {
+    Name     string `bson:"name"     goodm:"required"`
+    Quantity int    `bson:"quantity" goodm:"min=1"`
+}
+
+type Order struct {
+    goodm.Model `bson:",inline"`
+    Name        string      `bson:"name"    goodm:"required"`
+    Address     Address     `bson:"address" goodm:"required"`
+    Items       []OrderItem `bson:"items"`
+}
+```
+
+Subdocuments support:
+- **Validation** — all `goodm` tags (`required`, `enum`, `min`, `max`) are enforced recursively. Errors use dotted paths: `"address.street"`, `"items[0].name"`.
+- **Defaults** — `default=X` tags inside subdocuments are applied during `Create` and `CreateMany`.
+- **Schema introspection** — `FieldSchema.SubFields` contains the parsed inner fields. `FieldSchema.IsSlice` is true for `[]struct` fields.
+- **Immutability** — marking a subdocument field as `immutable` makes the entire subdocument immutable (compared with `reflect.DeepEqual`).
+
+Subdocuments are NOT separate models — they don't have collections, hooks, or CRUD operations. They exist as part of their parent's schema.
+
+Leaf types (`time.Time`, `bson.ObjectID`, `bson.Decimal128`) are never recursed into, even though they are structs.
+
 ## Registration
 
 Models must be registered before use. The convention is to register in `init()`:

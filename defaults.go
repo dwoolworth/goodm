@@ -14,23 +14,54 @@ func applyDefaults(model interface{}, schema *Schema) error {
 		v = v.Elem()
 	}
 
-	for _, field := range schema.Fields {
-		if field.Default == "" {
-			continue
-		}
+	return applyFieldDefaults(v, schema.Fields)
+}
 
+// applyFieldDefaults recursively applies default values to zero-valued fields,
+// including fields inside subdocuments and slice elements.
+func applyFieldDefaults(v reflect.Value, fields []FieldSchema) error {
+	for _, field := range fields {
 		fv := v.FieldByName(field.Name)
 		if !fv.IsValid() || !fv.CanSet() {
 			continue
 		}
 
-		// Only apply to zero-valued fields
-		if !fv.IsZero() {
-			continue
+		// Apply default to primitive fields
+		if field.Default != "" && fv.IsZero() {
+			if err := setFieldFromString(fv, field.Default); err != nil {
+				return fmt.Errorf("goodm: cannot apply default %q to field %s: %w", field.Default, field.Name, err)
+			}
 		}
 
-		if err := setFieldFromString(fv, field.Default); err != nil {
-			return fmt.Errorf("goodm: cannot apply default %q to field %s: %w", field.Default, field.Name, err)
+		// Recurse into subdocuments
+		if len(field.SubFields) > 0 {
+			if field.IsSlice {
+				// Slice of structs: apply defaults to each element
+				for i := 0; i < fv.Len(); i++ {
+					elemVal := fv.Index(i)
+					if elemVal.Kind() == reflect.Ptr {
+						if elemVal.IsNil() {
+							continue
+						}
+						elemVal = elemVal.Elem()
+					}
+					if err := applyFieldDefaults(elemVal, field.SubFields); err != nil {
+						return err
+					}
+				}
+			} else {
+				// Single struct or *struct
+				innerVal := fv
+				if innerVal.Kind() == reflect.Ptr {
+					if innerVal.IsNil() {
+						continue // skip nil pointer subdocs
+					}
+					innerVal = innerVal.Elem()
+				}
+				if err := applyFieldDefaults(innerVal, field.SubFields); err != nil {
+					return err
+				}
+			}
 		}
 	}
 

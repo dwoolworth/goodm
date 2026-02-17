@@ -112,6 +112,93 @@ func TestApplyDefaults_InvalidParse(t *testing.T) {
 	}
 }
 
+// --- subdocument defaults tests ---
+
+func TestApplyDefaults_SubdocumentStruct(t *testing.T) {
+	registerTestModels()
+	defer unregisterTestModels()
+
+	schema, _ := Get("testOrder")
+
+	order := &testOrder{
+		Name: "Order1",
+		Address: testAddress{
+			Street: "123 Main",
+			City:   "NYC",
+			// Zip left empty — should get default "00000"
+		},
+	}
+	if err := applyDefaults(order, schema); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if order.Address.Zip != "00000" {
+		t.Fatalf("expected Zip '00000', got %q", order.Address.Zip)
+	}
+}
+
+func TestApplyDefaults_SubdocumentStructNoOverwrite(t *testing.T) {
+	registerTestModels()
+	defer unregisterTestModels()
+
+	schema, _ := Get("testOrder")
+
+	order := &testOrder{
+		Name: "Order1",
+		Address: testAddress{
+			Street: "123 Main",
+			City:   "NYC",
+			Zip:    "12345",
+		},
+	}
+	if err := applyDefaults(order, schema); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if order.Address.Zip != "12345" {
+		t.Fatalf("expected Zip '12345' (not overwritten), got %q", order.Address.Zip)
+	}
+}
+
+func TestApplyDefaults_SubdocumentSlice(t *testing.T) {
+	// Use a manually constructed schema with defaults inside slice elements
+	type Item struct {
+		Name   string `bson:"name"`
+		Status string `bson:"status" goodm:"default=pending"`
+	}
+	type Container struct {
+		Items []Item `bson:"items"`
+	}
+
+	schema := &Schema{
+		Fields: []FieldSchema{
+			{
+				Name:     "Items",
+				BSONName: "items",
+				IsSlice:  true,
+				SubFields: []FieldSchema{
+					{Name: "Name", BSONName: "name"},
+					{Name: "Status", BSONName: "status", Default: "pending"},
+				},
+			},
+		},
+	}
+
+	c := &Container{
+		Items: []Item{
+			{Name: "A"},           // Status empty — should get default
+			{Name: "B", Status: "done"}, // Status set — should not overwrite
+		},
+	}
+	if err := applyDefaults(c, schema); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.Items[0].Status != "pending" {
+		t.Fatalf("expected Status 'pending', got %q", c.Items[0].Status)
+	}
+	if c.Items[1].Status != "done" {
+		t.Fatalf("expected Status 'done' (not overwritten), got %q", c.Items[1].Status)
+	}
+}
+
 func TestSetFieldFromString_UnsupportedType(t *testing.T) {
 	// A slice field cannot be set from string
 	v := reflect.ValueOf(&[]string{}).Elem()
