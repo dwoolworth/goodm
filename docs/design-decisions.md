@@ -90,6 +90,18 @@ Mongoose schemas accept many options. Here's how goodm handles each:
 | `validateBeforeSave` | Always on | goodm always validates before Create and Update. To bypass validation, use raw passthroughs (`UpdateOne`, `DeleteOne`, `UpdateMany`, `DeleteMany`). |
 | `selectPopulatedPaths` | N/A | goodm's `Populate` is explicit — you specify exactly which fields to populate. There's no automatic path selection to configure. |
 
+## Implemented: Subdocuments
+
+Nested structs are parsed recursively during registration. All `goodm` tags on inner struct fields are enforced — validation, defaults, and schema introspection work at any nesting depth.
+
+**Why inline sub-schemas instead of separate registration?** Subdocuments aren't models — they don't have collections, hooks, or CRUD operations. They're structural components of their parent document. Requiring separate registration would add ceremony for no benefit and would imply capabilities (like independent CRUD) that don't exist.
+
+**Circular reference safety:** During parsing, goodm tracks which types are currently being parsed. If a type references itself (e.g., `type Node struct { Child *Node }`), the recursive reference gets empty SubFields rather than causing infinite recursion.
+
+**Leaf types:** `time.Time`, `bson.ObjectID`, and `bson.Decimal128` are structs in Go but serialize as atomic BSON values. goodm treats them as leaf types and never recurses into their fields.
+
+**What's deferred:** `ref=` tags inside subdocuments are parsed and stored but `Populate()` only operates on top-level fields. Dotted-path indexes (`unique`/`index` on inner fields) are parsed but not acted on by `Enforce()`. Both are future enhancements.
+
 ## Design Principles
 
 These omissions follow a few core principles:

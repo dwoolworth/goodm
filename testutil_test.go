@@ -86,6 +86,26 @@ func (u *testHookUser) AfterDelete(ctx context.Context) error {
 	return nil
 }
 
+// --- subdocument test models ---
+
+type testAddress struct {
+	Street string `bson:"street" goodm:"required"`
+	City   string `bson:"city"   goodm:"required"`
+	Zip    string `bson:"zip"    goodm:"default=00000"`
+}
+
+type testOrderItem struct {
+	Name     string `bson:"name"     goodm:"required"`
+	Quantity int    `bson:"quantity" goodm:"min=1"`
+}
+
+type testOrder struct {
+	Model   `bson:",inline"`
+	Name    string          `bson:"name"    goodm:"required"`
+	Address testAddress     `bson:"address" goodm:"required"`
+	Items   []testOrderItem `bson:"items"`
+}
+
 // --- test DB setup ---
 
 func setupTestDB(t *testing.T) (context.Context, *mongo.Database, func()) {
@@ -143,6 +163,7 @@ func registerTestModels() {
 	_ = Register(&testPost{}, "test_posts")
 	_ = Register(&testHookUser{}, "test_hook_users")
 	_ = Register(&testConfiguredModel{}, "test_configured")
+	_ = Register(&testOrder{}, "test_orders")
 }
 
 func unregisterTestModels() {
@@ -153,5 +174,6 @@ func unregisterTestModels() {
 	delete(registry, "testPost")
 	delete(registry, "testHookUser")
 	delete(registry, "testConfiguredModel")
+	delete(registry, "testOrder")
 	registryMu.Unlock()
 }

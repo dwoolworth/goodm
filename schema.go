@@ -1,6 +1,10 @@
 package goodm
 
 import (
+	"reflect"
+	"time"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo/readconcern"
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
@@ -16,18 +20,28 @@ type CollectionOptions struct {
 
 // FieldSchema describes a single field parsed from struct tags.
 type FieldSchema struct {
-	Name      string   // Go field name
-	BSONName  string   // bson tag name
-	Type      string   // Go type as string
-	Required  bool     // field must be non-zero
-	Unique    bool     // unique index on this field
-	Index     bool     // single-field index
-	Default   string   // raw default value
-	Enum      []string // allowed values
-	Min       *int     // minimum value/length
-	Max       *int     // maximum value/length
-	Ref       string   // referenced collection
-	Immutable bool     // cannot be changed after creation
+	Name      string        // Go field name
+	BSONName  string        // bson tag name
+	Type      string        // Go type as string
+	Required  bool          // field must be non-zero
+	Unique    bool          // unique index on this field
+	Index     bool          // single-field index
+	Default   string        // raw default value
+	Enum      []string      // allowed values
+	Min       *int          // minimum value/length
+	Max       *int          // maximum value/length
+	Ref       string        // referenced collection
+	Immutable bool          // cannot be changed after creation
+	SubFields []FieldSchema // inner fields for struct/[]struct subdocuments
+	IsSlice   bool          // true if field is []struct or []*struct
+}
+
+// isLeafType returns true for struct types that serialize as atomic BSON values
+// and should NOT be recursed into for subdocument parsing.
+func isLeafType(t reflect.Type) bool {
+	return t == reflect.TypeOf(time.Time{}) ||
+		t == reflect.TypeOf(bson.ObjectID{}) ||
+		t == reflect.TypeOf(bson.Decimal128{})
 }
 
 // Schema is the parsed representation of a model struct.

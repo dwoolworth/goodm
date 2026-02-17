@@ -411,6 +411,93 @@ func TestHooks_Integration(t *testing.T) {
 	}
 }
 
+// --- subdocument registration tests ---
+
+func TestParseFields_SubdocumentStruct(t *testing.T) {
+	registerTestModels()
+	defer unregisterTestModels()
+
+	schema, ok := Get("testOrder")
+	if !ok {
+		t.Fatal("testOrder not registered")
+	}
+
+	// Address field should have 3 SubFields and IsSlice=false
+	addrField := schema.GetField("address")
+	if addrField == nil {
+		t.Fatal("expected 'address' field in schema")
+	}
+	if len(addrField.SubFields) != 3 {
+		t.Fatalf("expected 3 SubFields for address, got %d", len(addrField.SubFields))
+	}
+	if addrField.IsSlice {
+		t.Fatal("expected address IsSlice=false")
+	}
+
+	// Verify sub-field names
+	subNames := map[string]bool{}
+	for _, sf := range addrField.SubFields {
+		subNames[sf.BSONName] = true
+	}
+	for _, name := range []string{"street", "city", "zip"} {
+		if !subNames[name] {
+			t.Fatalf("expected sub-field %q in address", name)
+		}
+	}
+}
+
+func TestParseFields_SubdocumentSlice(t *testing.T) {
+	registerTestModels()
+	defer unregisterTestModels()
+
+	schema, ok := Get("testOrder")
+	if !ok {
+		t.Fatal("testOrder not registered")
+	}
+
+	// Items field should have 2 SubFields and IsSlice=true
+	itemsField := schema.GetField("items")
+	if itemsField == nil {
+		t.Fatal("expected 'items' field in schema")
+	}
+	if len(itemsField.SubFields) != 2 {
+		t.Fatalf("expected 2 SubFields for items, got %d", len(itemsField.SubFields))
+	}
+	if !itemsField.IsSlice {
+		t.Fatal("expected items IsSlice=true")
+	}
+}
+
+func TestParseFields_LeafTypesNoSubFields(t *testing.T) {
+	registerTestModels()
+	defer unregisterTestModels()
+
+	schema, ok := Get("testUser")
+	if !ok {
+		t.Fatal("testUser not registered")
+	}
+
+	// time.Time fields (CreatedAt, UpdatedAt) should have no SubFields
+	for _, bsonName := range []string{"created_at", "updated_at"} {
+		f := schema.GetField(bsonName)
+		if f == nil {
+			t.Fatalf("expected %q field", bsonName)
+		}
+		if len(f.SubFields) != 0 {
+			t.Fatalf("expected no SubFields for %s (leaf type), got %d", bsonName, len(f.SubFields))
+		}
+	}
+
+	// bson.ObjectID field should have no SubFields
+	profileField := schema.GetField("profile")
+	if profileField == nil {
+		t.Fatal("expected 'profile' field")
+	}
+	if len(profileField.SubFields) != 0 {
+		t.Fatalf("expected no SubFields for profile (ObjectID), got %d", len(profileField.SubFields))
+	}
+}
+
 // --- collection options unit tests ---
 
 func TestRegister_ConfigurableInterface(t *testing.T) {
@@ -652,6 +739,112 @@ func TestUpdate_VersionConflict_RollsBack(t *testing.T) {
 	// u2's version should be rolled back to 0 (its pre-conflict state)
 	if u2.Version != 0 {
 		t.Fatalf("expected version rolled back to 0, got %d", u2.Version)
+	}
+}
+
+// --- subdocument integration tests ---
+
+func TestSubdoc_CreateAndFindOne_Integration(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	order := &testOrder{
+		Name: "Order1",
+		Address: testAddress{
+			Street: "123 Main St",
+			City:   "NYC",
+			Zip:    "10001",
+		},
+		Items: []testOrderItem{
+			{Name: "Widget", Quantity: 3},
+			{Name: "Gadget", Quantity: 1},
+		},
+	}
+	if err := Create(ctx, order); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	found := &testOrder{}
+	if err := FindOne(ctx, bson.D{{Key: "_id", Value: order.ID}}, found); err != nil {
+		t.Fatalf("find: %v", err)
+	}
+	if found.Address.Street != "123 Main St" {
+		t.Fatalf("expected street '123 Main St', got %q", found.Address.Street)
+	}
+	if found.Address.City != "NYC" {
+		t.Fatalf("expected city 'NYC', got %q", found.Address.City)
+	}
+	if len(found.Items) != 2 {
+		t.Fatalf("expected 2 items, got %d", len(found.Items))
+	}
+	if found.Items[0].Name != "Widget" {
+		t.Fatalf("expected item name 'Widget', got %q", found.Items[0].Name)
+	}
+}
+
+func TestSubdoc_CreateValidationError_Integration(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	order := &testOrder{
+		Name: "Order1",
+		Address: testAddress{
+			Street: "", // required — should fail
+			City:   "NYC",
+		},
+	}
+	err := Create(ctx, order)
+	if err == nil {
+		t.Fatal("expected validation error")
+	}
+	var ve ValidationErrors
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected ValidationErrors, got %T: %v", err, err)
+	}
+
+	found := false
+	for _, e := range ve {
+		if e.Field == "address.street" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected error on 'address.street', got %v", ve)
+	}
+}
+
+func TestSubdoc_CreateManyWithDefaults_Integration(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	orders := []testOrder{
+		{
+			Name: "Order1",
+			Address: testAddress{
+				Street: "123 Main",
+				City:   "NYC",
+				// Zip left empty — should get default "00000"
+			},
+		},
+		{
+			Name: "Order2",
+			Address: testAddress{
+				Street: "456 Oak",
+				City:   "LA",
+				Zip:    "90001",
+			},
+		},
+	}
+	if err := CreateMany(ctx, orders); err != nil {
+		t.Fatalf("create many: %v", err)
+	}
+
+	if orders[0].Address.Zip != "00000" {
+		t.Fatalf("expected default Zip '00000', got %q", orders[0].Address.Zip)
+	}
+	if orders[1].Address.Zip != "90001" {
+		t.Fatalf("expected Zip '90001' (not overwritten), got %q", orders[1].Address.Zip)
 	}
 }
 
