@@ -1,0 +1,232 @@
+# Models & Tags
+
+## Model Definition
+
+A goodm model is a Go struct that embeds `goodm.Model` and is registered with a collection name. The struct is the single source of truth for your database schema.
+
+```go
+type User struct {
+    goodm.Model `bson:",inline"`
+    Email       string        `bson:"email"    goodm:"unique,required"`
+    Name        string        `bson:"name"     goodm:"required,immutable"`
+    Role        string        `bson:"role"     goodm:"enum=admin|user|mod,default=user"`
+    Age         int           `bson:"age"      goodm:"min=13,max=120"`
+    Profile     bson.ObjectID `bson:"profile"  goodm:"ref=profiles"`
+    Verified    bool          `bson:"verified" goodm:"default=false"`
+}
+
+func init() {
+    goodm.Register(&User{}, "users")
+}
+```
+
+## Base Model
+
+`goodm.Model` provides four fields automatically:
+
+| Field | BSON | Type | Behavior |
+|-------|------|------|----------|
+| `ID` | `_id` | `bson.ObjectID` | Auto-generated on Create if zero |
+| `CreatedAt` | `created_at` | `time.Time` | Set on Create (only if zero) |
+| `UpdatedAt` | `updated_at` | `time.Time` | Set on Create, refreshed on Update |
+| `Version` | `__v` | `int` | Set to 0 on Create, incremented on each Update (optimistic concurrency) |
+
+Always embed with `bson:",inline"` to flatten the fields into the document.
+
+## Tag Reference
+
+Tags are specified in the `goodm` struct tag, comma-separated:
+
+### `unique`
+
+Creates a unique index on this field. Enforced at the database level.
+
+```go
+Email string `bson:"email" goodm:"unique"`
+```
+
+### `index`
+
+Creates a non-unique index on this field.
+
+```go
+Category string `bson:"category" goodm:"index"`
+```
+
+### `required`
+
+Field must be non-zero on Create and Update. Zero means Go's zero value: `""` for strings, `0` for ints, `false` for bools, zero `ObjectID`, etc.
+
+```go
+Name string `bson:"name" goodm:"required"`
+```
+
+### `immutable`
+
+Field cannot be changed after the document is created. On Update, goodm fetches the existing document and compares immutable fields using `reflect.DeepEqual`. If any differ, a `ValidationError` is returned.
+
+```go
+Username string `bson:"username" goodm:"immutable"`
+```
+
+### `default=X`
+
+Sets the default value for a field. During `Create` and `CreateMany`, if the field is zero-valued, goodm sets it to this default before hooks and validation run. Supported types: string, bool, int/int8-64, uint/uint8-64, float32/float64.
+
+```go
+Role string `bson:"role" goodm:"default=user"`
+```
+
+### `enum=a|b|c`
+
+Restricts the field to one of the listed values (pipe-separated). Validated on Create and Update.
+
+```go
+Status string `bson:"status" goodm:"enum=draft|published|archived"`
+```
+
+### `min=N` / `max=N`
+
+Numeric boundaries for int/float fields. Validated on Create and Update.
+
+```go
+Age   int `bson:"age"   goodm:"min=13,max=120"`
+Price int `bson:"price" goodm:"min=0"`
+```
+
+### `ref=collection`
+
+Marks a `bson.ObjectID` field as a reference to a document in another collection. Used by `Populate()` to resolve references.
+
+```go
+AuthorID bson.ObjectID `bson:"author" goodm:"ref=users"`
+```
+
+## Combining Tags
+
+Tags are comma-separated and can be combined freely:
+
+```go
+Email string `bson:"email" goodm:"unique,required,index"`
+SKU   string `bson:"sku"   goodm:"unique,required,immutable"`
+```
+
+## Compound Indexes
+
+For multi-field indexes, implement the `Indexable` interface:
+
+```go
+func (u *User) Indexes() []goodm.CompoundIndex {
+    return []goodm.CompoundIndex{
+        goodm.NewCompoundIndex("email", "role"),           // non-unique
+        goodm.NewUniqueCompoundIndex("tenant", "username"), // unique
+    }
+}
+```
+
+Compound indexes are created by `Enforce()` alongside single-field indexes.
+
+## Collection Options (Read/Write Concern)
+
+For per-schema read preference, read concern, and write concern, implement the `Configurable` interface:
+
+```go
+import (
+    "go.mongodb.org/mongo-driver/v2/mongo/readpref"
+    "go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
+)
+
+func (u *User) CollectionOptions() goodm.CollectionOptions {
+    return goodm.CollectionOptions{
+        ReadPreference: readpref.SecondaryPreferred(),
+        WriteConcern:   writeconcern.Majority(),
+    }
+}
+```
+
+All CRUD, bulk, and pipeline operations automatically use the configured options. This is useful for separating read/write patterns in clustered deployments — for example, routing reads for an analytics model to secondaries while keeping user writes on majority concern.
+
+Available options:
+
+| Field | Type | Example |
+|-------|------|---------|
+| `ReadPreference` | `*readpref.ReadPref` | `readpref.SecondaryPreferred()`, `readpref.Nearest()` |
+| `ReadConcern` | `*readconcern.ReadConcern` | `readconcern.Majority()`, `readconcern.Local()` |
+| `WriteConcern` | `*writeconcern.WriteConcern` | `writeconcern.Majority()`, `writeconcern.W1()` |
+
+Models without `CollectionOptions()` use whatever concern is configured on the `*mongo.Database`.
+
+## Subdocuments
+
+Nested structs are treated as subdocuments. goodm recursively parses `goodm` tags on nested struct fields, so validation, defaults, and schema introspection work at any depth.
+
+```go
+type Address struct {
+    Street string `bson:"street" goodm:"required"`
+    City   string `bson:"city"   goodm:"required"`
+    Zip    string `bson:"zip"    goodm:"default=00000"`
+}
+
+type OrderItem struct {
+    Name     string `bson:"name"     goodm:"required"`
+    Quantity int    `bson:"quantity" goodm:"min=1"`
+}
+
+type Order struct {
+    goodm.Model `bson:",inline"`
+    Name        string      `bson:"name"    goodm:"required"`
+    Address     Address     `bson:"address" goodm:"required"`
+    Items       []OrderItem `bson:"items"`
+}
+```
+
+Subdocuments support:
+- **Validation** — all `goodm` tags (`required`, `enum`, `min`, `max`) are enforced recursively. Errors use dotted paths: `"address.street"`, `"items[0].name"`.
+- **Defaults** — `default=X` tags inside subdocuments are applied during `Create` and `CreateMany`.
+- **Schema introspection** — `FieldSchema.SubFields` contains the parsed inner fields. `FieldSchema.IsSlice` is true for `[]struct` fields.
+- **Immutability** — marking a subdocument field as `immutable` makes the entire subdocument immutable (compared with `reflect.DeepEqual`).
+
+Subdocuments are NOT separate models — they don't have collections, hooks, or CRUD operations. They exist as part of their parent's schema.
+
+Leaf types (`time.Time`, `bson.ObjectID`, `bson.Decimal128`) are never recursed into, even though they are structs.
+
+## Registration
+
+Models must be registered before use. The convention is to register in `init()`:
+
+```go
+func init() {
+    if err := goodm.Register(&User{}, "users"); err != nil {
+        panic(err)
+    }
+}
+```
+
+`Register` parses the struct tags, detects hook and interface implementations, and stores the schema in an internal registry. The registry is used by all CRUD operations to:
+
+- Look up the collection name for a model type
+- Validate fields on write operations
+- Enforce immutable fields on updates
+- Detect compound indexes (`Indexable`)
+- Apply per-schema collection options (`Configurable`)
+
+## Inspecting Schemas
+
+Retrieve registered schemas programmatically:
+
+```go
+// Get a specific schema
+schema, ok := goodm.Get("User")
+
+// Get all registered schemas
+all := goodm.GetAll()
+for name, schema := range all {
+    fmt.Printf("%s -> %s\n", name, schema.Collection)
+}
+```
+
+Or use the CLI:
+
+```bash
+goodm inspect
+```
