@@ -1,5 +1,6 @@
 # goodm
 
+[![CI](https://github.com/dwoolworth/goodm/actions/workflows/ci.yml/badge.svg)](https://github.com/dwoolworth/goodm/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/dwoolworth/goodm.svg)](https://pkg.go.dev/github.com/dwoolworth/goodm)
 [![Go Report Card](https://goreportcard.com/badge/github.com/dwoolworth/goodm)](https://goreportcard.com/report/github.com/dwoolworth/goodm)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
@@ -37,6 +38,23 @@ goodm fills that gap. Your Go struct *is* the schema. Tags declare constraints, 
 - **Full write lifecycle.** Create and Update automatically handle ID generation, timestamps, hook execution, validation, and immutable field enforcement. You don't wire any of it.
 - **Escape hatches.** `UpdateOne`, `DeleteOne`, `UpdateMany`, `DeleteMany` bypass the ODM and hit MongoDB directly when you need raw performance.
 - **Schema-aware CLI.** `goodm discover` reverse-engineers an existing database into Go structs. `goodm migrate` diffs your structs against a live database and syncs indexes.
+
+## How does goodm compare?
+
+| Feature | goodm | mongo-driver | mgm | mongox |
+|---|---|---|---|---|
+| Schema-as-struct tags | Yes | No | Partial | No |
+| Lifecycle hooks | 6 hooks | No | 3 hooks | No |
+| Validation (required, enum, min/max) | Yes | No | No | No |
+| Immutable fields | Yes | No | No | No |
+| Optimistic concurrency (versioning) | Yes | No | No | No |
+| Population (ref resolution) | Yes | No | No | No |
+| Aggregation builder | Fluent API | Manual | No | No |
+| Middleware (global + per-model) | Yes | No | No | No |
+| CLI: discover (DB → Go structs) | Yes | No | No | No |
+| CLI: migrate (sync indexes) | Yes | No | No | No |
+| Default values | Yes | No | No | No |
+| Escape hatches (raw MongoDB) | Yes | N/A | Yes | Yes |
 
 ## Install
 
