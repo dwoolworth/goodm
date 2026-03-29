@@ -290,20 +290,8 @@ func Update(ctx context.Context, model interface{}, opts ...UpdateOptions) error
 
 		coll := getCollection(db, schema)
 
-		// Only fetch the existing document if immutable fields need checking.
-		// This avoids an extra query when no fields are marked immutable.
-		if hasImmutableFields(schema) {
-			existing := reflect.New(reflect.TypeOf(model).Elem()).Interface()
-			if err := coll.FindOne(ctx, bson.D{{Key: "_id", Value: id}}).Decode(existing); err != nil {
-				if err == mongo.ErrNoDocuments {
-					return ErrNotFound
-				}
-				return fmt.Errorf("goodm: failed to fetch existing document: %w", err)
-			}
-
-			if immutableErrs := validateImmutable(existing, model, schema); len(immutableErrs) > 0 {
-				return ValidationErrors(immutableErrs)
-			}
+		if err := checkImmutableFields(ctx, coll, id, model, schema); err != nil {
+			return err
 		}
 
 		// BeforeSave hook
@@ -325,41 +313,16 @@ func Update(ctx context.Context, model interface{}, opts ...UpdateOptions) error
 		// Set UpdatedAt
 		setUpdatedAt(model, time.Now())
 
-		// Build filter with version check for optimistic concurrency.
-		// When oldVersion == 0, also match documents without __v (legacy compat).
-		var filter bson.D
-		if oldVersion == 0 {
-			filter = bson.D{
-				{Key: "_id", Value: id},
-				{Key: "$or", Value: bson.A{
-					bson.D{{Key: "__v", Value: 0}},
-					bson.D{{Key: "__v", Value: bson.D{{Key: "$exists", Value: false}}}},
-				}},
-			}
-		} else {
-			filter = bson.D{
-				{Key: "_id", Value: id},
-				{Key: "__v", Value: oldVersion},
-			}
-		}
-
-		// Replace
+		// Replace with optimistic concurrency check
+		filter := buildVersionFilter(id, oldVersion)
 		result, err := coll.ReplaceOne(ctx, filter, model)
 		if err != nil {
-			setModelVersion(model, oldVersion) // roll back on error
+			setModelVersion(model, oldVersion)
 			return fmt.Errorf("goodm: update failed: %w", err)
 		}
 		if result.MatchedCount == 0 {
-			setModelVersion(model, oldVersion) // roll back version
-			// Disambiguate: does the doc exist at all?
-			count, countErr := coll.CountDocuments(ctx, bson.D{{Key: "_id", Value: id}})
-			if countErr != nil {
-				return fmt.Errorf("goodm: update failed: %w", countErr)
-			}
-			if count == 0 {
-				return ErrNotFound
-			}
-			return ErrVersionConflict
+			setModelVersion(model, oldVersion)
+			return checkUpdateConflict(ctx, coll, id)
 		}
 
 		// AfterSave hook
@@ -371,6 +334,56 @@ func Update(ctx context.Context, model interface{}, opts ...UpdateOptions) error
 
 		return nil
 	})
+}
+
+// checkImmutableFields verifies that immutable fields have not been modified.
+// Skips the check entirely if no fields are marked immutable.
+func checkImmutableFields(ctx context.Context, coll *mongo.Collection, id bson.ObjectID, model interface{}, schema *Schema) error {
+	if !hasImmutableFields(schema) {
+		return nil
+	}
+	existing := reflect.New(reflect.TypeOf(model).Elem()).Interface()
+	if err := coll.FindOne(ctx, bson.D{{Key: "_id", Value: id}}).Decode(existing); err != nil {
+		if err == mongo.ErrNoDocuments {
+			return ErrNotFound
+		}
+		return fmt.Errorf("goodm: failed to fetch existing document: %w", err)
+	}
+	if immutableErrs := validateImmutable(existing, model, schema); len(immutableErrs) > 0 {
+		return ValidationErrors(immutableErrs)
+	}
+	return nil
+}
+
+// buildVersionFilter constructs a filter with optimistic concurrency version checking.
+// When oldVersion == 0, also matches documents without __v (legacy compat).
+func buildVersionFilter(id bson.ObjectID, oldVersion int) bson.D {
+	if oldVersion == 0 {
+		return bson.D{
+			{Key: "_id", Value: id},
+			{Key: "$or", Value: bson.A{
+				bson.D{{Key: "__v", Value: 0}},
+				bson.D{{Key: "__v", Value: bson.D{{Key: "$exists", Value: false}}}},
+			}},
+		}
+	}
+	return bson.D{
+		{Key: "_id", Value: id},
+		{Key: "__v", Value: oldVersion},
+	}
+}
+
+// checkUpdateConflict disambiguates between a missing document and a version conflict
+// when an update matched zero documents.
+func checkUpdateConflict(ctx context.Context, coll *mongo.Collection, id bson.ObjectID) error {
+	count, err := coll.CountDocuments(ctx, bson.D{{Key: "_id", Value: id}})
+	if err != nil {
+		return fmt.Errorf("goodm: update failed: %w", err)
+	}
+	if count == 0 {
+		return ErrNotFound
+	}
+	return ErrVersionConflict
 }
 
 // UpdateOne performs a partial update on a single document matching filter.

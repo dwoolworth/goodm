@@ -22,37 +22,47 @@ func ParseGoodmTag(tag string) FieldSchema {
 		}
 
 		if k, v, ok := strings.Cut(part, "="); ok {
-			switch k {
-			case "default":
-				fs.Default = v
-			case "enum":
-				fs.Enum = strings.Split(v, "|")
-			case "min":
-				if n, err := strconv.Atoi(v); err == nil {
-					fs.Min = &n
-				}
-			case "max":
-				if n, err := strconv.Atoi(v); err == nil {
-					fs.Max = &n
-				}
-			case "ref":
-				fs.Ref = v
-			}
+			parseTagKeyValue(&fs, k, v)
 		} else {
-			switch part {
-			case "unique":
-				fs.Unique = true
-			case "index":
-				fs.Index = true
-			case "required":
-				fs.Required = true
-			case "immutable":
-				fs.Immutable = true
-			}
+			parseTagFlag(&fs, part)
 		}
 	}
 
 	return fs
+}
+
+// parseTagKeyValue applies a key=value tag directive to a FieldSchema.
+func parseTagKeyValue(fs *FieldSchema, key, value string) {
+	switch key {
+	case "default":
+		fs.Default = value
+	case "enum":
+		fs.Enum = strings.Split(value, "|")
+	case "min":
+		if n, err := strconv.Atoi(value); err == nil {
+			fs.Min = &n
+		}
+	case "max":
+		if n, err := strconv.Atoi(value); err == nil {
+			fs.Max = &n
+		}
+	case "ref":
+		fs.Ref = value
+	}
+}
+
+// parseTagFlag applies a boolean flag tag directive to a FieldSchema.
+func parseTagFlag(fs *FieldSchema, flag string) {
+	switch flag {
+	case "unique":
+		fs.Unique = true
+	case "index":
+		fs.Index = true
+	case "required":
+		fs.Required = true
+	case "immutable":
+		fs.Immutable = true
+	}
 }
 
 // ParseBSONTag extracts the BSON field name from a `bson:"..."` struct tag.

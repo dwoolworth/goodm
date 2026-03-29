@@ -35,37 +35,41 @@ func applyFieldDefaults(v reflect.Value, fields []FieldSchema) error {
 
 		// Recurse into subdocuments
 		if len(field.SubFields) > 0 {
-			if field.IsSlice {
-				// Slice of structs: apply defaults to each element
-				for i := 0; i < fv.Len(); i++ {
-					elemVal := fv.Index(i)
-					if elemVal.Kind() == reflect.Ptr {
-						if elemVal.IsNil() {
-							continue
-						}
-						elemVal = elemVal.Elem()
-					}
-					if err := applyFieldDefaults(elemVal, field.SubFields); err != nil {
-						return err
-					}
-				}
-			} else {
-				// Single struct or *struct
-				innerVal := fv
-				if innerVal.Kind() == reflect.Ptr {
-					if innerVal.IsNil() {
-						continue // skip nil pointer subdocs
-					}
-					innerVal = innerVal.Elem()
-				}
-				if err := applyFieldDefaults(innerVal, field.SubFields); err != nil {
-					return err
-				}
+			if err := applySubFieldDefaults(fv, field); err != nil {
+				return err
 			}
 		}
 	}
 
 	return nil
+}
+
+// applySubFieldDefaults applies defaults to nested struct or slice-of-struct fields.
+func applySubFieldDefaults(fv reflect.Value, field FieldSchema) error {
+	if field.IsSlice {
+		for i := 0; i < fv.Len(); i++ {
+			elemVal := fv.Index(i)
+			if elemVal.Kind() == reflect.Ptr {
+				if elemVal.IsNil() {
+					continue
+				}
+				elemVal = elemVal.Elem()
+			}
+			if err := applyFieldDefaults(elemVal, field.SubFields); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	// Single struct or *struct
+	innerVal := fv
+	if innerVal.Kind() == reflect.Ptr {
+		if innerVal.IsNil() {
+			return nil
+		}
+		innerVal = innerVal.Elem()
+	}
+	return applyFieldDefaults(innerVal, field.SubFields)
 }
 
 // setFieldFromString parses a string value and sets it on a reflect.Value.

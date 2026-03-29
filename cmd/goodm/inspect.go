@@ -12,9 +12,9 @@ import (
 )
 
 var (
-	diffFlag  bool
-	mongoURI  string
-	dbName    string
+	diffFlag bool
+	mongoURI string
+	dbName   string
 )
 
 var inspectCmd = &cobra.Command{
@@ -66,26 +66,7 @@ func printSchema(schema *goodm.Schema) {
 		fmt.Printf("  %s %-12s %-14s %s%s\n", connector, field.BSONName, field.Type, attrs, refStr)
 	}
 
-	// Print indexes
-	if len(schema.CompoundIndexes) > 0 || hasIndexedFields(schema) {
-		fmt.Println()
-		fmt.Println("  Indexes:")
-		for _, field := range schema.Fields {
-			if field.Unique {
-				fmt.Printf("    ✓ %s_1 (unique)\n", field.BSONName)
-			} else if field.Index {
-				fmt.Printf("    ✓ %s_1\n", field.BSONName)
-			}
-		}
-		for _, ci := range schema.CompoundIndexes {
-			name := compoundName(ci)
-			label := "(compound)"
-			if ci.Unique {
-				label = "(compound, unique)"
-			}
-			fmt.Printf("    ✓ %s %s\n", name, label)
-		}
-	}
+	printIndexes(schema)
 
 	// Print relations
 	refs := collectRefs(schema)
@@ -104,6 +85,29 @@ func printSchema(schema *goodm.Schema) {
 		for _, h := range schema.Hooks {
 			fmt.Printf("    ⚡ %s\n", h)
 		}
+	}
+}
+
+func printIndexes(schema *goodm.Schema) {
+	if len(schema.CompoundIndexes) == 0 && !hasIndexedFields(schema) {
+		return
+	}
+	fmt.Println()
+	fmt.Println("  Indexes:")
+	for _, field := range schema.Fields {
+		if field.Unique {
+			fmt.Printf("    ✓ %s_1 (unique)\n", field.BSONName)
+		} else if field.Index {
+			fmt.Printf("    ✓ %s_1\n", field.BSONName)
+		}
+	}
+	for _, ci := range schema.CompoundIndexes {
+		name := compoundName(ci)
+		label := "(compound)"
+		if ci.Unique {
+			label = "(compound, unique)"
+		}
+		fmt.Printf("    ✓ %s %s\n", name, label)
 	}
 }
 

@@ -38,16 +38,7 @@ func CreateMany(ctx context.Context, models interface{}, opts ...CreateOptions) 
 		return nil
 	}
 
-	// Get a pointer to the first element for schema lookup
-	first := rv.Index(0)
-	var elemForSchema interface{}
-	if first.Kind() == reflect.Ptr {
-		elemForSchema = first.Interface()
-	} else {
-		elemForSchema = first.Addr().Interface()
-	}
-
-	schema, err := getSchemaForModel(elemForSchema)
+	schema, err := getSchemaForModel(elemModel(rv.Index(0)))
 	if err != nil {
 		return err
 	}
@@ -70,46 +61,10 @@ func CreateMany(ctx context.Context, models interface{}, opts ...CreateOptions) 
 		docs := make([]interface{}, rv.Len())
 
 		for i := 0; i < rv.Len(); i++ {
-			elem := rv.Index(i)
-			var model interface{}
-			if elem.Kind() == reflect.Ptr {
-				model = elem.Interface()
-			} else {
-				model = elem.Addr().Interface()
-			}
-
-			// Set ID if zero
-			id, err := getModelID(model)
+			model, err := prepareCreateItem(ctx, rv.Index(i), now, schema, i)
 			if err != nil {
 				return err
 			}
-			if id.IsZero() {
-				setModelID(model, bson.NewObjectID())
-			}
-
-			// Set timestamps
-			setTimestamps(model, now)
-
-			// Apply schema defaults to zero-valued fields
-			if err := applyDefaults(model, schema); err != nil {
-				return err
-			}
-
-			// Initialize version to 0
-			setModelVersion(model, 0)
-
-			// BeforeCreate hook
-			if hook, ok := model.(BeforeCreate); ok {
-				if err := hook.BeforeCreate(ctx); err != nil {
-					return fmt.Errorf("goodm: BeforeCreate failed on item %d: %w", i, err)
-				}
-			}
-
-			// Validate
-			if errs := Validate(model, schema); len(errs) > 0 {
-				return fmt.Errorf("goodm: validation failed on item %d: %w", i, ValidationErrors(errs))
-			}
-
 			docs[i] = model
 		}
 
@@ -120,13 +75,7 @@ func CreateMany(ctx context.Context, models interface{}, opts ...CreateOptions) 
 
 		// AfterCreate hooks
 		for i := 0; i < rv.Len(); i++ {
-			elem := rv.Index(i)
-			var model interface{}
-			if elem.Kind() == reflect.Ptr {
-				model = elem.Interface()
-			} else {
-				model = elem.Addr().Interface()
-			}
+			model := elemModel(rv.Index(i))
 			if hook, ok := model.(AfterCreate); ok {
 				if err := hook.AfterCreate(ctx); err != nil {
 					return err
@@ -136,6 +85,49 @@ func CreateMany(ctx context.Context, models interface{}, opts ...CreateOptions) 
 
 		return nil
 	})
+}
+
+// elemModel returns a pointer-to-struct interface from a reflect.Value,
+// whether the value is already a pointer or a plain struct.
+func elemModel(v reflect.Value) interface{} {
+	if v.Kind() == reflect.Ptr {
+		return v.Interface()
+	}
+	return v.Addr().Interface()
+}
+
+// prepareCreateItem initialises a single model for insertion: sets ID, timestamps,
+// defaults, version, runs BeforeCreate, and validates.
+func prepareCreateItem(ctx context.Context, elem reflect.Value, now time.Time, schema *Schema, index int) (interface{}, error) {
+	model := elemModel(elem)
+
+	id, err := getModelID(model)
+	if err != nil {
+		return nil, err
+	}
+	if id.IsZero() {
+		setModelID(model, bson.NewObjectID())
+	}
+
+	setTimestamps(model, now)
+
+	if err := applyDefaults(model, schema); err != nil {
+		return nil, err
+	}
+
+	setModelVersion(model, 0)
+
+	if hook, ok := model.(BeforeCreate); ok {
+		if err := hook.BeforeCreate(ctx); err != nil {
+			return nil, fmt.Errorf("goodm: BeforeCreate failed on item %d: %w", index, err)
+		}
+	}
+
+	if errs := Validate(model, schema); len(errs) > 0 {
+		return nil, fmt.Errorf("goodm: validation failed on item %d: %w", index, ValidationErrors(errs))
+	}
+
+	return model, nil
 }
 
 // UpdateMany updates all documents matching filter with the given update document.

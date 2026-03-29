@@ -57,7 +57,7 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 
 	// Group actions by collection
 	collectionActions := make(map[string][]goodm.MigrationAction)
-	collectionOrder := []string{}
+	collectionOrder := make([]string, 0, len(schemas))
 	for _, schema := range schemas {
 		collectionOrder = append(collectionOrder, schema.Collection)
 	}
@@ -65,31 +65,13 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 		collectionActions[action.Collection] = append(collectionActions[action.Collection], action)
 	}
 
-	createCount := 0
-	dropCount := 0
-	warnCount := 0
-
+	createCount, dropCount, warnCount := 0, 0, 0
 	for _, collName := range collectionOrder {
-		actions := collectionActions[collName]
 		fmt.Printf("%s:\n", collName)
-
-		if len(actions) == 0 {
-			fmt.Println("  ✓ No changes needed")
-		} else {
-			for _, action := range actions {
-				switch action.Type {
-				case goodm.ActionCreateIndex:
-					fmt.Printf("  + %s\n", action.Description)
-					createCount++
-				case goodm.ActionDropIndex:
-					fmt.Printf("  - %s\n", action.Description)
-					dropCount++
-				case goodm.ActionFieldDrift:
-					fmt.Printf("  ⚠ %s\n", action.Description)
-					warnCount++
-				}
-			}
-		}
+		c, d, w := displayPlanActions(collectionActions[collName])
+		createCount += c
+		dropCount += d
+		warnCount += w
 		fmt.Println()
 	}
 
@@ -121,6 +103,27 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+func displayPlanActions(actions []goodm.MigrationAction) (created, dropped, warned int) {
+	if len(actions) == 0 {
+		fmt.Println("  ✓ No changes needed")
+		return 0, 0, 0
+	}
+	for _, action := range actions {
+		switch action.Type {
+		case goodm.ActionCreateIndex:
+			fmt.Printf("  + %s\n", action.Description)
+			created++
+		case goodm.ActionDropIndex:
+			fmt.Printf("  - %s\n", action.Description)
+			dropped++
+		case goodm.ActionFieldDrift:
+			fmt.Printf("  ⚠ %s\n", action.Description)
+			warned++
+		}
+	}
+	return
 }
 
 func repeat(s string, n int) string {

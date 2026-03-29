@@ -70,19 +70,9 @@ func Populate(ctx context.Context, model interface{}, refs Refs, opts ...Populat
 
 		// Array ref: []bson.ObjectID → fetch all via $in
 		if refIDs, ok := fv.Interface().([]bson.ObjectID); ok {
-			ids := filterNonZeroIDs(refIDs)
-			if len(ids) == 0 {
-				continue
+			if err := populateArrayRef(ctx, coll, refIDs, bsonName, target); err != nil {
+				return err
 			}
-			cursor, err := coll.Find(ctx, bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}})
-			if err != nil {
-				return fmt.Errorf("goodm: populate %q failed: %w", bsonName, err)
-			}
-			if err := cursor.All(ctx, target); err != nil {
-				_ = cursor.Close(ctx)
-				return fmt.Errorf("goodm: populate %q decode failed: %w", bsonName, err)
-			}
-			_ = cursor.Close(ctx)
 			continue
 		}
 
@@ -91,18 +81,44 @@ func Populate(ctx context.Context, model interface{}, refs Refs, opts ...Populat
 		if !ok {
 			return fmt.Errorf("goodm: ref field %q is not bson.ObjectID or []bson.ObjectID", bsonName)
 		}
-		if refID.IsZero() {
-			continue // skip unset refs
-		}
 
-		if err := coll.FindOne(ctx, bson.D{{Key: "_id", Value: refID}}).Decode(target); err != nil {
-			if err == mongo.ErrNoDocuments {
-				continue // referenced document not found, leave target as zero
-			}
-			return fmt.Errorf("goodm: populate %q failed: %w", bsonName, err)
+		if err := populateSingleRef(ctx, coll, refID, bsonName, target); err != nil {
+			return err
 		}
 	}
 
+	return nil
+}
+
+// populateArrayRef fetches all documents whose IDs are in refIDs using a single $in query.
+func populateArrayRef(ctx context.Context, coll *mongo.Collection, refIDs []bson.ObjectID, bsonName string, target interface{}) error {
+	ids := filterNonZeroIDs(refIDs)
+	if len(ids) == 0 {
+		return nil
+	}
+	cursor, err := coll.Find(ctx, bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}})
+	if err != nil {
+		return fmt.Errorf("goodm: populate %q failed: %w", bsonName, err)
+	}
+	if err := cursor.All(ctx, target); err != nil {
+		_ = cursor.Close(ctx)
+		return fmt.Errorf("goodm: populate %q decode failed: %w", bsonName, err)
+	}
+	_ = cursor.Close(ctx)
+	return nil
+}
+
+// populateSingleRef fetches a single document by its ObjectID.
+func populateSingleRef(ctx context.Context, coll *mongo.Collection, refID bson.ObjectID, bsonName string, target interface{}) error {
+	if refID.IsZero() {
+		return nil // skip unset refs
+	}
+	if err := coll.FindOne(ctx, bson.D{{Key: "_id", Value: refID}}).Decode(target); err != nil {
+		if err == mongo.ErrNoDocuments {
+			return nil // referenced document not found, leave target as zero
+		}
+		return fmt.Errorf("goodm: populate %q failed: %w", bsonName, err)
+	}
 	return nil
 }
 
@@ -171,7 +187,37 @@ func BatchPopulate(ctx context.Context, models interface{}, field string, result
 		return fmt.Errorf("goodm: field %q has no ref tag", field)
 	}
 
-	// Collect unique non-zero IDs (supports both bson.ObjectID and []bson.ObjectID)
+	ids := collectRefIDs(mv, fs)
+	if len(ids) == 0 {
+		return nil
+	}
+
+	// Fetch all referenced documents in one query
+	var optDB *mongo.Database
+	if len(opts) > 0 {
+		optDB = opts[0].DB
+	}
+	db, err := getDB(optDB)
+	if err != nil {
+		return err
+	}
+
+	coll := db.Collection(fs.Ref)
+	cursor, err := coll.Find(ctx, bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}})
+	if err != nil {
+		return fmt.Errorf("goodm: batch populate %q failed: %w", field, err)
+	}
+	defer func() { _ = cursor.Close(ctx) }()
+
+	if err := cursor.All(ctx, results); err != nil {
+		return fmt.Errorf("goodm: batch populate decode failed: %w", err)
+	}
+
+	return nil
+}
+
+// collectRefIDs gathers unique non-zero ObjectIDs from a ref field across a slice of models.
+func collectRefIDs(mv reflect.Value, fs *FieldSchema) []bson.ObjectID {
 	seen := make(map[bson.ObjectID]bool)
 	var ids []bson.ObjectID
 	for i := 0; i < mv.Len(); i++ {
@@ -204,30 +250,5 @@ func BatchPopulate(ctx context.Context, models interface{}, field string, result
 		ids = append(ids, refID)
 	}
 
-	if len(ids) == 0 {
-		return nil
-	}
-
-	// Fetch all referenced documents in one query
-	var optDB *mongo.Database
-	if len(opts) > 0 {
-		optDB = opts[0].DB
-	}
-	db, err := getDB(optDB)
-	if err != nil {
-		return err
-	}
-
-	coll := db.Collection(fs.Ref)
-	cursor, err := coll.Find(ctx, bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}})
-	if err != nil {
-		return fmt.Errorf("goodm: batch populate %q failed: %w", field, err)
-	}
-	defer func() { _ = cursor.Close(ctx) }()
-
-	if err := cursor.All(ctx, results); err != nil {
-		return fmt.Errorf("goodm: batch populate decode failed: %w", err)
-	}
-
-	return nil
+	return ids
 }

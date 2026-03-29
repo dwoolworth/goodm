@@ -42,88 +42,119 @@ func validateFields(v reflect.Value, fields []FieldSchema, pathPrefix string) []
 
 		// Enum: value must be in the allowed set
 		if len(fs.Enum) > 0 && !fv.IsZero() {
-			strVal := stringValue(fv)
-			found := false
-			for _, allowed := range fs.Enum {
-				if strVal == allowed {
-					found = true
-					break
-				}
-			}
-			if !found {
-				errs = append(errs, ValidationError{
-					Field:   fieldPath,
-					Message: fmt.Sprintf("value %q is not in enum %v", strVal, fs.Enum),
-				})
+			if err := validateEnum(fv, fs.Enum, fieldPath); err != nil {
+				errs = append(errs, *err)
 			}
 		}
 
-		// Min/Max: numeric or string length boundaries
+		// Min: numeric or string length lower bound
 		if fs.Min != nil && !fv.IsZero() {
-			if fv.Kind() == reflect.String {
-				if fv.Len() < *fs.Min {
-					errs = append(errs, ValidationError{
-						Field:   fieldPath,
-						Message: fmt.Sprintf("length %d is less than minimum %d", fv.Len(), *fs.Min),
-					})
-				}
-			} else if intVal, ok := toInt(fv); ok {
-				if intVal < *fs.Min {
-					errs = append(errs, ValidationError{
-						Field:   fieldPath,
-						Message: fmt.Sprintf("value %d is less than minimum %d", intVal, *fs.Min),
-					})
-				}
+			if err := validateMin(fv, *fs.Min, fieldPath); err != nil {
+				errs = append(errs, *err)
 			}
 		}
 
+		// Max: numeric or string length upper bound
 		if fs.Max != nil && !fv.IsZero() {
-			if fv.Kind() == reflect.String {
-				if fv.Len() > *fs.Max {
-					errs = append(errs, ValidationError{
-						Field:   fieldPath,
-						Message: fmt.Sprintf("length %d exceeds maximum %d", fv.Len(), *fs.Max),
-					})
-				}
-			} else if intVal, ok := toInt(fv); ok {
-				if intVal > *fs.Max {
-					errs = append(errs, ValidationError{
-						Field:   fieldPath,
-						Message: fmt.Sprintf("value %d exceeds maximum %d", intVal, *fs.Max),
-					})
-				}
+			if err := validateMax(fv, *fs.Max, fieldPath); err != nil {
+				errs = append(errs, *err)
 			}
 		}
 
 		// Recurse into subdocuments
-		if len(fs.SubFields) > 0 {
-			if fs.IsSlice {
-				// Slice of structs: validate each element
-				for i := 0; i < fv.Len(); i++ {
-					elemVal := fv.Index(i)
-					if elemVal.Kind() == reflect.Ptr {
-						if elemVal.IsNil() {
-							continue
-						}
-						elemVal = elemVal.Elem()
-					}
-					elemPath := fmt.Sprintf("%s[%d]", fieldPath, i)
-					errs = append(errs, validateFields(elemVal, fs.SubFields, elemPath)...)
-				}
-			} else {
-				// Single struct or *struct
-				innerVal := fv
-				if innerVal.Kind() == reflect.Ptr {
-					if innerVal.IsNil() {
-						continue // skip nil pointer subdocs
-					}
-					innerVal = innerVal.Elem()
-				}
-				errs = append(errs, validateFields(innerVal, fs.SubFields, fieldPath)...)
+		errs = append(errs, validateSubFields(fv, fs, fieldPath)...)
+	}
+
+	return errs
+}
+
+// validateEnum checks that fv is one of the allowed enum values.
+func validateEnum(fv reflect.Value, enum []string, fieldPath string) *ValidationError {
+	strVal := stringValue(fv)
+	for _, allowed := range enum {
+		if strVal == allowed {
+			return nil
+		}
+	}
+	return &ValidationError{
+		Field:   fieldPath,
+		Message: fmt.Sprintf("value %q is not in enum %v", strVal, enum),
+	}
+}
+
+// validateMin checks that fv meets the minimum length (strings) or value (numerics).
+func validateMin(fv reflect.Value, min int, fieldPath string) *ValidationError {
+	if fv.Kind() == reflect.String {
+		if fv.Len() < min {
+			return &ValidationError{
+				Field:   fieldPath,
+				Message: fmt.Sprintf("length %d is less than minimum %d", fv.Len(), min),
+			}
+		}
+	} else if intVal, ok := toInt(fv); ok {
+		if intVal < min {
+			return &ValidationError{
+				Field:   fieldPath,
+				Message: fmt.Sprintf("value %d is less than minimum %d", intVal, min),
 			}
 		}
 	}
+	return nil
+}
 
+// validateMax checks that fv does not exceed the maximum length (strings) or value (numerics).
+func validateMax(fv reflect.Value, max int, fieldPath string) *ValidationError {
+	if fv.Kind() == reflect.String {
+		if fv.Len() > max {
+			return &ValidationError{
+				Field:   fieldPath,
+				Message: fmt.Sprintf("length %d exceeds maximum %d", fv.Len(), max),
+			}
+		}
+	} else if intVal, ok := toInt(fv); ok {
+		if intVal > max {
+			return &ValidationError{
+				Field:   fieldPath,
+				Message: fmt.Sprintf("value %d exceeds maximum %d", intVal, max),
+			}
+		}
+	}
+	return nil
+}
+
+// validateSubFields dispatches subdocument validation for struct and slice fields.
+func validateSubFields(fv reflect.Value, fs FieldSchema, fieldPath string) []ValidationError {
+	if len(fs.SubFields) == 0 {
+		return nil
+	}
+	if fs.IsSlice {
+		return validateSliceElements(fv, fs.SubFields, fieldPath)
+	}
+	// Single struct or *struct
+	innerVal := fv
+	if innerVal.Kind() == reflect.Ptr {
+		if innerVal.IsNil() {
+			return nil
+		}
+		innerVal = innerVal.Elem()
+	}
+	return validateFields(innerVal, fs.SubFields, fieldPath)
+}
+
+// validateSliceElements validates each element in a slice of structs.
+func validateSliceElements(fv reflect.Value, subFields []FieldSchema, fieldPath string) []ValidationError {
+	var errs []ValidationError
+	for i := 0; i < fv.Len(); i++ {
+		elemVal := fv.Index(i)
+		if elemVal.Kind() == reflect.Ptr {
+			if elemVal.IsNil() {
+				continue
+			}
+			elemVal = elemVal.Elem()
+		}
+		elemPath := fmt.Sprintf("%s[%d]", fieldPath, i)
+		errs = append(errs, validateFields(elemVal, subFields, elemPath)...)
+	}
 	return errs
 }
 

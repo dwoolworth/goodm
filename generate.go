@@ -18,15 +18,15 @@ type GenerateOptions struct {
 
 // modelTemplateData is the data passed to the code generation template.
 type modelTemplateData struct {
-	Package        string
-	StructName     string
-	CollectionName string
-	EmbedModel     bool
-	Fields         []templateField
+	Package         string
+	StructName      string
+	CollectionName  string
+	EmbedModel      bool
+	Fields          []templateField
 	CompoundIndexes []templateCompoundIndex
-	NeedsTime      bool
-	NeedsBSON      bool
-	NeedsGoodm     bool
+	NeedsTime       bool
+	NeedsBSON       bool
+	NeedsGoodm      bool
 }
 
 type templateField struct {

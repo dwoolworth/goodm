@@ -33,7 +33,7 @@ type OpInfo struct {
 type MiddlewareFunc func(ctx context.Context, op *OpInfo, next func(context.Context) error) error
 
 var (
-	mwMu    sync.RWMutex
+	mwMu     sync.RWMutex
 	globalMW []MiddlewareFunc
 	modelMW  map[string][]MiddlewareFunc
 )
