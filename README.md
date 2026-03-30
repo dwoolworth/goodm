@@ -7,6 +7,8 @@
 [![Go Version](https://img.shields.io/badge/Go-1.19+-00ADD8?logo=go&logoColor=white)](https://go.dev/)
 [![MongoDB](https://img.shields.io/badge/MongoDB-4.0+-47A248?logo=mongodb&logoColor=white)](https://www.mongodb.com/)
 
+**[Documentation](https://goodm.io)** | **[API Reference](https://pkg.go.dev/github.com/dwoolworth/goodm)**
+
 A schema-driven ODM for MongoDB in Go. Define your models as Go structs, and goodm handles validation, hooks, indexes, immutability, references, middleware, aggregation, bulk operations, and transactions.
 
 ```go
