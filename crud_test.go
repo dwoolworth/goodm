@@ -135,6 +135,99 @@ func TestGetDB_NilFallback(t *testing.T) {
 	}
 }
 
+func TestUnsetFields_Constructor(t *testing.T) {
+	opts := UnsetFields("agent_id", "temp_field")
+	if len(opts.Unset) != 2 {
+		t.Fatalf("expected 2 unset fields, got %d", len(opts.Unset))
+	}
+	if opts.Unset[0] != "agent_id" || opts.Unset[1] != "temp_field" {
+		t.Fatalf("unexpected unset fields: %v", opts.Unset)
+	}
+}
+
+func TestValidateUnsetFields(t *testing.T) {
+	registerTestModels()
+	defer unregisterTestModels()
+
+	schema, _ := Get("testUser")
+
+	// Valid optional field
+	if err := validateUnsetFields(schema, []string{"profile"}); err != nil {
+		t.Fatalf("unexpected error for optional field: %v", err)
+	}
+
+	// Unknown field
+	if err := validateUnsetFields(schema, []string{"nonexistent"}); err == nil {
+		t.Fatal("expected error for unknown field")
+	}
+
+	// Required field
+	if err := validateUnsetFields(schema, []string{"email"}); err == nil {
+		t.Fatal("expected error for required field")
+	}
+
+	// Managed field (_id)
+	if err := validateUnsetFields(schema, []string{"_id"}); err == nil {
+		t.Fatal("expected error for managed field _id")
+	}
+
+	// Managed field (__v)
+	if err := validateUnsetFields(schema, []string{"__v"}); err == nil {
+		t.Fatal("expected error for managed field __v")
+	}
+
+	// Empty list is fine
+	if err := validateUnsetFields(schema, nil); err != nil {
+		t.Fatalf("unexpected error for empty list: %v", err)
+	}
+}
+
+func TestBuildReplacement_NoUnset(t *testing.T) {
+	u := &testUser{Name: "Alice", Email: "alice@test.com"}
+	u.ID = bson.NewObjectID()
+
+	result, err := buildReplacement(u, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// With no unset fields, should return the original model
+	if result != u {
+		t.Fatal("expected original model returned when no unset fields")
+	}
+}
+
+func TestBuildReplacement_WithUnset(t *testing.T) {
+	u := &testUser{
+		Name:      "Alice",
+		Email:     "alice@test.com",
+		ProfileID: bson.NewObjectID(),
+	}
+	u.ID = bson.NewObjectID()
+
+	result, err := buildReplacement(u, []string{"profile"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	doc, ok := result.(bson.M)
+	if !ok {
+		t.Fatalf("expected bson.M, got %T", result)
+	}
+
+	// profile field should be gone
+	if _, exists := doc["profile"]; exists {
+		t.Fatal("expected profile field to be removed")
+	}
+
+	// other fields should remain
+	if _, exists := doc["email"]; !exists {
+		t.Fatal("expected email field to remain")
+	}
+	if _, exists := doc["name"]; !exists {
+		t.Fatal("expected name field to remain")
+	}
+}
+
 // --- integration tests (require MongoDB) ---
 
 func TestCreate_Integration(t *testing.T) {

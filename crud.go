@@ -47,7 +47,18 @@ type FindOptions struct {
 
 // UpdateOptions configures the Update operation.
 type UpdateOptions struct {
-	DB *mongo.Database
+	DB    *mongo.Database
+	Unset []string // bson field names to remove from the document
+}
+
+// UnsetFields returns UpdateOptions that will remove the specified fields from
+// the MongoDB document. Field names should be bson names (e.g. "agent_id").
+//
+// Example:
+//
+//	goodm.Update(ctx, &server, goodm.UnsetFields("agent_id"))
+func UnsetFields(fields ...string) UpdateOptions {
+	return UpdateOptions{Unset: fields}
 }
 
 // DeleteOptions configures the Delete operation.
@@ -274,16 +285,22 @@ func Update(ctx context.Context, model interface{}, opts ...UpdateOptions) error
 		return fmt.Errorf("goodm: cannot update document with zero ID")
 	}
 
+	var opt UpdateOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+
+	// Validate unset fields against the schema before proceeding.
+	if err := validateUnsetFields(schema, opt.Unset); err != nil {
+		return err
+	}
+
 	return runMiddleware(ctx, &OpInfo{
 		Operation: OpUpdate, Collection: schema.Collection,
 		ModelName: schema.ModelName, Model: model,
 		Filter: bson.D{{Key: "_id", Value: id}},
 	}, func(ctx context.Context) error {
-		var optDB *mongo.Database
-		if len(opts) > 0 {
-			optDB = opts[0].DB
-		}
-		db, err := getDB(optDB)
+		db, err := getDB(opt.DB)
 		if err != nil {
 			return err
 		}
@@ -313,14 +330,15 @@ func Update(ctx context.Context, model interface{}, opts ...UpdateOptions) error
 		// Set UpdatedAt
 		setUpdatedAt(model, time.Now())
 
-		// Replace with optimistic concurrency check
+		// Replace with optimistic concurrency check, removing any $unset
+		// fields from the document atomically.
 		filter := buildVersionFilter(id, oldVersion)
-		result, err := coll.ReplaceOne(ctx, filter, model)
+		matched, err := replaceWithUnset(ctx, coll, filter, model, opt.Unset)
 		if err != nil {
 			setModelVersion(model, oldVersion)
-			return fmt.Errorf("goodm: update failed: %w", err)
+			return err
 		}
-		if result.MatchedCount == 0 {
+		if matched == 0 {
 			setModelVersion(model, oldVersion)
 			return checkUpdateConflict(ctx, coll, id)
 		}
@@ -676,4 +694,65 @@ func setModelVersion(model interface{}, version int) {
 	if f := v.FieldByName("Version"); f.IsValid() && f.CanSet() {
 		f.SetInt(int64(version))
 	}
+}
+
+// managedFields are internal fields that must not be unset.
+var managedFields = map[string]bool{
+	"_id": true, "created_at": true, "updated_at": true, "__v": true,
+}
+
+// validateUnsetFields checks that unset field names are valid schema fields,
+// not managed by the ODM, and not required.
+func validateUnsetFields(schema *Schema, fields []string) error {
+	for _, name := range fields {
+		if managedFields[name] {
+			return fmt.Errorf("goodm: cannot unset managed field %q", name)
+		}
+		f := schema.GetField(name)
+		if f == nil {
+			return fmt.Errorf("goodm: cannot unset unknown field %q in %s", name, schema.ModelName)
+		}
+		if f.Required {
+			return fmt.Errorf("goodm: cannot unset required field %q", name)
+		}
+	}
+	return nil
+}
+
+// replaceWithUnset builds the replacement document, strips any unset fields, and
+// performs the ReplaceOne. Returns the number of matched documents.
+func replaceWithUnset(ctx context.Context, coll *mongo.Collection, filter bson.D, model interface{}, unsetFields []string) (int64, error) {
+	replacement, err := buildReplacement(model, unsetFields)
+	if err != nil {
+		return 0, err
+	}
+	result, err := coll.ReplaceOne(ctx, filter, replacement)
+	if err != nil {
+		return 0, fmt.Errorf("goodm: update failed: %w", err)
+	}
+	return result.MatchedCount, nil
+}
+
+// buildReplacement marshals a model to bson.M and removes unset fields.
+// When there are no unset fields, returns the model as-is to avoid the
+// marshal/unmarshal overhead.
+func buildReplacement(model interface{}, unsetFields []string) (interface{}, error) {
+	if len(unsetFields) == 0 {
+		return model, nil
+	}
+
+	raw, err := bson.Marshal(model)
+	if err != nil {
+		return nil, fmt.Errorf("goodm: failed to marshal model for unset: %w", err)
+	}
+	var doc bson.M
+	if err := bson.Unmarshal(raw, &doc); err != nil {
+		return nil, fmt.Errorf("goodm: failed to unmarshal model for unset: %w", err)
+	}
+
+	for _, field := range unsetFields {
+		delete(doc, field)
+	}
+
+	return doc, nil
 }
