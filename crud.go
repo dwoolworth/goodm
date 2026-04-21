@@ -404,6 +404,117 @@ func checkUpdateConflict(ctx context.Context, coll *mongo.Collection, id bson.Ob
 	return ErrVersionConflict
 }
 
+// UpdateFields performs a partial $set update on specific fields of a document,
+// identified by the model's ID. It runs middleware, sets UpdatedAt, and increments
+// the version — but does NOT enforce optimistic locking (last-write-wins).
+//
+// Use this instead of Update when concurrent writers touch disjoint fields and
+// version conflicts are acceptable (e.g. progress tracking, heartbeats).
+//
+// fields is a map of bson field names to their new values:
+//
+//	err := goodm.UpdateFields(ctx, &task, bson.M{"step": 5, "tokens_used": 12000})
+func UpdateFields(ctx context.Context, model interface{}, fields bson.M, opts ...UpdateOptions) error {
+	schema, err := getSchemaForModel(model)
+	if err != nil {
+		return err
+	}
+
+	id, err := getModelID(model)
+	if err != nil {
+		return err
+	}
+	if id.IsZero() {
+		return fmt.Errorf("goodm: cannot update document with zero ID")
+	}
+
+	if err := validateUpdateFieldNames(schema, fields); err != nil {
+		return err
+	}
+
+	return runMiddleware(ctx, &OpInfo{
+		Operation: OpUpdate, Collection: schema.Collection,
+		ModelName: schema.ModelName, Model: model,
+		Filter: bson.D{{Key: "_id", Value: id}},
+	}, func(ctx context.Context) error {
+		var optDB *mongo.Database
+		if len(opts) > 0 {
+			optDB = opts[0].DB
+		}
+		db, err := getDB(optDB)
+		if err != nil {
+			return err
+		}
+
+		// Add updated_at and increment version
+		fields["updated_at"] = time.Now()
+		oldVersion, _ := getModelVersion(model)
+		newVersion := oldVersion + 1
+
+		coll := getCollection(db, schema)
+		result, err := coll.UpdateOne(ctx, bson.D{{Key: "_id", Value: id}}, bson.D{
+			{Key: "$set", Value: fields},
+			{Key: "$inc", Value: bson.D{{Key: "__v", Value: 1}}},
+		})
+		if err != nil {
+			return fmt.Errorf("goodm: update fields failed: %w", err)
+		}
+		if result.MatchedCount == 0 {
+			return ErrNotFound
+		}
+
+		// Reflect the changes back onto the struct
+		setUpdatedAt(model, fields["updated_at"].(time.Time))
+		setModelVersion(model, newVersion)
+		applyFieldsToModel(model, fields)
+
+		return nil
+	})
+}
+
+// validateUpdateFieldNames checks that all field names in the map are known schema
+// fields and not managed by the ODM.
+func validateUpdateFieldNames(schema *Schema, fields bson.M) error {
+	for name := range fields {
+		if managedFields[name] {
+			return fmt.Errorf("goodm: cannot set managed field %q via UpdateFields", name)
+		}
+		if !schema.HasField(name) {
+			return fmt.Errorf("goodm: unknown field %q in %s", name, schema.ModelName)
+		}
+	}
+	return nil
+}
+
+// applyFieldsToModel reflects $set values back onto the Go struct so the caller
+// sees the updated state without a re-read.
+func applyFieldsToModel(model interface{}, fields bson.M) {
+	v := reflect.ValueOf(model)
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
+	t := v.Type()
+
+	for i := 0; i < t.NumField(); i++ {
+		sf := t.Field(i)
+		bsonName, _ := ParseBSONTag(sf.Tag.Get("bson"))
+		if bsonName == "" || bsonName == "-" {
+			continue
+		}
+		val, ok := fields[bsonName]
+		if !ok {
+			continue
+		}
+		fv := v.Field(i)
+		if fv.CanSet() {
+			rv := reflect.ValueOf(val)
+			if rv.Type().AssignableTo(fv.Type()) {
+				fv.Set(rv)
+			}
+		}
+	}
+}
+
 // UpdateOne performs a partial update on a single document matching filter.
 // The model parameter is used only for schema/collection lookup (e.g. &User{}).
 // The update parameter should be a MongoDB update document (e.g. bson.D{{"$set", bson.D{...}}}).

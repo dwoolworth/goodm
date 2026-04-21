@@ -228,6 +228,76 @@ func TestBuildReplacement_WithUnset(t *testing.T) {
 	}
 }
 
+func TestValidateUpdateFieldNames(t *testing.T) {
+	registerTestModels()
+	defer unregisterTestModels()
+
+	schema, _ := Get("testUser")
+
+	// Valid field
+	if err := validateUpdateFieldNames(schema, bson.M{"age": 25}); err != nil {
+		t.Fatalf("unexpected error for valid field: %v", err)
+	}
+
+	// Multiple valid fields
+	if err := validateUpdateFieldNames(schema, bson.M{"age": 25, "role": "admin"}); err != nil {
+		t.Fatalf("unexpected error for multiple valid fields: %v", err)
+	}
+
+	// Unknown field
+	if err := validateUpdateFieldNames(schema, bson.M{"nonexistent": 1}); err == nil {
+		t.Fatal("expected error for unknown field")
+	}
+
+	// Managed field _id
+	if err := validateUpdateFieldNames(schema, bson.M{"_id": "bad"}); err == nil {
+		t.Fatal("expected error for managed field _id")
+	}
+
+	// Managed field __v
+	if err := validateUpdateFieldNames(schema, bson.M{"__v": 99}); err == nil {
+		t.Fatal("expected error for managed field __v")
+	}
+
+	// Managed field updated_at
+	if err := validateUpdateFieldNames(schema, bson.M{"updated_at": "bad"}); err == nil {
+		t.Fatal("expected error for managed field updated_at")
+	}
+
+	// Empty map is fine
+	if err := validateUpdateFieldNames(schema, bson.M{}); err != nil {
+		t.Fatalf("unexpected error for empty map: %v", err)
+	}
+}
+
+func TestApplyFieldsToModel(t *testing.T) {
+	registerTestModels()
+	defer unregisterTestModels()
+
+	u := &testUser{
+		Email: "alice@test.com",
+		Name:  "Alice",
+		Age:   25,
+		Role:  "user",
+	}
+
+	applyFieldsToModel(u, bson.M{"age": 30, "role": "admin"})
+
+	if u.Age != 30 {
+		t.Fatalf("expected age 30, got %d", u.Age)
+	}
+	if u.Role != "admin" {
+		t.Fatalf("expected role admin, got %s", u.Role)
+	}
+	// Untouched fields stay the same
+	if u.Email != "alice@test.com" {
+		t.Fatalf("email should not change, got %s", u.Email)
+	}
+	if u.Name != "Alice" {
+		t.Fatalf("name should not change, got %s", u.Name)
+	}
+}
+
 // --- integration tests (require MongoDB) ---
 
 func TestCreate_Integration(t *testing.T) {
