@@ -899,9 +899,10 @@ func TestUpdate_VersionConflict_RollsBack(t *testing.T) {
 	u2.Age = 27
 	_ = Update(ctx, u2)
 
-	// u2's version should be rolled back to 0 (its pre-conflict state)
-	if u2.Version != 0 {
-		t.Fatalf("expected version rolled back to 0, got %d", u2.Version)
+	// u2's version should be refreshed to the current DB version (1) so
+	// subsequent Update() calls don't cascade-fail.
+	if u2.Version != 1 {
+		t.Fatalf("expected version refreshed to 1, got %d", u2.Version)
 	}
 }
 
