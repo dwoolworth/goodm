@@ -50,6 +50,17 @@ func (e ValidationError) Error() string {
 	return fmt.Sprintf("validation error on %s: %s", e.Field, e.Message)
 }
 
+// MergeConflictError is returned when a retry-with-merge detects that both the
+// caller and another writer modified the same fields. The conflicting field names
+// (bson names) are listed so the caller can decide how to resolve.
+type MergeConflictError struct {
+	Fields []string
+}
+
+func (e *MergeConflictError) Error() string {
+	return fmt.Sprintf("goodm: merge conflict on fields: %s", strings.Join(e.Fields, ", "))
+}
+
 // ValidationErrors is a slice of ValidationError that implements error.
 type ValidationErrors []ValidationError
 

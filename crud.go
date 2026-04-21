@@ -47,8 +47,9 @@ type FindOptions struct {
 
 // UpdateOptions configures the Update operation.
 type UpdateOptions struct {
-	DB    *mongo.Database
-	Unset []string // bson field names to remove from the document
+	DB         *mongo.Database
+	Unset      []string // bson field names to remove from the document
+	MaxRetries int      // retry with 3-way merge on version conflict (0 = no retry)
 }
 
 // UnsetFields returns UpdateOptions that will remove the specified fields from
@@ -59,6 +60,19 @@ type UpdateOptions struct {
 //	goodm.Update(ctx, &server, goodm.UnsetFields("agent_id"))
 func UnsetFields(fields ...string) UpdateOptions {
 	return UpdateOptions{Unset: fields}
+}
+
+// WithRetry returns UpdateOptions that will automatically retry on version
+// conflict using a 3-way field-level merge. On conflict, the document is re-read
+// from the database, and the caller's changed fields are merged onto the fresh
+// state — but only if no other writer modified the same fields. If both sides
+// changed the same field, a *MergeConflictError is returned.
+//
+// Example:
+//
+//	goodm.Update(ctx, &task, goodm.WithRetry(3))
+func WithRetry(maxRetries int) UpdateOptions {
+	return UpdateOptions{MaxRetries: maxRetries}
 }
 
 // DeleteOptions configures the Delete operation.
@@ -323,24 +337,9 @@ func Update(ctx context.Context, model interface{}, opts ...UpdateOptions) error
 			return ValidationErrors(errs)
 		}
 
-		// Read current version and increment
-		oldVersion, _ := getModelVersion(model)
-		setModelVersion(model, oldVersion+1)
-
-		// Set UpdatedAt
-		setUpdatedAt(model, time.Now())
-
-		// Replace with optimistic concurrency check, removing any $unset
-		// fields from the document atomically.
-		filter := buildVersionFilter(id, oldVersion)
-		matched, err := replaceWithUnset(ctx, coll, filter, model, opt.Unset)
-		if err != nil {
-			setModelVersion(model, oldVersion)
+		// Save with optional retry-with-merge on version conflict.
+		if err := saveWithRetry(ctx, coll, model, opt, id); err != nil {
 			return err
-		}
-		if matched == 0 {
-			setModelVersion(model, oldVersion)
-			return checkUpdateConflict(ctx, coll, id)
 		}
 
 		// AfterSave hook

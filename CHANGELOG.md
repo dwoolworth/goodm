@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] - 2026-04-21
+
+### Added
+- `WithRetry(n)` option for `Update()` with 3-way field-level merge on version conflict. On conflict, re-reads the document, diffs caller's changes against the other writer's changes, and auto-merges if the changed fields are disjoint. Returns `*MergeConflictError` (with field names) when both sides modified the same field. (#5)
+- `*MergeConflictError` error type listing the conflicting bson field names.
+- Auto-refresh of in-memory version on version conflict (even without retry) to prevent cascading write failures.
+
 ## [0.4.0] - 2026-04-20
 
 ### Added
