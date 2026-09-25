@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.0] - 2026-09-24
+
+### Fixed
+- `Enforce` now verifies the options of existing indexes instead of accepting any index by name alone. A `goodm:"unique"` field whose existing index is non-unique, sparse, or partial (and the reverse: a plain `index` field with a unique index) is reported as an `EnforcementError` by default. The same check applies to compound indexes. Previously such mismatches were silently skipped, so `unique` tags guaranteed nothing once any index of that name existed (MSA-76 / BUG-3136).
+
+### Added
+- `EnforceOptions.IndexMismatchPolicy`: `IndexMismatchError` (default, fail loudly), `IndexMismatchRebuild` (drop and recreate mismatched indexes; refuses to drop when rebuilding a unique index over duplicate data), and `IndexMismatchIgnore` (legacy name-only behavior).
+- `IndexSpec` type describing an existing index (keys, unique, sparse, partial).
+
+### Changed
+- **Breaking:** `ListExistingIndexes` now returns `map[string]IndexSpec` instead of `map[string]bool`.
+
 ## [0.5.0] - 2026-04-21
 
 ### Added

@@ -68,7 +68,7 @@ func PlanMigration(ctx context.Context, db *mongo.Database, schemas map[string]*
 
 		// expected - actual = indexes to create
 		for name := range expected {
-			if !existing[name] {
+			if _, ok := existing[name]; !ok {
 				plan.Actions = append(plan.Actions, MigrationAction{
 					Type:        ActionCreateIndex,
 					Collection:  schema.Collection,

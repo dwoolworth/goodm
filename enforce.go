@@ -22,11 +22,32 @@ const (
 // DefaultDriftSampleSize is the number of documents sampled for drift detection.
 const DefaultDriftSampleSize = 100
 
+// IndexMismatchPolicy controls what Enforce does when an index exists under the
+// expected name but its options don't match the schema (e.g. a goodm:"unique"
+// field whose index is not unique, or is sparse/partial).
+type IndexMismatchPolicy int
+
+const (
+	// IndexMismatchError returns an EnforcementError describing the mismatch.
+	// This is the default: a unique tag whose index isn't actually unique is a
+	// silent data-integrity hole, so Enforce fails loudly.
+	IndexMismatchError IndexMismatchPolicy = iota
+	// IndexMismatchRebuild drops the mismatched index and recreates it to match
+	// the schema. Before dropping an index that must become unique, the data is
+	// checked for duplicates; if any exist the existing index is left in place
+	// and an EnforcementError is returned.
+	IndexMismatchRebuild
+	// IndexMismatchIgnore restores the pre-0.6 behavior: an index is accepted
+	// by name alone and its options are never checked.
+	IndexMismatchIgnore
+)
+
 // EnforceOptions configures the behavior of Enforce.
 type EnforceOptions struct {
-	DriftPolicy    DriftPolicy
-	DriftSampleSize int                // documents to sample for drift detection (default 100)
-	OnDriftWarning func(d DriftError) // called for each drift when policy is DriftWarn
+	DriftPolicy         DriftPolicy
+	DriftSampleSize     int                 // documents to sample for drift detection (default 100)
+	OnDriftWarning      func(d DriftError)  // called for each drift when policy is DriftWarn
+	IndexMismatchPolicy IndexMismatchPolicy // how to handle existing indexes whose options don't match the schema
 }
 
 // Enforce ensures that all registered schemas are reflected in the database.
@@ -41,7 +62,7 @@ func Enforce(ctx context.Context, db *mongo.Database, opts ...EnforceOptions) er
 	schemas := GetAll()
 
 	for _, schema := range schemas {
-		if err := enforceSchema(ctx, db, schema); err != nil {
+		if err := enforceSchema(ctx, db, schema, opt.IndexMismatchPolicy); err != nil {
 			return err
 		}
 
@@ -80,7 +101,7 @@ func Enforce(ctx context.Context, db *mongo.Database, opts ...EnforceOptions) er
 	return nil
 }
 
-func enforceSchema(ctx context.Context, db *mongo.Database, schema *Schema) error {
+func enforceSchema(ctx context.Context, db *mongo.Database, schema *Schema, policy IndexMismatchPolicy) error {
 	coll := db.Collection(schema.Collection)
 
 	// Get existing indexes
@@ -92,60 +113,171 @@ func enforceSchema(ctx context.Context, db *mongo.Database, schema *Schema) erro
 		}
 	}
 
-	// Create single-field indexes from field tags
+	// Single-field indexes from field tags
 	for _, field := range schema.Fields {
-		if field.Unique {
-			indexName := field.BSONName + "_1"
-			if !existing[indexName] {
-				model := mongo.IndexModel{
-					Keys:    bson.D{{Key: field.BSONName, Value: 1}},
-					Options: options.Index().SetUnique(true),
-				}
-				if _, err := coll.Indexes().CreateOne(ctx, model); err != nil {
-					return &EnforcementError{
-						Collection: schema.Collection,
-						Message:    fmt.Sprintf("failed to create unique index on %s: %v", field.BSONName, err),
-					}
-				}
-			}
-		} else if field.Index {
-			indexName := field.BSONName + "_1"
-			if !existing[indexName] {
-				model := mongo.IndexModel{
-					Keys: bson.D{{Key: field.BSONName, Value: 1}},
-				}
-				if _, err := coll.Indexes().CreateOne(ctx, model); err != nil {
-					return &EnforcementError{
-						Collection: schema.Collection,
-						Message:    fmt.Sprintf("failed to create index on %s: %v", field.BSONName, err),
-					}
-				}
-			}
+		if !field.Unique && !field.Index {
+			continue
+		}
+		keys := bson.D{{Key: field.BSONName, Value: 1}}
+		if err := enforceIndex(ctx, coll, schema.Collection, existing, field.BSONName+"_1", keys, field.Unique, policy); err != nil {
+			return err
 		}
 	}
 
-	// Create compound indexes
+	// Compound indexes
 	for _, ci := range schema.CompoundIndexes {
-		indexName := compoundIndexName(ci)
-		if !existing[indexName] {
-			keys := bson.D{}
-			for _, f := range ci.Fields {
-				keys = append(keys, bson.E{Key: f, Value: 1})
-			}
-			model := mongo.IndexModel{Keys: keys}
-			if ci.Unique {
-				model.Options = options.Index().SetUnique(true)
-			}
-			if _, err := coll.Indexes().CreateOne(ctx, model); err != nil {
-				return &EnforcementError{
-					Collection: schema.Collection,
-					Message:    fmt.Sprintf("failed to create compound index %s: %v", indexName, err),
-				}
-			}
+		keys := bson.D{}
+		for _, f := range ci.Fields {
+			keys = append(keys, bson.E{Key: f, Value: 1})
+		}
+		if err := enforceIndex(ctx, coll, schema.Collection, existing, compoundIndexName(ci), keys, ci.Unique, policy); err != nil {
+			return err
 		}
 	}
 
 	return nil
+}
+
+// enforceIndex ensures a single index exists with the expected keys and options,
+// creating it if missing and handling option mismatches per the policy.
+func enforceIndex(ctx context.Context, coll *mongo.Collection, collection string, existing map[string]IndexSpec, name string, keys bson.D, unique bool, policy IndexMismatchPolicy) error {
+	spec, exists := existing[name]
+	if !exists {
+		return createIndex(ctx, coll, collection, name, keys, unique)
+	}
+
+	mismatch := describeIndexMismatch(spec, keys, unique)
+	if mismatch == "" || policy == IndexMismatchIgnore {
+		return nil
+	}
+
+	if policy == IndexMismatchError {
+		return &EnforcementError{
+			Collection: collection,
+			Message:    fmt.Sprintf("index %s exists but %s (use IndexMismatchRebuild to rebuild it)", name, mismatch),
+		}
+	}
+
+	// IndexMismatchRebuild: a unique index can only be built if the data is
+	// actually unique. Check before dropping so a failure leaves the existing
+	// index in place instead of leaving the collection unindexed.
+	if unique {
+		hasDups, err := hasDuplicateValues(ctx, coll, keys)
+		if err != nil {
+			return &EnforcementError{
+				Collection: collection,
+				Message:    fmt.Sprintf("failed to check for duplicates before rebuilding index %s: %v", name, err),
+			}
+		}
+		if hasDups {
+			return &EnforcementError{
+				Collection: collection,
+				Message:    fmt.Sprintf("cannot rebuild index %s as unique: collection contains duplicate values; existing index left in place", name),
+			}
+		}
+	}
+
+	if err := coll.Indexes().DropOne(ctx, name); err != nil {
+		return &EnforcementError{
+			Collection: collection,
+			Message:    fmt.Sprintf("failed to drop mismatched index %s: %v", name, err),
+		}
+	}
+	if err := createIndex(ctx, coll, collection, name, keys, unique); err != nil {
+		return &EnforcementError{
+			Collection: collection,
+			Message:    fmt.Sprintf("index %s was dropped but recreate failed: %v", name, err),
+		}
+	}
+	return nil
+}
+
+func createIndex(ctx context.Context, coll *mongo.Collection, collection, name string, keys bson.D, unique bool) error {
+	model := mongo.IndexModel{Keys: keys}
+	if unique {
+		model.Options = options.Index().SetUnique(true)
+	}
+	if _, err := coll.Indexes().CreateOne(ctx, model); err != nil {
+		return &EnforcementError{
+			Collection: collection,
+			Message:    fmt.Sprintf("failed to create index %s: %v", name, err),
+		}
+	}
+	return nil
+}
+
+// describeIndexMismatch returns a human-readable description of how an existing
+// index differs from what the schema expects, or "" if it matches.
+func describeIndexMismatch(spec IndexSpec, keys bson.D, unique bool) string {
+	if !indexKeysEqual(spec.Keys, keys) {
+		return "has different keys than the schema expects"
+	}
+	if unique && !spec.Unique {
+		return "is not unique (schema requires unique)"
+	}
+	if !unique && spec.Unique {
+		return "is unique (schema expects non-unique)"
+	}
+	if unique && spec.Sparse {
+		return "is sparse (schema requires a plain unique index)"
+	}
+	if unique && spec.HasPartialFilter {
+		return "is partial (schema requires a plain unique index)"
+	}
+	return ""
+}
+
+func indexKeysEqual(a, b bson.D) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Key != b[i].Key || indexDirection(a[i].Value) != indexDirection(b[i].Value) {
+			return false
+		}
+	}
+	return true
+}
+
+// indexDirection normalizes an index key direction to int. Non-numeric values
+// (text/hashed indexes) normalize to 0 and thus never match a schema index.
+func indexDirection(v interface{}) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case int32:
+		return int(n)
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	}
+	return 0
+}
+
+// hasDuplicateValues reports whether any two documents share the same value for
+// the given index keys. Missing fields group as null, matching MongoDB's unique
+// index semantics.
+func hasDuplicateValues(ctx context.Context, coll *mongo.Collection, keys bson.D) (bool, error) {
+	groupID := bson.D{}
+	for _, k := range keys {
+		// Dots are not allowed in $group _id field names.
+		groupID = append(groupID, bson.E{Key: strings.ReplaceAll(k.Key, ".", "_"), Value: "$" + k.Key})
+	}
+	pipeline := mongo.Pipeline{
+		{{Key: "$group", Value: bson.D{
+			{Key: "_id", Value: groupID},
+			{Key: "n", Value: bson.D{{Key: "$sum", Value: 1}}},
+		}}},
+		{{Key: "$match", Value: bson.D{{Key: "n", Value: bson.D{{Key: "$gt", Value: 1}}}}}},
+		{{Key: "$limit", Value: 1}},
+	}
+	cursor, err := coll.Aggregate(ctx, pipeline)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = cursor.Close(ctx) }()
+	return cursor.Next(ctx), cursor.Err()
 }
 
 // DetectDrift samples documents from the collection and reports fields
@@ -191,9 +323,19 @@ func DetectDrift(ctx context.Context, db *mongo.Database, schema *Schema, sample
 	return drifts
 }
 
-// ListExistingIndexes returns a set of index names that exist on the collection.
-func ListExistingIndexes(ctx context.Context, coll *mongo.Collection) (map[string]bool, error) {
-	result := make(map[string]bool)
+// IndexSpec describes an existing index on a collection.
+type IndexSpec struct {
+	Name             string
+	Keys             bson.D
+	Unique           bool
+	Sparse           bool
+	HasPartialFilter bool // index has a partialFilterExpression
+}
+
+// ListExistingIndexes returns the indexes that exist on the collection, keyed
+// by index name.
+func ListExistingIndexes(ctx context.Context, coll *mongo.Collection) (map[string]IndexSpec, error) {
+	result := make(map[string]IndexSpec)
 
 	cursor, err := coll.Indexes().List(ctx)
 	if err != nil {
@@ -202,12 +344,25 @@ func ListExistingIndexes(ctx context.Context, coll *mongo.Collection) (map[strin
 	defer func() { _ = cursor.Close(ctx) }()
 
 	for cursor.Next(ctx) {
-		var idx bson.M
+		var idx struct {
+			Name                    string   `bson:"name"`
+			Key                     bson.D   `bson:"key"`
+			Unique                  bool     `bson:"unique"`
+			Sparse                  bool     `bson:"sparse"`
+			PartialFilterExpression bson.Raw `bson:"partialFilterExpression"`
+		}
 		if err := cursor.Decode(&idx); err != nil {
 			continue
 		}
-		if name, ok := idx["name"].(string); ok {
-			result[name] = true
+		if idx.Name == "" {
+			continue
+		}
+		result[idx.Name] = IndexSpec{
+			Name:             idx.Name,
+			Keys:             idx.Key,
+			Unique:           idx.Unique,
+			Sparse:           idx.Sparse,
+			HasPartialFilter: len(idx.PartialFilterExpression) > 0,
 		}
 	}
 

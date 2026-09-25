@@ -115,6 +115,25 @@ goodm.Enforce(ctx, db, goodm.EnforceOptions{
 })
 ```
 
+`Enforce` also verifies the *options* of existing indexes, not just their names.
+If an index exists under the expected name but doesn't match the schema — e.g. a
+`goodm:"unique"` field whose index is not unique, or is sparse/partial — Enforce
+returns an `EnforcementError` by default. You can opt into automatic rebuilding:
+
+```go
+// Rebuild mismatched indexes (drop + recreate).
+// Before making an index unique, the data is checked for duplicates;
+// if any exist, the existing index is left in place and an error returned.
+goodm.Enforce(ctx, db, goodm.EnforceOptions{
+    IndexMismatchPolicy: goodm.IndexMismatchRebuild,
+})
+
+// Legacy behavior — accept any existing index by name alone
+goodm.Enforce(ctx, db, goodm.EnforceOptions{
+    IndexMismatchPolicy: goodm.IndexMismatchIgnore,
+})
+```
+
 ## Error Handling
 
 goodm provides typed errors:
