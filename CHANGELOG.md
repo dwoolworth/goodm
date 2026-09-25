@@ -2,10 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.6.1] - 2026-09-25
 
 ### Fixed
-- `IndexMismatchRebuild` no longer drops a non-unique index before recreating it as unique. On MongoDB 6.0+ the index is converted in place with `collMod` (`prepareUnique: true`, then `unique: true`), so there is no window where the collection is unindexed and a concurrent writer can insert a duplicate that would break the recreate and every subsequent `Enforce`. If duplicates already exist, `prepareUnique` is reverted and the existing index is left untouched. Drop + recreate remains the fallback for pre-6.0 servers and for mismatches `collMod` cannot fix (keys, sparse, partial, unique -> non-unique) (MSA-78).
+- `IndexMismatchRebuild` no longer drops a non-unique index before recreating it as unique. On MongoDB 6.0+ (binary and featureCompatibilityVersion) the index is converted in place with `collMod` (`prepareUnique: true`, then `unique: true`), so there is no window where the collection is unindexed and a concurrent writer can insert a duplicate that would break the recreate and every subsequent `Enforce`. The read-only duplicate pre-check still runs first, so known duplicates never trigger a `collMod`. If a duplicate slips in between the pre-check and the conversion, `prepareUnique` is reverted and the existing index is left untouched. On any other failure of the final step the index is left in the prepared state (present, new duplicates rejected) and the next `Enforce` completes the conversion. Drop + recreate remains the fallback for servers that don't support `prepareUnique` and for mismatches `collMod` cannot fix (keys, sparse, partial, unique -> non-unique) (MSA-78).
+
+### Added
+- `IndexSpec.PrepareUnique` reports an index left in the `collMod prepareUnique` state; `Enforce` mismatch errors name that state explicitly.
 
 ## [0.6.0] - 2026-09-24
 

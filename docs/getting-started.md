@@ -121,13 +121,13 @@ If an index exists under the expected name but doesn't match the schema — e.g.
 returns an `EnforcementError` by default. You can opt into automatic rebuilding:
 
 ```go
-// Rebuild mismatched indexes. A non-unique index that must become unique is
-// converted in place on MongoDB 6.0+ (collMod prepareUnique, then unique), so
-// the collection is never left without an index and concurrent writers can't
-// slip a duplicate in mid-conversion. If the data already contains duplicates,
-// the conversion is undone, the existing index is left in place, and an error
-// is returned. Other mismatches (keys, sparse, partial, unique -> non-unique)
-// and servers older than 6.0 fall back to drop + recreate.
+// Rebuild mismatched indexes. The data is first checked for duplicates; if
+// any exist, the existing index is left in place and an error is returned.
+// A non-unique index that must become unique is then converted in place on
+// MongoDB 6.0+ (collMod prepareUnique, then unique), so the collection is
+// never left without an index and concurrent writers can't slip a duplicate
+// in mid-conversion. Other mismatches (keys, sparse, partial, unique ->
+// non-unique) and servers older than 6.0 fall back to drop + recreate.
 goodm.Enforce(ctx, db, goodm.EnforceOptions{
     IndexMismatchPolicy: goodm.IndexMismatchRebuild,
 })

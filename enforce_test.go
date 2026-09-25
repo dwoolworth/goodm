@@ -245,7 +245,17 @@ func enableProfiler(t *testing.T, ctx context.Context, db *mongo.Database) {
 // against the collection.
 func dropIndexesCount(t *testing.T, ctx context.Context, db *mongo.Database, collection string) int64 {
 	t.Helper()
-	n, err := db.Collection("system.profile").CountDocuments(ctx, bson.D{{Key: "command.dropIndexes", Value: collection}})
+	return profiledCommandCount(t, ctx, db, "dropIndexes", collection)
+}
+
+func collModCount(t *testing.T, ctx context.Context, db *mongo.Database, collection string) int64 {
+	t.Helper()
+	return profiledCommandCount(t, ctx, db, "collMod", collection)
+}
+
+func profiledCommandCount(t *testing.T, ctx context.Context, db *mongo.Database, command, collection string) int64 {
+	t.Helper()
+	n, err := db.Collection("system.profile").CountDocuments(ctx, bson.D{{Key: "command." + command, Value: collection}})
 	if err != nil {
 		t.Fatalf("count profiler entries: %v", err)
 	}
@@ -328,13 +338,8 @@ func TestEnforce_PrepareUnique_RejectsNewDuplicates(t *testing.T) {
 	}
 }
 
-func TestEnforce_Rebuild_ExistingDuplicates_RevertsPrepareUnique(t *testing.T) {
-	ctx, db, cleanup := setupTestDB(t)
-	defer cleanup()
-	requirePrepareUnique(t, ctx, db)
-
-	coll := db.Collection("test_users")
-	createNonUniqueIndex(t, ctx, coll, "email")
+func insertDuplicateEmails(t *testing.T, ctx context.Context, coll *mongo.Collection) {
+	t.Helper()
 	docs := []interface{}{
 		bson.D{{Key: "email", Value: "dup@example.com"}, {Key: "name", Value: "a"}},
 		bson.D{{Key: "email", Value: "dup@example.com"}, {Key: "name", Value: "b"}},
@@ -342,6 +347,16 @@ func TestEnforce_Rebuild_ExistingDuplicates_RevertsPrepareUnique(t *testing.T) {
 	if _, err := coll.InsertMany(ctx, docs); err != nil {
 		t.Fatalf("insert duplicates: %v", err)
 	}
+}
+
+func TestEnforce_Rebuild_ExistingDuplicates_LeavesIndexUntouched(t *testing.T) {
+	ctx, db, cleanup := setupTestDB(t)
+	defer cleanup()
+	requirePrepareUnique(t, ctx, db)
+
+	coll := db.Collection("test_users")
+	createNonUniqueIndex(t, ctx, coll, "email")
+	insertDuplicateEmails(t, ctx, coll)
 	enableProfiler(t, ctx, db)
 
 	err := Enforce(ctx, db, EnforceOptions{IndexMismatchPolicy: IndexMismatchRebuild})
@@ -356,17 +371,76 @@ func TestEnforce_Rebuild_ExistingDuplicates_RevertsPrepareUnique(t *testing.T) {
 	if !ok {
 		t.Fatal("email_1 must not be dropped when data has duplicates")
 	}
-	if spec.Unique {
-		t.Error("email_1 should still be non-unique")
+	if spec.Unique || spec.PrepareUnique {
+		t.Errorf("email_1 should be untouched, got unique=%v prepareUnique=%v", spec.Unique, spec.PrepareUnique)
+	}
+	// Known duplicates must be detected by the read-only pre-check, so app
+	// writes are never rejected by a prepareUnique that was doomed to revert.
+	if n := collModCount(t, ctx, db, "test_users"); n != 0 {
+		t.Errorf("expected no collMod when duplicates already exist, got %d", n)
 	}
 	if n := dropIndexesCount(t, ctx, db, "test_users"); n != 0 {
 		t.Errorf("expected index untouched, but dropIndexes ran %d time(s)", n)
 	}
+	if _, err := coll.InsertOne(ctx, bson.D{{Key: "email", Value: "dup@example.com"}, {Key: "name", Value: "c"}}); err != nil {
+		t.Errorf("index unexpectedly rejects duplicates: %v", err)
+	}
+}
 
-	// prepareUnique must have been reverted: another duplicate is accepted,
-	// exactly as before Enforce ran.
+// Duplicates that slip in between the pre-check and prepareUnique surface as
+// server error 359 on the unique step; the conversion must revert.
+func TestConvertIndexToUnique_RaceDuplicates_Reverts(t *testing.T) {
+	ctx, db, cleanup := setupTestDB(t)
+	defer cleanup()
+	requirePrepareUnique(t, ctx, db)
+
+	coll := db.Collection("test_users")
+	createNonUniqueIndex(t, ctx, coll, "email")
+	insertDuplicateEmails(t, ctx, coll)
+	enableProfiler(t, ctx, db)
+
+	converted, err := convertIndexToUnique(ctx, coll, "test_users", "email_1")
+	if converted || err == nil {
+		t.Fatalf("expected conversion failure, got converted=%v err=%v", converted, err)
+	}
+	if !strings.Contains(err.Error(), "duplicate") {
+		t.Errorf("expected duplicate-data error, got: %v", err)
+	}
+
+	spec, ok := getIndexSpec(t, ctx, coll, "email_1")
+	if !ok {
+		t.Fatal("email_1 must survive a failed conversion")
+	}
+	if spec.Unique || spec.PrepareUnique {
+		t.Errorf("prepareUnique should be reverted, got unique=%v prepareUnique=%v", spec.Unique, spec.PrepareUnique)
+	}
+	if n := dropIndexesCount(t, ctx, db, "test_users"); n != 0 {
+		t.Errorf("expected index untouched, but dropIndexes ran %d time(s)", n)
+	}
 	if _, err := coll.InsertOne(ctx, bson.D{{Key: "email", Value: "dup@example.com"}, {Key: "name", Value: "c"}}); err != nil {
 		t.Errorf("index still rejects duplicates; prepareUnique was not reverted: %v", err)
+	}
+}
+
+func TestEnforce_PreparedIndex_IsReportedAsSuch(t *testing.T) {
+	ctx, db, cleanup := setupTestDB(t)
+	defer cleanup()
+	requirePrepareUnique(t, ctx, db)
+
+	coll := db.Collection("test_users")
+	createNonUniqueIndex(t, ctx, coll, "email")
+	if err := collModIndex(ctx, coll, "email_1", "prepareUnique", true); err != nil {
+		t.Fatalf("prepareUnique: %v", err)
+	}
+
+	spec, _ := getIndexSpec(t, ctx, coll, "email_1")
+	if !spec.PrepareUnique {
+		t.Error("ListExistingIndexes should report prepareUnique")
+	}
+
+	err := Enforce(ctx, db)
+	if err == nil || !strings.Contains(err.Error(), "prepareUnique") {
+		t.Errorf("default policy should report the prepared state, got: %v", err)
 	}
 }
 

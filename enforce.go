@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -66,14 +68,10 @@ func Enforce(ctx context.Context, db *mongo.Database, opts ...EnforceOptions) er
 	}
 
 	schemas := GetAll()
-
-	inPlaceUnique := false
-	if opt.IndexMismatchPolicy == IndexMismatchRebuild {
-		inPlaceUnique = supportsPrepareUnique(ctx, db)
-	}
+	probe := &prepareUniqueProbe{db: db}
 
 	for _, schema := range schemas {
-		if err := enforceSchema(ctx, db, schema, opt.IndexMismatchPolicy, inPlaceUnique); err != nil {
+		if err := enforceSchema(ctx, db, schema, opt.IndexMismatchPolicy, probe); err != nil {
 			return err
 		}
 
@@ -112,7 +110,7 @@ func Enforce(ctx context.Context, db *mongo.Database, opts ...EnforceOptions) er
 	return nil
 }
 
-func enforceSchema(ctx context.Context, db *mongo.Database, schema *Schema, policy IndexMismatchPolicy, inPlaceUnique bool) error {
+func enforceSchema(ctx context.Context, db *mongo.Database, schema *Schema, policy IndexMismatchPolicy, probe *prepareUniqueProbe) error {
 	coll := db.Collection(schema.Collection)
 
 	// Get existing indexes
@@ -130,7 +128,7 @@ func enforceSchema(ctx context.Context, db *mongo.Database, schema *Schema, poli
 			continue
 		}
 		keys := bson.D{{Key: field.BSONName, Value: 1}}
-		if err := enforceIndex(ctx, coll, schema.Collection, existing, field.BSONName+"_1", keys, field.Unique, policy, inPlaceUnique); err != nil {
+		if err := enforceIndex(ctx, coll, schema.Collection, existing, field.BSONName+"_1", keys, field.Unique, policy, probe); err != nil {
 			return err
 		}
 	}
@@ -141,7 +139,7 @@ func enforceSchema(ctx context.Context, db *mongo.Database, schema *Schema, poli
 		for _, f := range ci.Fields {
 			keys = append(keys, bson.E{Key: f, Value: 1})
 		}
-		if err := enforceIndex(ctx, coll, schema.Collection, existing, compoundIndexName(ci), keys, ci.Unique, policy, inPlaceUnique); err != nil {
+		if err := enforceIndex(ctx, coll, schema.Collection, existing, compoundIndexName(ci), keys, ci.Unique, policy, probe); err != nil {
 			return err
 		}
 	}
@@ -151,7 +149,7 @@ func enforceSchema(ctx context.Context, db *mongo.Database, schema *Schema, poli
 
 // enforceIndex ensures a single index exists with the expected keys and options,
 // creating it if missing and handling option mismatches per the policy.
-func enforceIndex(ctx context.Context, coll *mongo.Collection, collection string, existing map[string]IndexSpec, name string, keys bson.D, unique bool, policy IndexMismatchPolicy, inPlaceUnique bool) error {
+func enforceIndex(ctx context.Context, coll *mongo.Collection, collection string, existing map[string]IndexSpec, name string, keys bson.D, unique bool, policy IndexMismatchPolicy, probe *prepareUniqueProbe) error {
 	spec, exists := existing[name]
 	if !exists {
 		return createIndex(ctx, coll, collection, name, keys, unique)
@@ -169,16 +167,8 @@ func enforceIndex(ctx context.Context, coll *mongo.Collection, collection string
 		}
 	}
 
-	// IndexMismatchRebuild. Prefer in-place conversion: drop+create leaves a
-	// window with no index at all, during which a concurrent writer can insert
-	// a duplicate that makes the recreate fail and every later Enforce fail too.
-	if inPlaceUnique && canConvertToUniqueInPlace(spec, keys, unique) {
-		return convertIndexToUnique(ctx, coll, collection, name)
-	}
-
-	// A unique index can only be built if the data is actually unique. Check
-	// before dropping so a failure leaves the existing index in place instead
-	// of leaving the collection unindexed.
+	// IndexMismatchRebuild. A unique index can only be built over unique data.
+	// Check before touching the index so a failure here is a read-only no-op.
 	if unique {
 		hasDups, err := hasDuplicateValues(ctx, coll, keys)
 		if err != nil {
@@ -192,6 +182,13 @@ func enforceIndex(ctx context.Context, coll *mongo.Collection, collection string
 				Collection: collection,
 				Message:    fmt.Sprintf("cannot rebuild index %s as unique: collection contains duplicate values; existing index left in place", name),
 			}
+		}
+	}
+
+	if canConvertToUniqueInPlace(spec, keys, unique) && probe.ok(ctx) {
+		converted, err := convertIndexToUnique(ctx, coll, collection, name)
+		if err != nil || converted {
+			return err
 		}
 	}
 
@@ -221,14 +218,28 @@ func canConvertToUniqueInPlace(spec IndexSpec, keys bson.D, unique bool) bool {
 // collMod {unique: true} when the collection already contains duplicates.
 const codeCannotConvertIndexToUnique = 359
 
+// revertTimeout bounds the prepareUnique revert, which must not depend on the
+// caller's context still being alive.
+const revertTimeout = 30 * time.Second
+
 // convertIndexToUnique makes an existing non-unique index unique without
 // dropping it. prepareUnique must be set first: from then on the server
 // rejects new duplicate inserts, so the final unique step cannot race a writer.
-// If the final step fails, prepareUnique is reverted so the index is left
-// exactly as it was.
-func convertIndexToUnique(ctx context.Context, coll *mongo.Collection, collection, name string) error {
+//
+// Returns (false, nil) if the server rejected prepareUnique; the index is
+// untouched and the caller may fall back to drop and recreate. If the final
+// step reports existing duplicates, prepareUnique is reverted so the index is
+// left exactly as it was. On any other failure the index is deliberately left
+// prepared: that state is safe (index present, new duplicates rejected), it
+// may be shared with a concurrent Enforce, and the next Enforce finishes the
+// conversion because both collMod steps are idempotent.
+func convertIndexToUnique(ctx context.Context, coll *mongo.Collection, collection, name string) (bool, error) {
 	if err := collModIndex(ctx, coll, name, "prepareUnique", true); err != nil {
-		return &EnforcementError{
+		var cmdErr mongo.CommandError
+		if errors.As(err, &cmdErr) {
+			return false, nil
+		}
+		return false, &EnforcementError{
 			Collection: collection,
 			Message:    fmt.Sprintf("failed to prepare index %s for unique conversion: %v", name, err),
 		}
@@ -236,18 +247,24 @@ func convertIndexToUnique(ctx context.Context, coll *mongo.Collection, collectio
 
 	err := collModIndex(ctx, coll, name, "unique", true)
 	if err == nil {
-		return nil
+		return true, nil
 	}
 
-	msg := fmt.Sprintf("failed to convert index %s to unique: %v", name, err)
 	var cmdErr mongo.CommandError
-	if errors.As(err, &cmdErr) && cmdErr.Code == codeCannotConvertIndexToUnique {
-		msg = fmt.Sprintf("cannot convert index %s to unique: collection contains duplicate values; existing index left in place", name)
+	if !errors.As(err, &cmdErr) || cmdErr.Code != codeCannotConvertIndexToUnique {
+		return false, &EnforcementError{
+			Collection: collection,
+			Message:    fmt.Sprintf("index %s is prepareUnique (new duplicates are rejected) but the unique step failed, rerun Enforce to finish the conversion: %v", name, err),
+		}
 	}
-	if revertErr := collModIndex(ctx, coll, name, "prepareUnique", false); revertErr != nil {
+
+	msg := fmt.Sprintf("cannot convert index %s to unique: collection contains duplicate values; existing index left in place", name)
+	revertCtx, cancel := context.WithTimeout(context.Background(), revertTimeout)
+	defer cancel()
+	if revertErr := collModIndex(revertCtx, coll, name, "prepareUnique", false); revertErr != nil {
 		msg += fmt.Sprintf(" (index is still prepareUnique, so new duplicates are rejected; revert failed: %v)", revertErr)
 	}
-	return &EnforcementError{Collection: collection, Message: msg}
+	return false, &EnforcementError{Collection: collection, Message: msg}
 }
 
 func collModIndex(ctx context.Context, coll *mongo.Collection, name, option string, value bool) error {
@@ -261,9 +278,27 @@ func collModIndex(ctx context.Context, coll *mongo.Collection, name, option stri
 	return coll.Database().RunCommand(ctx, cmd).Err()
 }
 
+// prepareUniqueProbe checks server support for collMod prepareUnique at most
+// once per Enforce run, and only when a conversion is actually needed.
+type prepareUniqueProbe struct {
+	db        *mongo.Database
+	checked   bool
+	supported bool
+}
+
+func (p *prepareUniqueProbe) ok(ctx context.Context) bool {
+	if !p.checked {
+		p.supported = supportsPrepareUnique(ctx, p.db)
+		p.checked = true
+	}
+	return p.supported
+}
+
 // supportsPrepareUnique reports whether the server is 6.0 or newer, the first
-// release with collMod prepareUnique. Unknown versions are treated as
-// unsupported so Enforce falls back to drop and recreate rather than failing.
+// release with collMod prepareUnique. A 6.0+ binary still rejects it while the
+// featureCompatibilityVersion is below 6.0 (mid-upgrade), so FCV is checked
+// too when the caller has permission to read it. Unknown versions are treated
+// as unsupported so Enforce falls back to drop and recreate rather than failing.
 func supportsPrepareUnique(ctx context.Context, db *mongo.Database) bool {
 	var info struct {
 		VersionArray []int32 `bson:"versionArray"`
@@ -271,7 +306,22 @@ func supportsPrepareUnique(ctx context.Context, db *mongo.Database) bool {
 	if err := db.RunCommand(ctx, bson.D{{Key: "buildInfo", Value: 1}}).Decode(&info); err != nil {
 		return false
 	}
-	return len(info.VersionArray) > 0 && info.VersionArray[0] >= 6
+	if len(info.VersionArray) == 0 || info.VersionArray[0] < 6 {
+		return false
+	}
+
+	var fcv struct {
+		FCV struct {
+			Version string `bson:"version"`
+		} `bson:"featureCompatibilityVersion"`
+	}
+	cmd := bson.D{{Key: "getParameter", Value: 1}, {Key: "featureCompatibilityVersion", Value: 1}}
+	if err := db.Client().Database("admin").RunCommand(ctx, cmd).Decode(&fcv); err != nil {
+		return true // not permitted to read FCV; trust the binary version
+	}
+	major, _, _ := strings.Cut(fcv.FCV.Version, ".")
+	n, err := strconv.Atoi(major)
+	return err != nil || n >= 6
 }
 
 func createIndex(ctx context.Context, coll *mongo.Collection, collection, name string, keys bson.D, unique bool) error {
@@ -295,6 +345,9 @@ func describeIndexMismatch(spec IndexSpec, keys bson.D, unique bool) string {
 		return "has different keys than the schema expects"
 	}
 	if unique && !spec.Unique {
+		if spec.PrepareUnique {
+			return "is prepareUnique but not yet unique: new duplicates are already rejected (schema requires unique)"
+		}
 		return "is not unique (schema requires unique)"
 	}
 	if !unique && spec.Unique {
@@ -410,6 +463,7 @@ type IndexSpec struct {
 	Name             string
 	Keys             bson.D
 	Unique           bool
+	PrepareUnique    bool // collMod prepareUnique is set: not unique, but new duplicates are rejected
 	Sparse           bool
 	HasPartialFilter bool // index has a partialFilterExpression
 }
@@ -430,6 +484,7 @@ func ListExistingIndexes(ctx context.Context, coll *mongo.Collection) (map[strin
 			Name                    string   `bson:"name"`
 			Key                     bson.D   `bson:"key"`
 			Unique                  bool     `bson:"unique"`
+			PrepareUnique           bool     `bson:"prepareUnique"`
 			Sparse                  bool     `bson:"sparse"`
 			PartialFilterExpression bson.Raw `bson:"partialFilterExpression"`
 		}
@@ -443,6 +498,7 @@ func ListExistingIndexes(ctx context.Context, coll *mongo.Collection) (map[strin
 			Name:             idx.Name,
 			Keys:             idx.Key,
 			Unique:           idx.Unique,
+			PrepareUnique:    idx.PrepareUnique,
 			Sparse:           idx.Sparse,
 			HasPartialFilter: len(idx.PartialFilterExpression) > 0,
 		}
