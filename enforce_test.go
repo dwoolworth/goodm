@@ -264,7 +264,11 @@ func profiledCommandCount(t *testing.T, ctx context.Context, db *mongo.Database,
 
 func requirePrepareUnique(t *testing.T, ctx context.Context, db *mongo.Database) {
 	t.Helper()
-	if !supportsPrepareUnique(ctx, db) {
+	ok, err := supportsPrepareUnique(ctx, db)
+	if err != nil {
+		t.Fatalf("supportsPrepareUnique: %v", err)
+	}
+	if !ok {
 		t.Skip("collMod prepareUnique requires MongoDB 6.0+")
 	}
 }
@@ -471,4 +475,128 @@ func TestEnforce_Rebuild_SparseUnique_FallsBackToDropCreate(t *testing.T) {
 	if n := dropIndexesCount(t, ctx, db, "test_users"); n != 1 {
 		t.Errorf("expected exactly one dropIndexes for the fallback path, got %d", n)
 	}
+}
+
+func registerModel(t *testing.T, model interface{}, collection, registryKey string) {
+	t.Helper()
+	if err := Register(model, collection); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	t.Cleanup(func() {
+		registryMu.Lock()
+		delete(registry, registryKey)
+		registryMu.Unlock()
+	})
+}
+
+func TestEnforce_StalePrepareUnique_OnIndexField_ClearedInPlace(t *testing.T) {
+	ctx, db, cleanup := setupTestDB(t)
+	defer cleanup()
+	requirePrepareUnique(t, ctx, db)
+	registerModel(t, &testIndexedField{}, "test_indexed_field", "testIndexedField")
+
+	coll := db.Collection("test_indexed_field")
+	createNonUniqueIndex(t, ctx, coll, "code")
+	if err := collModIndex(ctx, coll, "code_1", "prepareUnique", true); err != nil {
+		t.Fatalf("prepareUnique: %v", err)
+	}
+
+	err := Enforce(ctx, db)
+	if err == nil || !strings.Contains(err.Error(), "prepareUnique") {
+		t.Errorf("default policy should report the stale prepareUnique, got: %v", err)
+	}
+
+	enableProfiler(t, ctx, db)
+	if err := Enforce(ctx, db, EnforceOptions{IndexMismatchPolicy: IndexMismatchRebuild}); err != nil {
+		t.Fatalf("Enforce with rebuild: %v", err)
+	}
+	spec, _ := getIndexSpec(t, ctx, coll, "code_1")
+	if spec.PrepareUnique || spec.Unique {
+		t.Errorf("expected plain non-unique index, got unique=%v prepareUnique=%v", spec.Unique, spec.PrepareUnique)
+	}
+	if n := dropIndexesCount(t, ctx, db, "test_indexed_field"); n != 0 {
+		t.Errorf("expected in-place clear, but dropIndexes ran %d time(s)", n)
+	}
+	docs := []interface{}{bson.D{{Key: "code", Value: "x"}}, bson.D{{Key: "code", Value: "x"}}}
+	if _, err := coll.InsertMany(ctx, docs); err != nil {
+		t.Errorf("non-unique index should accept duplicates: %v", err)
+	}
+}
+
+func TestEnforce_Rebuild_CollationIndex_FallsBackToDropCreate(t *testing.T) {
+	ctx, db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	coll := db.Collection("test_users")
+	_, err := coll.Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "email", Value: 1}},
+		Options: options.Index().SetCollation(&options.Collation{Locale: "en", Strength: 2}),
+	})
+	if err != nil {
+		t.Fatalf("create collation index: %v", err)
+	}
+	spec, _ := getIndexSpec(t, ctx, coll, "email_1")
+	if !spec.HasCollation {
+		t.Fatal("ListExistingIndexes should report collation")
+	}
+	enableProfiler(t, ctx, db)
+
+	if err := Enforce(ctx, db, EnforceOptions{IndexMismatchPolicy: IndexMismatchRebuild}); err != nil {
+		t.Fatalf("Enforce with rebuild: %v", err)
+	}
+	spec, _ = getIndexSpec(t, ctx, coll, "email_1")
+	if !spec.Unique || spec.HasCollation {
+		t.Errorf("expected plain unique index, got unique=%v collation=%v", spec.Unique, spec.HasCollation)
+	}
+	if n := dropIndexesCount(t, ctx, db, "test_users"); n != 1 {
+		t.Errorf("collation index must go through drop+create, dropIndexes ran %d time(s)", n)
+	}
+}
+
+func TestHasDuplicateValues_UniqueIndexSemantics(t *testing.T) {
+	ctx, db, cleanup := setupTestDB(t)
+	defer cleanup()
+	coll := db.Collection("dupcheck")
+	keys := bson.D{{Key: "tags", Value: 1}}
+
+	insert := func(docs ...interface{}) {
+		t.Helper()
+		if _, err := coll.InsertMany(ctx, docs); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+	check := func(want bool, why string) {
+		t.Helper()
+		got, err := hasDuplicateValues(ctx, coll, keys)
+		if err != nil {
+			t.Fatalf("hasDuplicateValues: %v", err)
+		}
+		if got != want {
+			t.Errorf("%s: got %v, want %v", why, got, want)
+		}
+	}
+
+	insert(bson.D{{Key: "tags", Value: bson.A{"a", "a"}}})
+	check(false, "duplicate elements within one document")
+	insert(bson.D{{Key: "tags", Value: bson.A{"b", "c"}}})
+	check(false, "distinct elements across documents")
+	insert(bson.D{{Key: "tags", Value: bson.A{"c", "d"}}})
+	check(true, "element shared across documents")
+
+	if err := coll.Drop(ctx); err != nil {
+		t.Fatalf("drop: %v", err)
+	}
+	insert(bson.D{{Key: "x", Value: 1}}, bson.D{{Key: "x", Value: 2}})
+	check(true, "field missing on two documents groups as null")
+
+	// Dotted and underscored keys must not collapse into one $group field.
+	keys = bson.D{{Key: "a.b", Value: 1}, {Key: "a_b", Value: 1}}
+	if err := coll.Drop(ctx); err != nil {
+		t.Fatalf("drop: %v", err)
+	}
+	insert(
+		bson.D{{Key: "a", Value: bson.D{{Key: "b", Value: 1}}}, {Key: "a_b", Value: 1}},
+		bson.D{{Key: "a", Value: bson.D{{Key: "b", Value: 1}}}, {Key: "a_b", Value: 2}},
+	)
+	check(false, "compound keys differ on a_b")
 }
