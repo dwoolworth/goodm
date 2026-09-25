@@ -19,7 +19,7 @@ var (
 // The collection parameter is the MongoDB collection name.
 func Register(model interface{}, collection string) error {
 	t := reflect.TypeOf(model)
-	if t.Kind() == reflect.Ptr {
+	if t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
 	if t.Kind() != reflect.Struct {
@@ -111,7 +111,7 @@ func parseFields(t reflect.Type, seen map[reflect.Type]bool) []FieldSchema {
 			isSlice = true
 			fieldType = fieldType.Elem()
 		}
-		if fieldType.Kind() == reflect.Ptr {
+		if fieldType.Kind() == reflect.Pointer {
 			fieldType = fieldType.Elem()
 		}
 

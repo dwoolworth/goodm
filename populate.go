@@ -48,7 +48,7 @@ func Populate(ctx context.Context, model interface{}, refs Refs, opts ...Populat
 	}
 
 	v := reflect.ValueOf(model)
-	if v.Kind() == reflect.Ptr {
+	if v.Kind() == reflect.Pointer {
 		v = v.Elem()
 	}
 
@@ -151,13 +151,13 @@ func filterNonZeroIDs(ids []bson.ObjectID) []bson.ObjectID {
 func BatchPopulate(ctx context.Context, models interface{}, field string, results interface{}, opts ...PopulateOptions) error {
 	// Validate results is *[]T
 	rv := reflect.ValueOf(results)
-	if rv.Kind() != reflect.Ptr || rv.Elem().Kind() != reflect.Slice {
+	if rv.Kind() != reflect.Pointer || rv.Elem().Kind() != reflect.Slice {
 		return fmt.Errorf("goodm: results must be a pointer to a slice, got %T", results)
 	}
 
 	// Normalize models to a reflect.Value of a slice
 	mv := reflect.ValueOf(models)
-	if mv.Kind() == reflect.Ptr {
+	if mv.Kind() == reflect.Pointer {
 		mv = mv.Elem()
 	}
 	if mv.Kind() != reflect.Slice {
@@ -169,7 +169,7 @@ func BatchPopulate(ctx context.Context, models interface{}, field string, result
 
 	// Get schema from the first element
 	elem := mv.Index(0)
-	if elem.Kind() == reflect.Ptr {
+	if elem.Kind() == reflect.Pointer {
 		elem = elem.Elem()
 	}
 	tmpPtr := reflect.New(elem.Type())
@@ -222,7 +222,7 @@ func collectRefIDs(mv reflect.Value, fs *FieldSchema) []bson.ObjectID {
 	var ids []bson.ObjectID
 	for i := 0; i < mv.Len(); i++ {
 		el := mv.Index(i)
-		if el.Kind() == reflect.Ptr {
+		if el.Kind() == reflect.Pointer {
 			el = el.Elem()
 		}
 		fv := el.FieldByName(fs.Name)

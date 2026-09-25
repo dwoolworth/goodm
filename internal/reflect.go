@@ -8,7 +8,7 @@ import (
 // StructFields returns all exported fields of a struct, flattening embedded structs.
 // It accepts a reflect.Type that must be a struct type.
 func StructFields(t reflect.Type) []reflect.StructField {
-	if t.Kind() == reflect.Ptr {
+	if t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
 	if t.Kind() != reflect.Struct {
@@ -34,7 +34,7 @@ func StructFields(t reflect.Type) []reflect.StructField {
 
 // TypeName returns a human-readable type name for a reflect.Type.
 func TypeName(t reflect.Type) string {
-	if t.Kind() == reflect.Ptr {
+	if t.Kind() == reflect.Pointer {
 		return "*" + TypeName(t.Elem())
 	}
 	if t.Kind() == reflect.Slice {

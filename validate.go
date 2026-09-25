@@ -9,7 +9,7 @@ import (
 // Returns a slice of ValidationError for any fields that fail validation.
 func Validate(model interface{}, schema *Schema) []ValidationError {
 	v := reflect.ValueOf(model)
-	if v.Kind() == reflect.Ptr {
+	if v.Kind() == reflect.Pointer {
 		v = v.Elem()
 	}
 
@@ -132,7 +132,7 @@ func validateSubFields(fv reflect.Value, fs FieldSchema, fieldPath string) []Val
 	}
 	// Single struct or *struct
 	innerVal := fv
-	if innerVal.Kind() == reflect.Ptr {
+	if innerVal.Kind() == reflect.Pointer {
 		if innerVal.IsNil() {
 			return nil
 		}
@@ -146,7 +146,7 @@ func validateSliceElements(fv reflect.Value, subFields []FieldSchema, fieldPath 
 	var errs []ValidationError
 	for i := 0; i < fv.Len(); i++ {
 		elemVal := fv.Index(i)
-		if elemVal.Kind() == reflect.Ptr {
+		if elemVal.Kind() == reflect.Pointer {
 			if elemVal.IsNil() {
 				continue
 			}
