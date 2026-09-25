@@ -188,7 +188,7 @@ func FindOne(ctx context.Context, filter interface{}, result interface{}, opts .
 func Find(ctx context.Context, filter interface{}, results interface{}, opts ...FindOptions) error {
 	// results must be *[]T
 	rv := reflect.ValueOf(results)
-	if rv.Kind() != reflect.Ptr || rv.Elem().Kind() != reflect.Slice {
+	if rv.Kind() != reflect.Pointer || rv.Elem().Kind() != reflect.Slice {
 		return fmt.Errorf("goodm: results must be a pointer to a slice, got %T", results)
 	}
 
@@ -489,7 +489,7 @@ func validateUpdateFieldNames(schema *Schema, fields bson.M) error {
 // sees the updated state without a re-read.
 func applyFieldsToModel(model interface{}, fields bson.M) {
 	v := reflect.ValueOf(model)
-	if v.Kind() == reflect.Ptr {
+	if v.Kind() == reflect.Pointer {
 		v = v.Elem()
 	}
 	t := v.Type()
@@ -654,12 +654,12 @@ func DeleteOne(ctx context.Context, filter interface{}, model interface{}, opts 
 // getSchemaForModel resolves the schema for a model instance from the registry.
 func getSchemaForModel(model interface{}) (*Schema, error) {
 	t := reflect.TypeOf(model)
-	if t.Kind() == reflect.Ptr {
+	if t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
 	if t.Kind() == reflect.Slice {
 		t = t.Elem()
-		if t.Kind() == reflect.Ptr {
+		if t.Kind() == reflect.Pointer {
 			t = t.Elem()
 		}
 	}
@@ -674,7 +674,7 @@ func getSchemaForModel(model interface{}) (*Schema, error) {
 // getModelID extracts the ID field from a model via reflection.
 func getModelID(model interface{}) (bson.ObjectID, error) {
 	v := reflect.ValueOf(model)
-	if v.Kind() == reflect.Ptr {
+	if v.Kind() == reflect.Pointer {
 		v = v.Elem()
 	}
 	idField := v.FieldByName("ID")
@@ -691,7 +691,7 @@ func getModelID(model interface{}) (bson.ObjectID, error) {
 // setModelID sets the ID field on a model via reflection.
 func setModelID(model interface{}, id bson.ObjectID) {
 	v := reflect.ValueOf(model)
-	if v.Kind() == reflect.Ptr {
+	if v.Kind() == reflect.Pointer {
 		v = v.Elem()
 	}
 	idField := v.FieldByName("ID")
@@ -703,7 +703,7 @@ func setModelID(model interface{}, id bson.ObjectID) {
 // setTimestamps sets CreatedAt (if zero) and UpdatedAt on a model via reflection.
 func setTimestamps(model interface{}, now time.Time) {
 	v := reflect.ValueOf(model)
-	if v.Kind() == reflect.Ptr {
+	if v.Kind() == reflect.Pointer {
 		v = v.Elem()
 	}
 	if f := v.FieldByName("CreatedAt"); f.IsValid() && f.CanSet() {
@@ -719,7 +719,7 @@ func setTimestamps(model interface{}, now time.Time) {
 // setUpdatedAt sets only UpdatedAt on a model via reflection.
 func setUpdatedAt(model interface{}, now time.Time) {
 	v := reflect.ValueOf(model)
-	if v.Kind() == reflect.Ptr {
+	if v.Kind() == reflect.Pointer {
 		v = v.Elem()
 	}
 	if f := v.FieldByName("UpdatedAt"); f.IsValid() && f.CanSet() {
@@ -744,11 +744,11 @@ func validateImmutable(old, new interface{}, schema *Schema) []ValidationError {
 	var errs []ValidationError
 
 	oldV := reflect.ValueOf(old)
-	if oldV.Kind() == reflect.Ptr {
+	if oldV.Kind() == reflect.Pointer {
 		oldV = oldV.Elem()
 	}
 	newV := reflect.ValueOf(new)
-	if newV.Kind() == reflect.Ptr {
+	if newV.Kind() == reflect.Pointer {
 		newV = newV.Elem()
 	}
 
@@ -785,7 +785,7 @@ func hasImmutableFields(schema *Schema) bool {
 // getModelVersion extracts the Version field from a model via reflection.
 func getModelVersion(model interface{}) (int, error) {
 	v := reflect.ValueOf(model)
-	if v.Kind() == reflect.Ptr {
+	if v.Kind() == reflect.Pointer {
 		v = v.Elem()
 	}
 	f := v.FieldByName("Version")
@@ -798,7 +798,7 @@ func getModelVersion(model interface{}) (int, error) {
 // setModelVersion sets the Version field on a model via reflection.
 func setModelVersion(model interface{}, version int) {
 	v := reflect.ValueOf(model)
-	if v.Kind() == reflect.Ptr {
+	if v.Kind() == reflect.Pointer {
 		v = v.Elem()
 	}
 	if f := v.FieldByName("Version"); f.IsValid() && f.CanSet() {

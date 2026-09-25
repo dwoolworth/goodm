@@ -28,7 +28,7 @@ type BulkResult struct {
 // you don't need the ODM lifecycle, use the mongo driver's InsertMany directly.
 func CreateMany(ctx context.Context, models interface{}, opts ...CreateOptions) error {
 	rv := reflect.ValueOf(models)
-	if rv.Kind() == reflect.Ptr {
+	if rv.Kind() == reflect.Pointer {
 		rv = rv.Elem()
 	}
 	if rv.Kind() != reflect.Slice {
@@ -90,7 +90,7 @@ func CreateMany(ctx context.Context, models interface{}, opts ...CreateOptions) 
 // elemModel returns a pointer-to-struct interface from a reflect.Value,
 // whether the value is already a pointer or a plain struct.
 func elemModel(v reflect.Value) interface{} {
-	if v.Kind() == reflect.Ptr {
+	if v.Kind() == reflect.Pointer {
 		return v.Interface()
 	}
 	return v.Addr().Interface()

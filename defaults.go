@@ -10,7 +10,7 @@ import (
 // Only called during Create — defaults are a creation-time concern.
 func applyDefaults(model interface{}, schema *Schema) error {
 	v := reflect.ValueOf(model)
-	if v.Kind() == reflect.Ptr {
+	if v.Kind() == reflect.Pointer {
 		v = v.Elem()
 	}
 
@@ -49,7 +49,7 @@ func applySubFieldDefaults(fv reflect.Value, field FieldSchema) error {
 	if field.IsSlice {
 		for i := 0; i < fv.Len(); i++ {
 			elemVal := fv.Index(i)
-			if elemVal.Kind() == reflect.Ptr {
+			if elemVal.Kind() == reflect.Pointer {
 				if elemVal.IsNil() {
 					continue
 				}
@@ -63,7 +63,7 @@ func applySubFieldDefaults(fv reflect.Value, field FieldSchema) error {
 	}
 	// Single struct or *struct
 	innerVal := fv
-	if innerVal.Kind() == reflect.Ptr {
+	if innerVal.Kind() == reflect.Pointer {
 		if innerVal.IsNil() {
 			return nil
 		}

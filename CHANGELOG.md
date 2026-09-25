@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- `IndexMismatchRebuild` no longer drops a non-unique index before recreating it as unique. On MongoDB 6.0+ the index is converted in place with `collMod` (`prepareUnique: true`, then `unique: true`), so there is no window where the collection is unindexed and a concurrent writer can insert a duplicate that would break the recreate and every subsequent `Enforce`. If duplicates already exist, `prepareUnique` is reverted and the existing index is left untouched. Drop + recreate remains the fallback for pre-6.0 servers and for mismatches `collMod` cannot fix (keys, sparse, partial, unique -> non-unique) (MSA-78).
+
 ## [0.6.0] - 2026-09-24
 
 ### Fixed
