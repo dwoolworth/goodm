@@ -419,6 +419,11 @@ func isServerError(err error) bool {
 	return errors.As(err, &se)
 }
 
+// codeMaxTimeMSExpired is the server error for an operation that exceeded
+// maxTimeMS; the driver attaches context.DeadlineExceeded to it although the
+// server produced it and did not apply the write.
+const codeMaxTimeMSExpired = 50
+
 // isTransportError reports whether err is a network failure or an in-flight
 // context error, after which the server may or may not have applied the
 // write.
@@ -566,12 +571,15 @@ func classifyReplaceError(err error, schema *Schema) replaceResult {
 	var we mongo.WriteException
 	if !errors.As(err, &we) {
 		var ce mongo.CommandError
-		if errors.As(err, &ce) && !isTransportError(err) {
-			// A command error from the server (write conflict, no such
-			// transaction) is known not to have applied.
-			r.err = fmt.Errorf("goodm: replace failed: %w", err)
+		if errors.As(err, &ce) {
 			r.code = int(ce.Code)
-			return r
+			// A command error from the server (write conflict, no such
+			// transaction, maxTimeMS expired) is known not to have applied;
+			// one that stands for a network failure is not.
+			if !isTransportError(err) || ce.Code == codeMaxTimeMSExpired {
+				r.err = fmt.Errorf("goodm: replace failed: %w", err)
+				return r
+			}
 		}
 		r.err = fmt.Errorf("goodm: outcome unknown: %w", err)
 		return r

@@ -970,6 +970,11 @@ func TestClassifyReplaceError_TransportIsUnknown(t *testing.T) {
 	if strings.Contains(r.err.Error(), "outcome unknown") || r.code != 112 {
 		t.Errorf("write conflict is a known failure with its code: %v code=%d", r.err, r.code)
 	}
+	expired := mongo.CommandError{Code: 50, Message: "operation exceeded time limit", Wrapped: context.DeadlineExceeded}
+	r = classifyReplaceError(expired, nil)
+	if strings.Contains(r.err.Error(), "outcome unknown") || r.code != 50 {
+		t.Errorf("maxTimeMS expiry is a server error that did not apply: %v code=%d", r.err, r.code)
+	}
 	r = classifyReplaceError(errors.New("marshal boom"), nil)
 	if r.server || !strings.Contains(r.err.Error(), "outcome unknown") {
 		t.Errorf("client-side error: %v server=%v", r.err, r.server)
