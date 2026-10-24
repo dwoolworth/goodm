@@ -56,6 +56,10 @@ goodm.WithTransaction(outerCtx, func(ctx context.Context) error {
 
 If the context already carries a session with a transaction in progress, a nested `WithTransaction` runs its callback inside that transaction instead of starting a second one, and ignores its own options. An error from the inner callback therefore aborts the whole outer transaction, and the inner writes are never committed on their own. This lets helpers that wrap themselves in `WithTransaction` be composed freely. A context that carries a session without an active transaction gets a transaction started on that session.
 
+## Batch Operations
+
+A `SaveMany` or `CreateMany` error inside the callback must be returned, not ignored. When the server rejected a write, the transaction is already aborted, and returning nil makes the driver retry the callback until its two-minute limit instead of failing fast. See [Bulk Operations](bulk.md) for how each batch operation reports its items inside a transaction.
+
 ## Options
 
 Override the database connection or pass driver transaction options (read concern, write concern, read preference, max commit time):

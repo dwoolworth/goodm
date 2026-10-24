@@ -3,9 +3,15 @@ package goodm
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
+	"sync"
 	"testing"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
 )
 
 func TestBulk_MixedOperations(t *testing.T) {
@@ -272,5 +278,705 @@ func TestSaveMany_RejectsZeroIDAndEmptyIsNoop(t *testing.T) {
 	err := SaveMany(ctx, []*testUser{{Email: "x@test.com", Name: "X"}})
 	if err == nil {
 		t.Error("zero ID must be rejected")
+	}
+}
+
+// testWC5 forces an unsatisfiable write concern on a single-node replica set.
+type testWC5 struct {
+	Model  `bson:",inline"`
+	Name   string `bson:"name"`
+	Events []string
+}
+
+func (m *testWC5) CollectionOptions() CollectionOptions {
+	return CollectionOptions{WriteConcern: &writeconcern.WriteConcern{W: 5}}
+}
+func (m *testWC5) AfterCreate(ctx context.Context) error {
+	m.Events = append(m.Events, "after_create")
+	return nil
+}
+func (m *testWC5) AfterSave(ctx context.Context) error {
+	m.Events = append(m.Events, "after_save")
+	return nil
+}
+
+// testNoTimestamps is a custom-ID model with no timestamp or version fields.
+type testNoTimestamps struct {
+	ID   string `bson:"_id"`
+	Name string `bson:"name"`
+}
+
+func TestSaveMany_ConcurrentWritersFromSameVersion_ExactlyOneWins(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	for round := 0; round < 25; round++ {
+		base := &testUser{Email: fmt.Sprintf("race%d@test.com", round), Name: "Race", Age: 1}
+		if err := Create(ctx, base); err != nil {
+			t.Fatal(err)
+		}
+		a, b := *base, *base
+		a.Age = 10
+		b.Role = "admin"
+
+		var errA, errB error
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); errA = SaveMany(ctx, []*testUser{&a}) }()
+		go func() { defer wg.Done(); errB = SaveMany(ctx, []*testUser{&b}) }()
+		wg.Wait()
+
+		okA, okB := errA == nil, errB == nil
+		if okA == okB {
+			t.Fatalf("round %d: exactly one writer must win, got errA=%v errB=%v", round, errA, errB)
+		}
+		loser := errB
+		if !okA {
+			loser = errA
+		}
+		if !errors.Is(loser, ErrVersionConflict) {
+			t.Fatalf("round %d: loser must see ErrVersionConflict, got %v", round, loser)
+		}
+		var fresh testUser
+		if err := FindByID(ctx, base.ID, &fresh); err != nil {
+			t.Fatal(err)
+		}
+		if fresh.Version != 1 {
+			t.Fatalf("round %d: stored version %d, want 1", round, fresh.Version)
+		}
+		if okA && (fresh.Age != 10 || fresh.Role != "user") || okB && (fresh.Role != "admin" || fresh.Age != 1) {
+			t.Fatalf("round %d: stored document does not match the winner: %+v (A won: %v)", round, fresh, okA)
+		}
+	}
+}
+
+func TestSaveMany_RejectsDuplicateIDsInBatch(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	u := seedUsers(t, ctx, 1)[0]
+
+	copy1, copy2 := *u, *u
+	copy1.Age = 1
+	copy2.Age = 2
+	err := SaveMany(ctx, []*testUser{&copy1, &copy2})
+	if err == nil || !strings.Contains(err.Error(), "same _id") {
+		t.Fatalf("expected duplicate-id rejection, got %v", err)
+	}
+	var fresh testUser
+	if err := FindByID(ctx, u.ID, &fresh); err != nil || fresh.Version != 0 {
+		t.Fatalf("nothing should have been written: %+v %v", fresh, err)
+	}
+}
+
+func TestSaveMany_IdenticalContentFromAnotherWriter_IsStillAConflict(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	u := seedUsers(t, ctx, 1)[0]
+
+	other := *u
+	other.Age = 30
+	if err := Update(ctx, &other); err != nil {
+		t.Fatal(err)
+	}
+	mine := other
+	mine.Version = 0 // stale: our filter targets version 0
+	err := SaveMany(ctx, []*testUser{&mine})
+	if !errors.Is(err, ErrVersionConflict) {
+		t.Fatalf("a stale version must be a conflict regardless of content, got %v", err)
+	}
+	if mine.Version != 1 {
+		t.Errorf("conflicting model should have its version refreshed to 1, got %d", mine.Version)
+	}
+}
+
+func TestSaveMany_ModelWithoutTimestamps_ClassifiesCorrectly(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testNoTimestamps{}, "test_no_ts", "")
+
+	docs := []*testNoTimestamps{{ID: "a", Name: "A"}, {ID: "b", Name: "B"}}
+	if err := CreateMany(ctx, docs); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteOne(ctx, bson.D{{Key: "_id", Value: "b"}}, &testNoTimestamps{}); err != nil {
+		t.Fatal(err)
+	}
+	docs[0].Name = "A2"
+	docs[1].Name = "B2"
+	err := SaveMany(ctx, docs)
+	var be *BulkError
+	if !errors.As(err, &be) || len(be.Errors) != 1 || be.Errors[0].Index != 1 || !errors.Is(be.Errors[0].Err, ErrNotFound) {
+		t.Fatalf("expected only item 1 to fail with ErrNotFound, got %v", err)
+	}
+	var fresh testNoTimestamps
+	if err := FindByID(ctx, "a", &fresh); err != nil || fresh.Name != "A2" {
+		t.Fatalf("item 0 should have been saved and reported as success: %+v %v", fresh, err)
+	}
+}
+
+func TestBulkPaths_WriteConcernErrorIsReported(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testWC5{}, "test_wc5", "")
+
+	m := []*testWC5{{Name: "x"}, {Name: "y"}}
+	err := CreateMany(ctx, m)
+	var be *BulkError
+	if !errors.As(err, &be) || be.WriteConcernError == nil {
+		t.Fatalf("CreateMany: expected a BulkError carrying the write concern error, got %v", err)
+	}
+	for i, d := range m {
+		if len(d.Events) != 0 {
+			t.Errorf("CreateMany: AfterCreate must not run on item %d after a write concern failure", i)
+		}
+	}
+
+	// The server may well have applied the inserts before failing the write
+	// concern, so make sure the documents exist without assuming either way.
+	coll := DB().Collection("test_wc5")
+	for _, d := range m {
+		if _, err := coll.ReplaceOne(ctx, bson.D{{Key: "_id", Value: d.ID}}, d, options.Replace().SetUpsert(true)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m[0].Name = "x2"
+	err = SaveMany(ctx, m)
+	if !errors.As(err, &be) || be.WriteConcernError == nil || len(be.Errors) != 2 {
+		t.Fatalf("SaveMany: expected a BulkError with the write concern error on both items, got %v", err)
+	}
+	if m[0].Version != 0 || len(m[0].Events) != 0 {
+		t.Errorf("SaveMany: version must be rolled back and AfterSave skipped, got v=%d events=%v", m[0].Version, m[0].Events)
+	}
+
+	// A duplicate key alongside the write concern failure keeps its own error
+	// and does not stop the batch.
+	dupSave := []*testWC5{{Model: Model{ID: m[0].ID}, Name: "d1"}, {Model: Model{ID: m[0].ID}, Name: "d2"}}
+	if err := SaveMany(ctx, dupSave); err == nil || !strings.Contains(err.Error(), "same _id") {
+		t.Fatalf("duplicate ids must still be rejected up front: %v", err)
+	}
+
+	_, err = NewBulk(&testWC5{}).InsertOne(bson.D{{Key: "name", Value: "z"}}).Execute(ctx)
+	if !errors.As(err, &be) || be.WriteConcernError == nil {
+		t.Fatalf("Bulk: expected a BulkError carrying the write concern error, got %v", err)
+	}
+
+	// A write concern error alongside a rejected item keeps the item error.
+	id := bson.NewObjectID()
+	dup := []*testWC5{{Model: Model{ID: id}, Name: "a"}, {Model: Model{ID: id}, Name: "b"}}
+	err = CreateMany(ctx, dup, CreateOptions{Unordered: true})
+	if !errors.As(err, &be) || be.WriteConcernError == nil || !errors.Is(err, ErrDuplicateKey) {
+		t.Fatalf("expected both the write concern error and the duplicate key error, got %v", err)
+	}
+}
+
+func TestSaveMany_MiddlewareScopeFilter(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	users := seedUsers(t, ctx, 2) // users[0] admin, users[1] user
+
+	Use(func(ctx context.Context, op *OpInfo, next func(context.Context) error) error {
+		if op.Operation == OpSaveMany {
+			op.Filter = bson.D{{Key: "role", Value: "admin"}}
+		}
+		return next(ctx)
+	})
+	for _, u := range users {
+		u.Age = 99
+	}
+	err := SaveMany(ctx, users)
+	var be *BulkError
+	if !errors.As(err, &be) || len(be.Errors) != 1 || be.Errors[0].Index != 1 || !errors.Is(be.Errors[0].Err, ErrNotFound) {
+		t.Fatalf("out-of-scope document must be reported as ErrNotFound, got %v", err)
+	}
+	var fresh testUser
+	if err := FindByID(ctx, users[1].ID, &fresh); err != nil || fresh.Age == 99 {
+		t.Fatalf("out-of-scope document must not be written: %+v %v", fresh, err)
+	}
+	if err := FindByID(ctx, users[0].ID, &fresh); err != nil || fresh.Age != 99 {
+		t.Fatalf("in-scope document must be written: %+v %v", fresh, err)
+	}
+}
+
+func TestSaveMany_LargeBatchConcurrentAndInTransaction(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	users := seedUsers(t, ctx, 25) // more than the concurrency bound
+
+	for _, u := range users {
+		u.Age = 77
+	}
+	if err := SaveMany(ctx, users); err != nil {
+		t.Fatalf("concurrent SaveMany: %v", err)
+	}
+	n, _ := Count(ctx, bson.D{{Key: "age", Value: 77}, {Key: "__v", Value: 1}}, &testUser{})
+	if n != 25 {
+		t.Fatalf("expected 25 saved documents, got %d", n)
+	}
+
+	// Inside a transaction the same batch runs sequentially on the session
+	// and is atomic with the surrounding writes.
+	for _, u := range users {
+		u.Age = 78
+	}
+	err := WithTransaction(ctx, func(ctx context.Context) error {
+		if err := SaveMany(ctx, users); err != nil {
+			return err
+		}
+		return errors.New("abort")
+	})
+	if err == nil {
+		t.Fatal("expected abort")
+	}
+	n, _ = Count(ctx, bson.D{{Key: "age", Value: 78}}, &testUser{})
+	if n != 0 {
+		t.Fatalf("aborted transaction must roll back every SaveMany write, got %d", n)
+	}
+	// Models bumped in the aborted transaction must be reconciled by the
+	// caller, as after any aborted transaction; a fresh load saves cleanly.
+	var fresh []testUser
+	if err := Find(ctx, bson.D{}, &fresh); err != nil {
+		t.Fatal(err)
+	}
+	for i := range fresh {
+		fresh[i].Age = 79
+	}
+	if err := WithTransaction(ctx, func(ctx context.Context) error { return SaveMany(ctx, fresh) }); err != nil {
+		t.Fatalf("SaveMany in a committed transaction: %v", err)
+	}
+	n, _ = Count(ctx, bson.D{{Key: "age", Value: 79}, {Key: "__v", Value: 2}}, &testUser{})
+	if n != 25 {
+		t.Fatalf("expected 25 documents at version 2, got %d", n)
+	}
+}
+
+func TestSaveMany_InTransaction_FirstFailureAbortsBatch(t *testing.T) {
+	ctx, db, cleanup := setupTestDB(t)
+	defer cleanup()
+	if err := Enforce(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	hooked := []*testHookUser{{Email: "t1@test.com", Name: "A"}, {Email: "t2@test.com", Name: "B"}, {Email: "t3@test.com", Name: "C"}}
+	if err := CreateMany(ctx, hooked); err != nil {
+		t.Fatal(err)
+	}
+	users := seedUsers(t, ctx, 2)
+	users[1].Email = users[0].Email // duplicate key on item 1
+
+	var be *BulkError
+	err := WithTransaction(ctx, func(ctx context.Context) error {
+		err := SaveMany(ctx, users)
+		if !errors.As(err, &be) {
+			t.Fatalf("expected a BulkError inside the transaction, got %v", err)
+		}
+		return err
+	})
+	if err == nil {
+		t.Fatal("transaction must fail")
+	}
+	if len(be.Errors) != 2 || !errors.Is(be.Errors[1].Err, ErrDuplicateKey) || be.Errors[1].Code != 11000 {
+		t.Errorf("expected item 1 as a duplicate key with code 11000 and item 0 as not saved, got %+v", be.Errors)
+	}
+	if errors.Is(be.Errors[0].Err, ErrDuplicateKey) || !strings.Contains(be.Errors[0].Err.Error(), "not saved") {
+		t.Errorf("item 0 must be reported as not saved without matching item 1's error type, got %v", be.Errors[0].Err)
+	}
+	for i, u := range users {
+		if u.Version != 0 {
+			t.Errorf("item %d version must be restored after the aborted transaction, got %d", i, u.Version)
+		}
+	}
+
+	// Hooks: nothing ran, since nothing committed. test_hook_users has no
+	// unique index of its own, so create one to make item 1 fail.
+	if _, err := db.Collection("test_hook_users").Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys: bson.D{{Key: "email", Value: 1}}, Options: options.Index().SetUnique(true),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range hooked {
+		h.Name += "x"
+	}
+	hooked[1].Email = hooked[0].Email
+	if err := WithTransaction(ctx, func(ctx context.Context) error { return SaveMany(ctx, hooked) }); err == nil {
+		t.Fatal("transaction with a duplicate key must fail")
+	}
+	for i, h := range hooked {
+		for _, e := range h.Events {
+			if e == "after_save" {
+				t.Errorf("item %d: AfterSave must not run in an aborted transaction", i)
+			}
+		}
+	}
+}
+
+type testHookFail struct {
+	Model   `bson:",inline"`
+	Name    string `bson:"name"`
+	FailOn  string
+	Created []string
+}
+
+func (m *testHookFail) AfterSave(ctx context.Context) error {
+	if m.FailOn == "save" {
+		return errors.New("after save boom")
+	}
+	return nil
+}
+func (m *testHookFail) AfterCreate(ctx context.Context) error {
+	m.Created = append(m.Created, "after_create")
+	if m.FailOn == "create" {
+		return errors.New("after create boom")
+	}
+	return nil
+}
+
+func TestBulk_AfterHookErrorsAreCollectedNotFatal(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testHookFail{}, "test_hook_fail", "")
+
+	ms := []*testHookFail{{Name: "a", FailOn: "create"}, {Name: "b"}, {Name: "c"}}
+	err := CreateMany(ctx, ms)
+	var be *BulkError
+	if !errors.As(err, &be) || len(be.Errors) != 1 || be.Errors[0].Index != 0 || be.Result.InsertedCount != 3 {
+		t.Fatalf("CreateMany: expected a BulkError for item 0 with all 3 inserted, got %v", err)
+	}
+	for i, m := range ms {
+		if len(m.Created) != 1 {
+			t.Errorf("CreateMany: AfterCreate must still run for item %d", i)
+		}
+	}
+
+	ms[0].FailOn = "save"
+	ms[0].Name = "a2"
+	ms[1].Name = "b2"
+	stale := *ms[2]
+	ms[2].Name = "c2"
+	if err := Update(ctx, &stale); err != nil { // make item 2 conflict
+		t.Fatal(err)
+	}
+	err = SaveMany(ctx, ms)
+	if !errors.As(err, &be) {
+		t.Fatalf("expected a BulkError, got %v", err)
+	}
+	if !errors.Is(err, ErrVersionConflict) {
+		t.Error("the conflict on item 2 must not be hidden by the hook error on item 0")
+	}
+	byIndex := map[int]error{}
+	for _, e := range be.Errors {
+		byIndex[e.Index] = e.Err
+	}
+	if byIndex[0] == nil || !strings.Contains(byIndex[0].Error(), "AfterSave failed") || ms[0].Version != 1 {
+		t.Errorf("item 0 must be reported as saved with a failed hook and keep version 1, got %v v=%d", byIndex[0], ms[0].Version)
+	}
+	if _, failed := byIndex[1]; failed {
+		t.Errorf("item 1 saved cleanly and must not be listed: %v", byIndex[1])
+	}
+	var fresh testHookFail
+	if err := FindByID(ctx, ms[0].ID, &fresh); err != nil || fresh.Name != "a2" {
+		t.Errorf("item 0 must have been saved despite the hook error: %+v %v", fresh, err)
+	}
+}
+
+func TestSaveMany_CancelledContext_ReportsNotAttempted(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testNoTimestamps{}, "test_no_ts", "")
+	docs := []*testNoTimestamps{{ID: "a", Name: "A"}, {ID: "b", Name: "B"}}
+	if err := CreateMany(ctx, docs); err != nil {
+		t.Fatal(err)
+	}
+
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	docs[0].Name = "A2"
+	err := SaveMany(cancelled, docs)
+	var be *BulkError
+	if !errors.As(err, &be) || len(be.Errors) != 2 {
+		t.Fatalf("expected both items reported, got %v", err)
+	}
+	for _, e := range be.Errors {
+		if !errors.Is(e.Err, ErrNotAttempted) && !strings.Contains(e.Err.Error(), "outcome unknown") {
+			t.Errorf("item %d must be not attempted or outcome unknown, got %v", e.Index, e.Err)
+		}
+		if !errors.Is(e.Err, context.Canceled) {
+			t.Errorf("item %d must wrap the context error, got %v", e.Index, e.Err)
+		}
+	}
+	var fresh testNoTimestamps
+	if err := FindByID(ctx, "a", &fresh); err != nil || fresh.Name != "A" {
+		t.Errorf("nothing should have been written: %+v %v", fresh, err)
+	}
+}
+
+func TestSaveMany_PlainSession_IsNotATransaction(t *testing.T) {
+	ctx, db, cleanup := setupTestDB(t)
+	defer cleanup()
+	if err := Enforce(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	users := seedUsers(t, ctx, 3)
+	users[0].Age = 50
+	users[1].Age = 51
+	users[2].Email = users[1].Email // duplicate key on item 2
+
+	err := db.Client().UseSession(ctx, func(ctx context.Context) error {
+		err := SaveMany(ctx, users)
+		var be *BulkError
+		if !errors.As(err, &be) {
+			return fmt.Errorf("expected a BulkError, got %v", err)
+		}
+		if len(be.Errors) != 1 || be.Errors[0].Index != 2 || !errors.Is(be.Errors[0].Err, ErrDuplicateKey) {
+			return fmt.Errorf("only item 2 may fail in a plain session, got %+v", be.Errors)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if users[0].Version != 1 || users[1].Version != 1 {
+		t.Errorf("saved items must keep their new version in a plain session: %d %d", users[0].Version, users[1].Version)
+	}
+	var fresh testUser
+	if err := FindByID(ctx, users[0].ID, &fresh); err != nil || fresh.Age != 50 || fresh.Version != 1 {
+		t.Errorf("item 0 must be saved: %+v %v", fresh, err)
+	}
+	// The next Update must not see a false conflict.
+	users[0].Age = 52
+	if err := Update(ctx, users[0]); err != nil {
+		t.Errorf("Update after a plain-session SaveMany: %v", err)
+	}
+}
+
+type testBadMarshal struct {
+	Model `bson:",inline"`
+	Name  string `bson:"name"`
+	Bad   badValue
+}
+
+type badValue struct{ fail bool }
+
+func (b badValue) MarshalBSONValue() (byte, []byte, error) {
+	if b.fail {
+		return 0, nil, errors.New("marshal boom")
+	}
+	typ, data, err := bson.MarshalValue("ok")
+	return byte(typ), data, err
+}
+
+func (b *badValue) UnmarshalBSONValue(byte, []byte) error { return nil }
+
+func TestSaveMany_ClientSideFailureInTransaction_DoesNotAbort(t *testing.T) {
+	ctx, db, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testBadMarshal{}, "test_bad_marshal", "")
+	docs := []*testBadMarshal{{Name: "a"}, {Name: "b"}, {Name: "c"}}
+	if err := CreateMany(ctx, docs); err != nil {
+		t.Fatal(err)
+	}
+
+	sess, err := db.Client().StartSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.EndSession(ctx)
+	if err := sess.StartTransaction(); err != nil {
+		t.Fatal(err)
+	}
+	sessCtx := mongo.NewSessionContext(ctx, sess)
+
+	docs[0].Name = "a2"
+	docs[1].Bad = badValue{fail: true} // fails in the driver, never reaches the server
+	docs[2].Name = "c2"
+	err = SaveMany(sessCtx, docs)
+	var be *BulkError
+	if !errors.As(err, &be) || len(be.Errors) != 1 || be.Errors[0].Index != 1 {
+		t.Fatalf("a client-side failure must be reported for its item only, got %v", err)
+	}
+	if docs[0].Version != 1 || docs[2].Version != 1 {
+		t.Errorf("items written in the still-open transaction keep their new version: %d %d", docs[0].Version, docs[2].Version)
+	}
+	// Later writes in the same transaction must still be inside it, and the
+	// caller's commit decides the outcome.
+	extra := &testBadMarshal{Name: "extra"}
+	if err := Create(sessCtx, extra); err != nil {
+		t.Fatalf("Create in the still-open transaction: %v", err)
+	}
+	if ok, _ := Exists(ctx, bson.D{{Key: "_id", Value: extra.ID}}, &testBadMarshal{}); ok {
+		t.Fatal("a write after the batch failure leaked out of the transaction")
+	}
+	if err := sess.CommitTransaction(ctx); err != nil {
+		t.Fatalf("commit must still work: %v", err)
+	}
+	var fresh testBadMarshal
+	if err := FindByID(ctx, docs[0].ID, &fresh); err != nil || fresh.Name != "a2" || fresh.Version != 1 {
+		t.Errorf("item 0 must be committed with the transaction: %+v %v", fresh, err)
+	}
+	if ok, _ := Exists(ctx, bson.D{{Key: "_id", Value: extra.ID}}, &testBadMarshal{}); !ok {
+		t.Error("the later write must be committed with the transaction")
+	}
+}
+
+func TestSaveMany_ServerErrorInTransaction_LaterWriteFailsLoudly(t *testing.T) {
+	ctx, db, cleanup := setupTestDB(t)
+	defer cleanup()
+	if err := Enforce(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	users := seedUsers(t, ctx, 2)
+	users[1].Email = users[0].Email
+
+	// A driver-managed transaction (no retry loop): after the server aborts
+	// it on the duplicate key, a later write must fail rather than commit on
+	// its own, which is what resetting the client state would have caused.
+	sess, err := db.Client().StartSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.EndSession(ctx)
+	if err := sess.StartTransaction(); err != nil {
+		t.Fatal(err)
+	}
+	sessCtx := mongo.NewSessionContext(ctx, sess)
+	if err := SaveMany(sessCtx, users); !errors.Is(err, ErrDuplicateKey) {
+		t.Fatalf("expected the duplicate key failure, got %v", err)
+	}
+	if err := Create(sessCtx, &testUser{Email: "later@test.com", Name: "L"}); err == nil {
+		t.Fatal("a write after a server-aborted batch must fail")
+	}
+	_ = sess.AbortTransaction(ctx)
+	if ok, _ := Exists(ctx, bson.D{{Key: "email", Value: "later@test.com"}}, &testUser{}); ok {
+		t.Fatal("the later write leaked out of the aborted transaction")
+	}
+}
+
+func TestCreateMany_InTransaction_FailureReportsNothingInserted(t *testing.T) {
+	ctx, db, cleanup := setupTestDB(t)
+	defer cleanup()
+	if err := Enforce(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	seedUsers(t, ctx, 1) // u0@test.com exists
+
+	hooked := []*testHookUser{{Email: "a@test.com", Name: "A"}, {Email: "u0@test.com", Name: "Dup"}, {Email: "b@test.com", Name: "B"}}
+	// test_hook_users needs a unique index for the duplicate to fail.
+	if _, err := db.Collection("test_hook_users").Indexes().CreateOne(ctx, mongo.IndexModel{Keys: bson.D{{Key: "email", Value: 1}}, Options: options.Index().SetUnique(true)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Create(ctx, &testHookUser{Email: "u0@test.com", Name: "existing"}); err != nil {
+		t.Fatal(err)
+	}
+	var be *BulkError
+	err := WithTransaction(ctx, func(ctx context.Context) error {
+		err := CreateMany(ctx, hooked, CreateOptions{Unordered: true})
+		if !errors.As(err, &be) {
+			t.Fatalf("expected a BulkError, got %v", err)
+		}
+		return err
+	})
+	if err == nil {
+		t.Fatal("transaction must fail")
+	}
+	if len(be.Errors) != 3 || be.Result.InsertedCount != 0 {
+		t.Errorf("every item must be reported as not inserted with nothing counted: %+v %+v", be.Errors, be.Result)
+	}
+	// Ordered: items after the failure were never sent.
+	for _, h := range hooked {
+		h.Events = nil
+	}
+	hooked2 := []*testHookUser{{Email: "u0@test.com", Name: "Dup"}, {Email: "c@test.com", Name: "C"}}
+	_ = WithTransaction(ctx, func(ctx context.Context) error {
+		err := CreateMany(ctx, hooked2)
+		if !errors.As(err, &be) {
+			t.Fatalf("expected a BulkError, got %v", err)
+		}
+		return err
+	})
+	if len(be.Errors) != 2 || !errors.Is(be.Errors[1].Err, ErrNotAttempted) {
+		t.Errorf("ordered insert: item 1 must be ErrNotAttempted, got %+v", be.Errors)
+	}
+	for i, h := range hooked {
+		for _, e := range h.Events {
+			if e == "after_create" {
+				t.Errorf("item %d: AfterCreate must not run in an aborted transaction", i)
+			}
+		}
+	}
+	n, _ := Count(ctx, bson.D{{Key: "email", Value: "a@test.com"}}, &testHookUser{})
+	if n != 0 {
+		t.Error("nothing may have been committed")
+	}
+}
+
+func TestSaveMany_ValidatorFailureInTransaction_IsAServerError(t *testing.T) {
+	ctx, db, cleanup := setupTestDB(t)
+	defer cleanup()
+	// A $jsonSchema validator makes the server reject a write with code 121,
+	// which is not a duplicate key: it must still count as a server error.
+	cmd := bson.D{{Key: "collMod", Value: "test_users"}, {Key: "validator", Value: bson.D{
+		{Key: "$jsonSchema", Value: bson.D{{Key: "properties", Value: bson.D{{Key: "role", Value: bson.D{{Key: "enum", Value: bson.A{"user"}}}}}}}},
+	}}}
+	users := seedUsers(t, ctx, 3)
+	if err := db.RunCommand(ctx, cmd).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	users[0].Role, users[0].Age = "user", 1
+	users[1].Role, users[1].Age = "user", 2
+	users[2].Role = "admin" // allowed by goodm's enum, rejected by the server's validator; it is the last item
+	calls := 0
+	var be *BulkError
+	err := WithTransaction(ctx, func(ctx context.Context) error {
+		calls++
+		err := SaveMany(ctx, users)
+		if !errors.As(err, &be) {
+			t.Fatalf("expected a BulkError, got %v", err)
+		}
+		return err
+	})
+	if err == nil {
+		t.Fatal("transaction must fail")
+	}
+	if calls != 1 {
+		t.Errorf("callback must run once, not retry: %d", calls)
+	}
+	if len(be.Errors) != 3 || be.Errors[2].Code != 121 {
+		t.Errorf("every item must be reported and item 2 must carry code 121: %+v", be.Errors)
+	}
+	for i, u := range users {
+		if u.Version != 0 {
+			t.Errorf("item %d version must be restored, got %d", i, u.Version)
+		}
+	}
+	var fresh testUser
+	if err := FindByID(ctx, users[0].ID, &fresh); err != nil || fresh.Age == 1 {
+		t.Errorf("nothing may have been committed: %+v %v", fresh, err)
+	}
+}
+
+func TestClassifyReplaceError_TransportIsUnknown(t *testing.T) {
+	// A network error arrives as a CommandError with the NetworkError label.
+	netErr := mongo.CommandError{Code: 0, Message: "connection reset", Labels: []string{"NetworkError"}}
+	r := classifyReplaceError(netErr, nil)
+	if !strings.Contains(r.err.Error(), "outcome unknown") || !r.server {
+		t.Errorf("network error: %v server=%v", r.err, r.server)
+	}
+	dl := mongo.CommandError{Code: 0, Message: "incomplete read", Labels: []string{"NetworkError"}, Wrapped: context.DeadlineExceeded}
+	r = classifyReplaceError(dl, nil)
+	if !strings.Contains(r.err.Error(), "outcome unknown") || !errors.Is(r.err, context.DeadlineExceeded) {
+		t.Errorf("in-flight deadline: %v", r.err)
+	}
+	wc := mongo.CommandError{Code: 112, Message: "WriteConflict", Labels: []string{"TransientTransactionError"}}
+	r = classifyReplaceError(wc, nil)
+	if strings.Contains(r.err.Error(), "outcome unknown") || r.code != 112 {
+		t.Errorf("write conflict is a known failure with its code: %v code=%d", r.err, r.code)
+	}
+	expired := mongo.CommandError{Code: 50, Message: "operation exceeded time limit", Wrapped: context.DeadlineExceeded}
+	r = classifyReplaceError(expired, nil)
+	if strings.Contains(r.err.Error(), "outcome unknown") || r.code != 50 {
+		t.Errorf("maxTimeMS expiry is a server error that did not apply: %v code=%d", r.err, r.code)
+	}
+	r = classifyReplaceError(errors.New("marshal boom"), nil)
+	if r.server || !strings.Contains(r.err.Error(), "outcome unknown") {
+		t.Errorf("client-side error: %v server=%v", r.err, r.server)
 	}
 }

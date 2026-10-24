@@ -1,6 +1,6 @@
 # Bulk Operations
 
-goodm has two tiers of batch operations, mirroring the single-document API. `CreateMany` and `SaveMany` run the full model lifecycle per item and then write once. `UpdateMany`, `DeleteMany`, and the `Bulk` builder are raw passthroughs for speed.
+goodm has two tiers of batch operations, mirroring the single-document API. `CreateMany` and `SaveMany` run the full model lifecycle per item (`CreateMany` then inserts in one request; `SaveMany` replaces each document with its own, concurrently). `UpdateMany`, `DeleteMany`, and the `Bulk` builder are raw passthroughs for speed.
 
 ## CreateMany
 
@@ -27,7 +27,7 @@ err := goodm.CreateMany(ctx, users)
 // Error: "goodm: item 1: validation error on email: field is required"
 ```
 
-Write failures such as duplicate keys come back as a `*BulkError`. The insert is ordered by default, so it stops at the first failure. Set `Unordered` to insert everything that can be inserted:
+Write failures such as duplicate keys come back as a `*BulkError`. The insert is ordered by default, so it stops at the first failure. Set `Unordered` to insert everything that can be inserted. An `AfterCreate` hook that returns an error is reported for its item in the same `*BulkError` after the other hooks have run; the document stays inserted. Inside a transaction a server rejection has aborted the transaction, so `CreateMany` reports every item as not inserted (items an ordered insert never sent as `ErrNotAttempted`) and runs no `AfterCreate`.
 
 ```go
 err := goodm.CreateMany(ctx, users, goodm.CreateOptions{Unordered: true})
@@ -46,7 +46,9 @@ if errors.As(err, &be) {
 func SaveMany(ctx context.Context, models interface{}, opts ...UpdateOptions) error
 ```
 
-Persists changes to many loaded models in one round trip. Each model goes through the `Update` lifecycle: immutable fields are checked against the stored documents (one query for the whole batch), `BeforeSave` runs, the model is validated, and its `Version` and `UpdatedAt` advance. The replacements are sent as a single unordered bulk write, each guarded by its own version filter, and `AfterSave` runs for every model that was written.
+Persists changes to many loaded models in one call. Each model goes through the `Update` lifecycle: immutable fields are checked against the stored documents (one query for the whole batch), `BeforeSave` runs, the model is validated, and its `Version` and `UpdatedAt` advance. Each document is then replaced with its own conditional request guarded by its version filter, and `AfterSave` runs for every model that was written.
+
+Outside a transaction the replacements are issued concurrently, up to eight in flight, so a batch costs roughly a few round trips of latency rather than one per document. Inside a transaction they run in order on the session. MongoDB's bulk write is deliberately not used: its results do not say which replacement matched, which is exactly what optimistic locking needs to know, and the client-level bulk write of MongoDB 8 cannot honor database-level codecs or write concern.
 
 ```go
 var tasks []Task
@@ -57,15 +59,24 @@ for i := range tasks {
 err := goodm.SaveMany(ctx, tasks)
 ```
 
-If any model fails its immutable check, hook, or validation, `SaveMany` returns before writing anything. After the write, per-item problems are reported in a `*BulkError`:
+If any model fails its immutable check, `BeforeSave` hook, or validation, or the slice contains the same `_id` twice, `SaveMany` returns before writing anything. After the write, per-item problems are reported in a `*BulkError`:
 
 | Item error | Meaning |
 |-----------|---------|
 | `ErrVersionConflict` | Another writer changed the document first. The model's in-memory version is refreshed from the database, as `Update` does. |
-| `ErrNotFound` | The document was deleted. |
+| `ErrNotFound` | The document was deleted (or is outside the middleware scope). |
 | `*DuplicateKeyError` | The replacement violated a unique index. |
+| error marked "outcome unknown" | The write concern was not met, or the request failed in transport or by context cancellation. The server may have applied it, so the model's version is rolled back and `AfterSave` is skipped; a later save of that model then reports a conflict rather than losing anything. `BulkError.WriteConcernError` is set when a write concern error was involved. |
+| `ErrNotAttempted` | The context was done before the item was sent (the context error is wrapped too), or an earlier item aborted the transaction. |
+| error marked "saved, but AfterSave failed" | The document was saved and keeps its new version; the hook's error is reported after the other hooks have run. |
 
-Models that succeeded are saved regardless of failures elsewhere in the batch; failed models keep their old version.
+Models that succeeded are saved regardless of failures elsewhere in the batch; failed models keep their old version. A replacement that matched nothing is resolved by reading the document from the primary: still present means `ErrVersionConflict`, gone means `ErrNotFound`. Two writers racing from the same version therefore always see exactly one success and one conflict. If that resolution read itself fails, only the items it was resolving are reported as unknown and the items already known to be saved keep their new version, unless the failure was a server error inside a transaction, which has aborted the transaction: then every item is reported as not saved.
+
+Inside a transaction, whether started by `goodm.WithTransaction` or on the session by the driver, a server error on any item (a duplicate key, a write conflict, a validator failure) has aborted the transaction, so `SaveMany` stops there, restores every model's version, runs no `AfterSave`, and reports every item in the `*BulkError` (the items before the failure as "not saved", the ones after it as `ErrNotAttempted`). Version conflicts, missing documents, and client-side failures such as a marshal error or a cancelled context do not abort a transaction, so they are reported per item as usual and the transaction stays open. `SaveMany` never aborts a transaction itself: resetting the session's state on the client would let later writes in the same transaction commit on their own. A `WithTransaction` callback must return a `SaveMany` or `CreateMany` error rather than ignore it: after a server error the transaction is already dead, so returning nil makes the driver retry the callback until its two-minute limit. A session with no transaction running only makes the items run one at a time.
+
+Of `UpdateOptions` only `DB` is used. Because replacements run on several goroutines outside a transaction, custom BSON marshalers on the model may run concurrently.
+
+Middleware may replace `op.Filter` for `OpSaveMany` (it starts as an empty document); it is ANDed into every document's filter and out-of-scope documents are reported as `ErrNotFound`.
 
 ```go
 err := goodm.SaveMany(ctx, tasks)
@@ -173,11 +184,16 @@ type BulkResult struct {
 
 ```go
 type BulkError struct {
-    Collection string
-    Errors     []BulkWriteError // one per failed operation or model
-    Result     *BulkResult      // what did succeed
+    Collection        string
+    Errors            []BulkWriteError // one per failed operation or model
+    Result            *BulkResult      // what did succeed
+    WriteConcernError error            // set when the write concern was not met for some write
 }
+```
 
+`WriteConcernError` means different things per operation: for `CreateMany` and `Bulk` the whole batch's outcome is unknown, `Result` cannot be trusted, and no after-hooks ran; for `SaveMany` only the items listed with that error are unknown.
+
+```go
 type BulkWriteError struct {
     Index   int    // position in the batch
     Code    int    // server error code, 0 for ODM-level failures
@@ -193,7 +209,7 @@ type BulkWriteError struct {
 | Operation | Hooks | Validation | Immutable Check | Versioning | DB Calls |
 |-----------|-------|-----------|----------------|-----------|----------|
 | `CreateMany` | Yes (per model) | Yes (per model) | No | Sets 0 | 1 InsertMany |
-| `SaveMany` | Yes (per model) | Yes (per model) | Yes (1 query) | Per-document version filter | 1 BulkWrite (+1 verify query on conflicts) |
+| `SaveMany` | Yes (per model) | Yes (per model) | Yes (1 query) | Per-document version filter | 1 ReplaceOne per document, up to 8 concurrent (sequential when a session is in the context; +1 read to resolve misses) |
 | `UpdateMany` | No | No | No | No | 1 UpdateMany |
 | `DeleteMany` | No | No | N/A | No | 1 DeleteMany |
 | `Bulk` | No | No | No | No | 1 BulkWrite |
