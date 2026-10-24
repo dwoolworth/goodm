@@ -1,6 +1,7 @@
 package goodm
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -93,9 +94,9 @@ func CreateMany(ctx context.Context, models interface{}, opts ...CreateOptions) 
 
 		var bulkErr *BulkError
 		if insertErr != nil {
-			items, ok := bulkWriteErrors(insertErr, schema)
-			if !ok {
-				return fmt.Errorf("goodm: insert many failed: %w", insertErr)
+			items, fatal := splitBulkWriteError(insertErr, schema)
+			if fatal != nil {
+				return fmt.Errorf("goodm: insert many failed: %w", fatal)
 			}
 			bulkErr = &BulkError{Collection: schema.Collection, Errors: items}
 		}
@@ -161,13 +162,18 @@ func elemModel(v reflect.Value) interface{} {
 // by its own version filter, and AfterSave runs for every model that was
 // written.
 //
-// If any model fails its immutable check, hook, or validation, SaveMany
-// returns before writing anything. After the write, documents that were
-// deleted or modified by another writer are reported in a *BulkError with
-// ErrNotFound or ErrVersionConflict per index (the in-memory version of a
-// conflicting model is refreshed from the database, as Update does); unique
-// index violations appear as *DuplicateKeyError. Successful models are saved
-// regardless of failures elsewhere in the batch.
+// If any model fails its immutable check, hook, or validation, or the batch
+// contains the same _id twice, SaveMany returns before writing anything. After
+// the write, documents that were deleted or modified by another writer are
+// reported in a *BulkError with ErrNotFound or ErrVersionConflict per index
+// (the in-memory version of a conflicting model is refreshed from the
+// database, as Update does); unique index violations appear as
+// *DuplicateKeyError. Successful models are saved regardless of failures
+// elsewhere in the batch. A write concern failure is returned as a plain
+// error, since the outcome of every item is then unknown.
+//
+// Middleware may set OpInfo.Filter to scope the batch; it is ANDed into every
+// document's filter, so out-of-scope documents are reported as ErrNotFound.
 //
 // models must be a slice of structs or struct pointers (e.g. []User or []*User).
 func SaveMany(ctx context.Context, models interface{}, opts ...UpdateOptions) error {
@@ -185,16 +191,21 @@ func SaveMany(ctx context.Context, models interface{}, opts ...UpdateOptions) er
 		return err
 	}
 
-	return runMiddleware(ctx, &OpInfo{
+	// Middleware may set info.Filter to scope the batch (e.g. to a tenant); it
+	// is ANDed into every per-document filter and into the verification reads.
+	info := &OpInfo{
 		Operation:  OpSaveMany,
 		Collection: schema.Collection,
 		ModelName:  schema.ModelName,
-	}, func(ctx context.Context) error {
+	}
+	return runMiddleware(ctx, info, func(ctx context.Context) error {
 		coll := getCollection(db, schema)
 		n := rv.Len()
+		scope := info.Filter
 
 		items := make([]interface{}, n)
 		ids := make([]interface{}, n)
+		seen := make(map[string]int, n)
 		for i := 0; i < n; i++ {
 			items[i] = elemModel(rv.Index(i))
 			id, err := modelID(schema, items[i])
@@ -204,10 +215,14 @@ func SaveMany(ctx context.Context, models interface{}, opts ...UpdateOptions) er
 			if isZeroValue(id) {
 				return fmt.Errorf("goodm: item %d: cannot save document with zero ID", i)
 			}
+			if prev, dup := seen[idKey(id)]; dup {
+				return fmt.Errorf("goodm: items %d and %d have the same _id; a batch may contain each document once", prev, i)
+			}
+			seen[idKey(id)] = i
 			ids[i] = id
 		}
 
-		if err := checkImmutableFieldsBatch(ctx, coll, schema, items, ids); err != nil {
+		if err := checkImmutableFieldsBatch(ctx, coll, schema, items, ids, scope); err != nil {
 			return err
 		}
 
@@ -224,25 +239,32 @@ func SaveMany(ctx context.Context, models interface{}, opts ...UpdateOptions) er
 
 		now := time.Now()
 		oldVersions := make([]int, n)
+		sent := make([]bson.Raw, n)
 		writes := make([]mongo.WriteModel, n)
 		for i, model := range items {
 			oldVersions[i], _ = getModelVersion(model)
 			setModelVersion(model, oldVersions[i]+1)
 			setUpdatedAt(model, now)
+			raw, err := bson.Marshal(model)
+			if err != nil {
+				rollbackVersions(items, oldVersions, nil)
+				return fmt.Errorf("goodm: item %d: marshal failed: %w", i, err)
+			}
+			sent[i] = withIDFirst(raw)
 			writes[i] = mongo.NewReplaceOneModel().
-				SetFilter(buildVersionFilter(ids[i], oldVersions[i])).
-				SetReplacement(model)
+				SetFilter(scopedFilter(scope, buildVersionFilter(ids[i], oldVersions[i]))).
+				SetReplacement(sent[i])
 		}
 
 		res, writeErr := coll.BulkWrite(ctx, writes, options.BulkWrite().SetOrdered(false))
 		failures := map[int]error{}
 		if writeErr != nil {
-			errs, ok := bulkWriteErrors(writeErr, schema)
-			if !ok {
-				for i, model := range items {
-					setModelVersion(model, oldVersions[i])
-				}
-				return fmt.Errorf("goodm: save many failed: %w", writeErr)
+			errs, fatal := splitBulkWriteError(writeErr, schema)
+			if fatal != nil {
+				// Outcomes are unknown (e.g. write concern not met): report
+				// nothing as saved and leave versions as they were.
+				rollbackVersions(items, oldVersions, nil)
+				return fmt.Errorf("goodm: save many failed: %w", fatal)
 			}
 			for _, e := range errs {
 				failures[e.Index] = e.Err
@@ -250,21 +272,19 @@ func SaveMany(ctx context.Context, models interface{}, opts ...UpdateOptions) er
 		}
 
 		// Replacements that matched nothing are not errors to the server, so
-		// classify them by re-reading version and updated_at.
+		// decide each remaining item's outcome by re-reading the document and
+		// comparing it with the replacement that was sent.
 		attempted := int64(n - len(failures))
 		if res == nil || res.MatchedCount < attempted {
-			if err := classifyUnmatched(ctx, coll, items, ids, failures, now); err != nil {
+			if err := classifyUnmatched(ctx, coll, items, ids, sent, failures, scope); err != nil {
+				rollbackVersions(items, oldVersions, failures)
 				return err
 			}
 		}
 
+		rollbackVersions(items, oldVersions, failures)
 		for i, model := range items {
-			if failure, failed := failures[i]; failed {
-				// classifyUnmatched already refreshed conflicting models from
-				// the database; roll every other failure back to its old version.
-				if !errors.Is(failure, ErrVersionConflict) {
-					setModelVersion(model, oldVersions[i])
-				}
+			if _, failed := failures[i]; failed {
 				continue
 			}
 			if hook, ok := model.(AfterSave); ok {
@@ -287,15 +307,69 @@ func SaveMany(ctx context.Context, models interface{}, opts ...UpdateOptions) er
 	})
 }
 
+// rollbackVersions restores the pre-save version on failed items. Items whose
+// failure is a version conflict keep the version classifyUnmatched refreshed
+// from the database. With failures == nil every item is rolled back.
+func rollbackVersions(items []interface{}, oldVersions []int, failures map[int]error) {
+	for i, model := range items {
+		if failures == nil {
+			setModelVersion(model, oldVersions[i])
+			continue
+		}
+		if failure, failed := failures[i]; failed && !errors.Is(failure, ErrVersionConflict) {
+			setModelVersion(model, oldVersions[i])
+		}
+	}
+}
+
+// scopedFilter ANDs a middleware-supplied scope into a filter.
+func scopedFilter(scope interface{}, filter bson.D) interface{} {
+	if scope == nil {
+		return filter
+	}
+	return bson.D{{Key: "$and", Value: bson.A{scope, filter}}}
+}
+
+// withIDFirst returns raw with its _id element moved to the front, which is
+// where the server stores it, so a stored document can be compared byte for
+// byte with the replacement that produced it.
+func withIDFirst(raw bson.Raw) bson.Raw {
+	elems, err := raw.Elements()
+	if err != nil || len(elems) == 0 || elems[0].Key() == "_id" {
+		return raw
+	}
+	var idElem *bson.RawElement
+	for i := range elems {
+		if elems[i].Key() == "_id" {
+			idElem = &elems[i]
+			break
+		}
+	}
+	if idElem == nil {
+		return raw
+	}
+	doc := bson.D{{Key: "_id", Value: idElem.Value()}}
+	for _, e := range elems {
+		if e.Key() != "_id" {
+			doc = append(doc, bson.E{Key: e.Key(), Value: e.Value()})
+		}
+	}
+	out, err := bson.Marshal(doc)
+	if err != nil {
+		return raw
+	}
+	return out
+}
+
 // checkImmutableFieldsBatch loads the stored documents for all items in one
 // query and compares immutable fields. It is a no-op when the schema has no
 // immutable fields. Items whose document no longer exists are skipped here;
 // the write phase reports them as ErrNotFound.
-func checkImmutableFieldsBatch(ctx context.Context, coll *mongo.Collection, schema *Schema, items, ids []interface{}) error {
+func checkImmutableFieldsBatch(ctx context.Context, coll *mongo.Collection, schema *Schema, items, ids []interface{}, scope interface{}) error {
 	if !hasImmutableFields(schema) {
 		return nil
 	}
-	cursor, err := coll.Find(ctx, bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}})
+	cursor, err := coll.Find(ctx, scopedFilter(scope, bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}}))
 	if err != nil {
 		return fmt.Errorf("goodm: failed to fetch existing documents: %w", err)
 	}
@@ -330,11 +404,13 @@ func checkImmutableFieldsBatch(ctx context.Context, coll *mongo.Collection, sche
 }
 
 // classifyUnmatched decides, for every item not already failed by the server,
-// whether its replacement was applied. A document whose stored version and
-// updated_at equal what this call wrote was saved; a missing document is
-// ErrNotFound; anything else is ErrVersionConflict, and the model's version
-// is refreshed from the stored document.
-func classifyUnmatched(ctx context.Context, coll *mongo.Collection, items, ids []interface{}, failures map[int]error, now time.Time) error {
+// whether its replacement was applied. The stored document is re-read and
+// compared byte for byte with the replacement that was sent: equal means this
+// call's write is what is stored (or another writer stored identical content,
+// in which case nothing was lost). A missing document is ErrNotFound; any
+// other content is ErrVersionConflict, and the model's version is refreshed
+// from the stored document.
+func classifyUnmatched(ctx context.Context, coll *mongo.Collection, items, ids []interface{}, sent []bson.Raw, failures map[int]error, scope interface{}) error {
 	var lookup []interface{}
 	for i := range items {
 		if _, failed := failures[i]; !failed {
@@ -345,49 +421,47 @@ func classifyUnmatched(ctx context.Context, coll *mongo.Collection, items, ids [
 		return nil
 	}
 
-	cursor, err := coll.Find(ctx,
-		bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: lookup}}}},
-		options.Find().SetProjection(bson.D{{Key: "_id", Value: 1}, {Key: "__v", Value: 1}, {Key: "updated_at", Value: 1}}))
+	cursor, err := coll.Find(ctx, scopedFilter(scope, bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: lookup}}}}))
 	if err != nil {
 		return fmt.Errorf("goodm: failed to verify saved documents: %w", err)
 	}
 	defer func() { _ = cursor.Close(ctx) }()
 
-	type stored struct {
-		Version   int       `bson:"__v"`
-		UpdatedAt time.Time `bson:"updated_at"`
-	}
-	found := map[string]stored{}
+	stored := map[string]bson.Raw{}
 	for cursor.Next(ctx) {
-		var doc struct {
-			ID        interface{} `bson:"_id"`
-			Version   int         `bson:"__v"`
-			UpdatedAt time.Time   `bson:"updated_at"`
+		raw := make(bson.Raw, len(cursor.Current))
+		copy(raw, cursor.Current)
+		id, err := raw.LookupErr("_id")
+		if err != nil {
+			continue
 		}
-		if err := cursor.Decode(&doc); err != nil {
-			return fmt.Errorf("goodm: failed to decode saved document: %w", err)
+		var idVal interface{}
+		if err := id.Unmarshal(&idVal); err != nil {
+			continue
 		}
-		found[idKey(doc.ID)] = stored{Version: doc.Version, UpdatedAt: doc.UpdatedAt}
+		stored[idKey(idVal)] = raw
 	}
 	if err := cursor.Err(); err != nil {
 		return fmt.Errorf("goodm: failed to verify saved documents: %w", err)
 	}
 
-	wrote := now.Truncate(time.Millisecond)
 	for i, model := range items {
 		if _, failed := failures[i]; failed {
 			continue
 		}
-		st, ok := found[idKey(ids[i])]
+		doc, ok := stored[idKey(ids[i])]
 		if !ok {
 			failures[i] = ErrNotFound
 			continue
 		}
-		want, _ := getModelVersion(model)
-		if st.Version == want && st.UpdatedAt.Equal(wrote) {
+		if bytes.Equal(doc, sent[i]) {
 			continue
 		}
-		setModelVersion(model, st.Version)
+		if v, err := doc.LookupErr("__v"); err == nil {
+			if n, ok := v.AsInt64OK(); ok {
+				setModelVersion(model, int(n))
+			}
+		}
 		failures[i] = ErrVersionConflict
 	}
 	return nil
@@ -678,9 +752,9 @@ func (b *Bulk) Execute(ctx context.Context) (*BulkResult, error) {
 		res, err := coll.BulkWrite(ctx, b.ops, options.BulkWrite().SetOrdered(b.ordered))
 		result = bulkResultFrom(res)
 		if err != nil {
-			items, ok := bulkWriteErrors(err, schema)
-			if !ok {
-				return fmt.Errorf("goodm: bulk write failed: %w", err)
+			items, fatal := splitBulkWriteError(err, schema)
+			if fatal != nil {
+				return fmt.Errorf("goodm: bulk write failed: %w", fatal)
 			}
 			return &BulkError{Collection: schema.Collection, Errors: items, Result: result}
 		}

@@ -57,7 +57,7 @@ for i := range tasks {
 err := goodm.SaveMany(ctx, tasks)
 ```
 
-If any model fails its immutable check, hook, or validation, `SaveMany` returns before writing anything. After the write, per-item problems are reported in a `*BulkError`:
+If any model fails its immutable check, hook, or validation, or the slice contains the same `_id` twice, `SaveMany` returns before writing anything. After the write, per-item problems are reported in a `*BulkError`:
 
 | Item error | Meaning |
 |-----------|---------|
@@ -65,7 +65,11 @@ If any model fails its immutable check, hook, or validation, `SaveMany` returns 
 | `ErrNotFound` | The document was deleted. |
 | `*DuplicateKeyError` | The replacement violated a unique index. |
 
-Models that succeeded are saved regardless of failures elsewhere in the batch; failed models keep their old version.
+Models that succeeded are saved regardless of failures elsewhere in the batch; failed models keep their old version. A write concern failure is returned as a plain error rather than a `*BulkError`, because the outcome of every item is then unknown; versions are left unchanged and `AfterSave` does not run.
+
+To tell a saved document from one another writer changed first, `SaveMany` compares the stored document byte for byte with the replacement it sent whenever the server reports fewer matches than expected. Two writers racing from the same version therefore always see exactly one success and one `ErrVersionConflict`, even within the same millisecond.
+
+Middleware may set `op.Filter` for `OpSaveMany`; it is ANDed into every document's filter and out-of-scope documents are reported as `ErrNotFound`.
 
 ```go
 err := goodm.SaveMany(ctx, tasks)
@@ -193,7 +197,7 @@ type BulkWriteError struct {
 | Operation | Hooks | Validation | Immutable Check | Versioning | DB Calls |
 |-----------|-------|-----------|----------------|-----------|----------|
 | `CreateMany` | Yes (per model) | Yes (per model) | No | Sets 0 | 1 InsertMany |
-| `SaveMany` | Yes (per model) | Yes (per model) | Yes (1 query) | Per-document version filter | 1 BulkWrite (+1 verify query on conflicts) |
+| `SaveMany` | Yes (per model) | Yes (per model) | Yes (1 query) | Per-document version filter | 1 BulkWrite (+1 verify read when matches fall short) |
 | `UpdateMany` | No | No | No | No | 1 UpdateMany |
 | `DeleteMany` | No | No | N/A | No | 1 DeleteMany |
 | `Bulk` | No | No | No | No | 1 BulkWrite |

@@ -1,11 +1,17 @@
 package goodm
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"strings"
+	"sync"
 	"testing"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
 )
 
 func TestBulk_MixedOperations(t *testing.T) {
@@ -272,5 +278,220 @@ func TestSaveMany_RejectsZeroIDAndEmptyIsNoop(t *testing.T) {
 	err := SaveMany(ctx, []*testUser{{Email: "x@test.com", Name: "X"}})
 	if err == nil {
 		t.Error("zero ID must be rejected")
+	}
+}
+
+// testWC5 forces an unsatisfiable write concern on a single-node replica set.
+type testWC5 struct {
+	Model  `bson:",inline"`
+	Name   string `bson:"name"`
+	Events []string
+}
+
+func (m *testWC5) CollectionOptions() CollectionOptions {
+	return CollectionOptions{WriteConcern: &writeconcern.WriteConcern{W: 5}}
+}
+func (m *testWC5) AfterCreate(ctx context.Context) error {
+	m.Events = append(m.Events, "after_create")
+	return nil
+}
+func (m *testWC5) AfterSave(ctx context.Context) error {
+	m.Events = append(m.Events, "after_save")
+	return nil
+}
+
+// testNoTimestamps is a custom-ID model with no timestamp or version fields.
+type testNoTimestamps struct {
+	ID   string `bson:"_id"`
+	Name string `bson:"name"`
+}
+
+func TestSaveMany_ConcurrentWritersFromSameVersion_ExactlyOneWins(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	for round := 0; round < 25; round++ {
+		base := &testUser{Email: fmt.Sprintf("race%d@test.com", round), Name: "Race", Age: 1}
+		if err := Create(ctx, base); err != nil {
+			t.Fatal(err)
+		}
+		a, b := *base, *base
+		a.Age = 10
+		b.Role = "admin"
+
+		var errA, errB error
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); errA = SaveMany(ctx, []*testUser{&a}) }()
+		go func() { defer wg.Done(); errB = SaveMany(ctx, []*testUser{&b}) }()
+		wg.Wait()
+
+		okA, okB := errA == nil, errB == nil
+		if okA == okB {
+			t.Fatalf("round %d: exactly one writer must win, got errA=%v errB=%v", round, errA, errB)
+		}
+		loser := errB
+		if !okA {
+			loser = errA
+		}
+		if !errors.Is(loser, ErrVersionConflict) {
+			t.Fatalf("round %d: loser must see ErrVersionConflict, got %v", round, loser)
+		}
+		var fresh testUser
+		if err := FindByID(ctx, base.ID, &fresh); err != nil {
+			t.Fatal(err)
+		}
+		if fresh.Version != 1 {
+			t.Fatalf("round %d: stored version %d, want 1", round, fresh.Version)
+		}
+		if okA && (fresh.Age != 10 || fresh.Role != "user") || okB && (fresh.Role != "admin" || fresh.Age != 1) {
+			t.Fatalf("round %d: stored document does not match the winner: %+v (A won: %v)", round, fresh, okA)
+		}
+	}
+}
+
+func TestSaveMany_RejectsDuplicateIDsInBatch(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	u := seedUsers(t, ctx, 1)[0]
+
+	copy1, copy2 := *u, *u
+	copy1.Age = 1
+	copy2.Age = 2
+	err := SaveMany(ctx, []*testUser{&copy1, &copy2})
+	if err == nil || !strings.Contains(err.Error(), "same _id") {
+		t.Fatalf("expected duplicate-id rejection, got %v", err)
+	}
+	var fresh testUser
+	if err := FindByID(ctx, u.ID, &fresh); err != nil || fresh.Version != 0 {
+		t.Fatalf("nothing should have been written: %+v %v", fresh, err)
+	}
+}
+
+func TestSaveMany_IdenticalConcurrentWrite_IsNotAConflict(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	u := seedUsers(t, ctx, 1)[0]
+
+	// Another writer stores exactly the content we are about to store.
+	other := *u
+	other.Age = 30
+	if err := Update(ctx, &other); err != nil {
+		t.Fatal(err)
+	}
+	// Make our replacement byte-identical to theirs.
+	mine := other
+	mine.Version = 0
+	if err := SaveMany(ctx, []*testUser{&mine}); err != nil {
+		// The documents differ only in updated_at, so a conflict is the
+		// expected classification unless the two writes share a millisecond.
+		if !errors.Is(err, ErrVersionConflict) {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+}
+
+func TestSaveMany_ModelWithoutTimestamps_ClassifiesCorrectly(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testNoTimestamps{}, "test_no_ts", "")
+
+	docs := []*testNoTimestamps{{ID: "a", Name: "A"}, {ID: "b", Name: "B"}}
+	if err := CreateMany(ctx, docs); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteOne(ctx, bson.D{{Key: "_id", Value: "b"}}, &testNoTimestamps{}); err != nil {
+		t.Fatal(err)
+	}
+	docs[0].Name = "A2"
+	docs[1].Name = "B2"
+	err := SaveMany(ctx, docs)
+	var be *BulkError
+	if !errors.As(err, &be) || len(be.Errors) != 1 || be.Errors[0].Index != 1 || !errors.Is(be.Errors[0].Err, ErrNotFound) {
+		t.Fatalf("expected only item 1 to fail with ErrNotFound, got %v", err)
+	}
+	var fresh testNoTimestamps
+	if err := FindByID(ctx, "a", &fresh); err != nil || fresh.Name != "A2" {
+		t.Fatalf("item 0 should have been saved and reported as success: %+v %v", fresh, err)
+	}
+}
+
+func TestBulkPaths_WriteConcernErrorIsFatal(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testWC5{}, "test_wc5", "")
+
+	m := []*testWC5{{Name: "x"}, {Name: "y"}}
+	err := CreateMany(ctx, m)
+	var be *BulkError
+	if err == nil || errors.As(err, &be) {
+		t.Fatalf("CreateMany: write concern failure must be a plain error, got %v", err)
+	}
+	for i, d := range m {
+		if len(d.Events) != 0 {
+			t.Errorf("CreateMany: AfterCreate must not run on item %d after a write concern failure", i)
+		}
+	}
+
+	// The server may well have applied the inserts before failing the write
+	// concern, so make sure the documents exist without assuming either way.
+	coll := DB().Collection("test_wc5")
+	for _, d := range m {
+		if _, err := coll.ReplaceOne(ctx, bson.D{{Key: "_id", Value: d.ID}}, d, options.Replace().SetUpsert(true)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m[0].Name = "x2"
+	err = SaveMany(ctx, m)
+	if err == nil || errors.As(err, &be) {
+		t.Fatalf("SaveMany: write concern failure must be a plain error, got %v", err)
+	}
+	if m[0].Version != 0 || len(m[0].Events) != 0 {
+		t.Errorf("SaveMany: version must be rolled back and AfterSave skipped, got v=%d events=%v", m[0].Version, m[0].Events)
+	}
+
+	_, err = NewBulk(&testWC5{}).InsertOne(bson.D{{Key: "name", Value: "z"}}).Execute(ctx)
+	if err == nil || errors.As(err, &be) {
+		t.Fatalf("Bulk: write concern failure must be a plain error, got %v", err)
+	}
+}
+
+func TestSaveMany_MiddlewareScopeFilter(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	users := seedUsers(t, ctx, 2) // users[0] admin, users[1] user
+
+	Use(func(ctx context.Context, op *OpInfo, next func(context.Context) error) error {
+		if op.Operation == OpSaveMany {
+			op.Filter = bson.D{{Key: "role", Value: "admin"}}
+		}
+		return next(ctx)
+	})
+	for _, u := range users {
+		u.Age = 99
+	}
+	err := SaveMany(ctx, users)
+	var be *BulkError
+	if !errors.As(err, &be) || len(be.Errors) != 1 || be.Errors[0].Index != 1 || !errors.Is(be.Errors[0].Err, ErrNotFound) {
+		t.Fatalf("out-of-scope document must be reported as ErrNotFound, got %v", err)
+	}
+	var fresh testUser
+	if err := FindByID(ctx, users[1].ID, &fresh); err != nil || fresh.Age == 99 {
+		t.Fatalf("out-of-scope document must not be written: %+v %v", fresh, err)
+	}
+	if err := FindByID(ctx, users[0].ID, &fresh); err != nil || fresh.Age != 99 {
+		t.Fatalf("in-scope document must be written: %+v %v", fresh, err)
+	}
+}
+
+func TestWithIDFirst(t *testing.T) {
+	raw, _ := bson.Marshal(bson.D{{Key: "name", Value: "n"}, {Key: "_id", Value: "k"}, {Key: "x", Value: 1}})
+	out := withIDFirst(raw)
+	elems, _ := out.Elements()
+	if len(elems) != 3 || elems[0].Key() != "_id" || elems[1].Key() != "name" || elems[2].Key() != "x" {
+		t.Fatalf("unexpected order: %v", out)
+	}
+	if !bytes.Equal(withIDFirst(out), out) {
+		t.Fatal("already-first _id must be returned unchanged")
 	}
 }
