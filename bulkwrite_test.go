@@ -171,16 +171,6 @@ func TestSaveMany_HappyPath(t *testing.T) {
 }
 
 func TestSaveMany_ClassifiesConflictsAndMissing(t *testing.T) {
-	for _, legacy := range []bool{false, true} {
-		t.Run(map[bool]string{false: "clientBulk", true: "perDocument"}[legacy], func(t *testing.T) {
-			forceLegacySaveMany = legacy
-			defer func() { forceLegacySaveMany = false }()
-			testSaveManyClassification(t)
-		})
-	}
-}
-
-func testSaveManyClassification(t *testing.T) {
 	ctx, db, cleanup := setupTestDB(t)
 	defer cleanup()
 	if err := Enforce(ctx, db); err != nil {
@@ -316,16 +306,6 @@ type testNoTimestamps struct {
 }
 
 func TestSaveMany_ConcurrentWritersFromSameVersion_ExactlyOneWins(t *testing.T) {
-	for _, legacy := range []bool{false, true} {
-		t.Run(map[bool]string{false: "clientBulk", true: "perDocument"}[legacy], func(t *testing.T) {
-			forceLegacySaveMany = legacy
-			defer func() { forceLegacySaveMany = false }()
-			testSaveManyRace(t)
-		})
-	}
-}
-
-func testSaveManyRace(t *testing.T) {
 	ctx, _, cleanup := setupTestDB(t)
 	defer cleanup()
 
@@ -458,18 +438,21 @@ func TestBulkPaths_WriteConcernErrorIsReported(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for _, legacy := range []bool{false, true} {
-		forceLegacySaveMany = legacy
-		m[0].Name = "x2"
-		err = SaveMany(ctx, m)
-		if !errors.As(err, &be) || be.WriteConcernError == nil {
-			t.Fatalf("SaveMany (legacy=%v): expected a BulkError carrying the write concern error, got %v", legacy, err)
-		}
-		if m[0].Version != 0 || len(m[0].Events) != 0 {
-			t.Errorf("SaveMany (legacy=%v): version must be rolled back and AfterSave skipped, got v=%d events=%v", legacy, m[0].Version, m[0].Events)
-		}
+	m[0].Name = "x2"
+	err = SaveMany(ctx, m)
+	if !errors.As(err, &be) || be.WriteConcernError == nil || len(be.Errors) != 2 {
+		t.Fatalf("SaveMany: expected a BulkError with the write concern error on both items, got %v", err)
 	}
-	forceLegacySaveMany = false
+	if m[0].Version != 0 || len(m[0].Events) != 0 {
+		t.Errorf("SaveMany: version must be rolled back and AfterSave skipped, got v=%d events=%v", m[0].Version, m[0].Events)
+	}
+
+	// A duplicate key alongside the write concern failure keeps its own error
+	// and does not stop the batch.
+	dupSave := []*testWC5{{Model: Model{ID: m[0].ID}, Name: "d1"}, {Model: Model{ID: m[0].ID}, Name: "d2"}}
+	if err := SaveMany(ctx, dupSave); err == nil || !strings.Contains(err.Error(), "same _id") {
+		t.Fatalf("duplicate ids must still be rejected up front: %v", err)
+	}
 
 	_, err = NewBulk(&testWC5{}).InsertOne(bson.D{{Key: "name", Value: "z"}}).Execute(ctx)
 	if !errors.As(err, &be) || be.WriteConcernError == nil {
@@ -510,5 +493,57 @@ func TestSaveMany_MiddlewareScopeFilter(t *testing.T) {
 	}
 	if err := FindByID(ctx, users[0].ID, &fresh); err != nil || fresh.Age != 99 {
 		t.Fatalf("in-scope document must be written: %+v %v", fresh, err)
+	}
+}
+
+func TestSaveMany_LargeBatchConcurrentAndInTransaction(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	users := seedUsers(t, ctx, 25) // more than the concurrency bound
+
+	for _, u := range users {
+		u.Age = 77
+	}
+	if err := SaveMany(ctx, users); err != nil {
+		t.Fatalf("concurrent SaveMany: %v", err)
+	}
+	n, _ := Count(ctx, bson.D{{Key: "age", Value: 77}, {Key: "__v", Value: 1}}, &testUser{})
+	if n != 25 {
+		t.Fatalf("expected 25 saved documents, got %d", n)
+	}
+
+	// Inside a transaction the same batch runs sequentially on the session
+	// and is atomic with the surrounding writes.
+	for _, u := range users {
+		u.Age = 78
+	}
+	err := WithTransaction(ctx, func(ctx context.Context) error {
+		if err := SaveMany(ctx, users); err != nil {
+			return err
+		}
+		return errors.New("abort")
+	})
+	if err == nil {
+		t.Fatal("expected abort")
+	}
+	n, _ = Count(ctx, bson.D{{Key: "age", Value: 78}}, &testUser{})
+	if n != 0 {
+		t.Fatalf("aborted transaction must roll back every SaveMany write, got %d", n)
+	}
+	// Models bumped in the aborted transaction must be reconciled by the
+	// caller, as after any aborted transaction; a fresh load saves cleanly.
+	var fresh []testUser
+	if err := Find(ctx, bson.D{}, &fresh); err != nil {
+		t.Fatal(err)
+	}
+	for i := range fresh {
+		fresh[i].Age = 79
+	}
+	if err := WithTransaction(ctx, func(ctx context.Context) error { return SaveMany(ctx, fresh) }); err != nil {
+		t.Fatalf("SaveMany in a committed transaction: %v", err)
+	}
+	n, _ = Count(ctx, bson.D{{Key: "age", Value: 79}, {Key: "__v", Value: 2}}, &testUser{})
+	if n != 25 {
+		t.Fatalf("expected 25 documents at version 2, got %d", n)
 	}
 }

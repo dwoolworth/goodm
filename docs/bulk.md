@@ -46,7 +46,9 @@ if errors.As(err, &be) {
 func SaveMany(ctx context.Context, models interface{}, opts ...UpdateOptions) error
 ```
 
-Persists changes to many loaded models in one round trip. Each model goes through the `Update` lifecycle: immutable fields are checked against the stored documents (one query for the whole batch), `BeforeSave` runs, the model is validated, and its `Version` and `UpdatedAt` advance. The replacements are sent as a single unordered bulk write, each guarded by its own version filter, and `AfterSave` runs for every model that was written.
+Persists changes to many loaded models in one call. Each model goes through the `Update` lifecycle: immutable fields are checked against the stored documents (one query for the whole batch), `BeforeSave` runs, the model is validated, and its `Version` and `UpdatedAt` advance. Each document is then replaced with its own conditional request guarded by its version filter, and `AfterSave` runs for every model that was written.
+
+Outside a transaction the replacements are issued concurrently, up to eight in flight, so a batch costs roughly a few round trips of latency rather than one per document. Inside a transaction they run in order on the session. MongoDB's bulk write is deliberately not used: its results do not say which replacement matched, which is exactly what optimistic locking needs to know, and the client-level bulk write of MongoDB 8 cannot honor database-level codecs or write concern.
 
 ```go
 var tasks []Task
@@ -65,9 +67,10 @@ If any model fails its immutable check, hook, or validation, or the slice contai
 | `ErrNotFound` | The document was deleted. |
 | `*DuplicateKeyError` | The replacement violated a unique index. |
 
-Models that succeeded are saved regardless of failures elsewhere in the batch; failed models keep their old version. A write concern failure comes back as a `*BulkError` whose `WriteConcernError` is set: the outcome of every item is then unknown, so versions are rolled back, `AfterSave` does not run, and `Result` must not be trusted.
+| `*WriteConcernError`-style item | The write concern was not met for that item; its outcome is unknown, so its version is rolled back and `AfterSave` skipped. `BulkError.WriteConcernError` is set too. |
+| transport or context error | Attributed to the item it happened on; the rest of the batch still runs. |
 
-How `SaveMany` knows what happened to each document depends on the server. On MongoDB 8.0 and later the replacements go out in one client-level bulk write whose verbose results report the matched count of every operation. Older servers report only aggregate counts, so there each document is replaced with its own request. Either way a replacement that matched nothing is resolved by reading the document from the primary: still present means `ErrVersionConflict`, gone means `ErrNotFound`. Two writers racing from the same version therefore always see exactly one success and one conflict.
+Models that succeeded are saved regardless of failures elsewhere in the batch; failed models keep their old version. A replacement that matched nothing is resolved by reading the document from the primary: still present means `ErrVersionConflict`, gone means `ErrNotFound`. Two writers racing from the same version therefore always see exactly one success and one conflict. If that resolution read itself fails, only the items it was resolving are reported as failed, with the read error; the items already known to be saved keep their new version.
 
 Middleware may replace `op.Filter` for `OpSaveMany` (it starts as an empty document); it is ANDed into every document's filter and out-of-scope documents are reported as `ErrNotFound`.
 
@@ -180,7 +183,7 @@ type BulkError struct {
     Collection        string
     Errors            []BulkWriteError // one per failed operation or model
     Result            *BulkResult      // what did succeed
-    WriteConcernError error            // set when the write concern was not met; outcomes are then unknown
+    WriteConcernError error            // set when the write concern was not met for some operation
 }
 
 type BulkWriteError struct {
@@ -198,7 +201,7 @@ type BulkWriteError struct {
 | Operation | Hooks | Validation | Immutable Check | Versioning | DB Calls |
 |-----------|-------|-----------|----------------|-----------|----------|
 | `CreateMany` | Yes (per model) | Yes (per model) | No | Sets 0 | 1 InsertMany |
-| `SaveMany` | Yes (per model) | Yes (per model) | Yes (1 query) | Per-document version filter | 1 BulkWrite on MongoDB 8.0+, else 1 ReplaceOne per document (+1 read to resolve misses) |
+| `SaveMany` | Yes (per model) | Yes (per model) | Yes (1 query) | Per-document version filter | 1 ReplaceOne per document, up to 8 concurrent (+1 read to resolve misses) |
 | `UpdateMany` | No | No | No | No | 1 UpdateMany |
 | `DeleteMany` | No | No | N/A | No | 1 DeleteMany |
 | `Bulk` | No | No | No | No | 1 BulkWrite |

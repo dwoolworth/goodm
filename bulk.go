@@ -175,15 +175,19 @@ func elemModel(v reflect.Value) interface{} {
 // reported in a *BulkError with ErrNotFound or ErrVersionConflict per index
 // (the in-memory version of a conflicting model is refreshed from the
 // database, as Update does); unique index violations appear as
-// *DuplicateKeyError. Successful models are saved regardless of failures
-// elsewhere in the batch. A write concern failure is returned as a plain
-// error, since the outcome of every item is then unknown.
+// *DuplicateKeyError. An item whose write concern was not met is listed with
+// that error, its version rolled back and its AfterSave skipped, because its
+// outcome is unknown; BulkError.WriteConcernError is set as well. Successful
+// models are saved regardless of failures elsewhere in the batch.
 //
-// On MongoDB 8.0 and later the replacements go out in one client-level bulk
-// write whose verbose results report the matched count of each operation.
-// Older servers only report aggregate counts, so there each document is
-// replaced with its own request. Either way the outcome of every item is
-// known exactly.
+// Each document is replaced with its own conditional request, so every
+// replacement's matched count is known exactly and every failure, including
+// a write concern or transport error, is attributed to one item; a failure
+// never stops the batch. Outside a transaction the requests are issued
+// concurrently (up to 8 in flight); inside one they run in order. A bulk
+// write would be fewer round trips, but MongoDB's bulk results do not say
+// which replacement matched, and the client-level bulkWrite of MongoDB 8
+// cannot honor database-level codecs or write concern.
 //
 // Middleware may replace OpInfo.Filter (initially an empty document) to scope
 // the batch; it is ANDed into every document's filter, so out-of-scope
@@ -263,28 +267,15 @@ func SaveMany(ctx context.Context, models interface{}, opts ...UpdateOptions) er
 			filters[i] = scopedFilter(scope, buildVersionFilter(ids[i], oldVersions[i]))
 		}
 
-		// failures holds the outcome of every item that was not saved;
-		// unresolved lists items whose replacement matched no document.
-		var out saveOutcome
-		var err error
-		if !forceLegacySaveMany && supportsClientBulkWrite(ctx, db) {
-			out, err = saveManyClientBulk(ctx, db, schema, items, filters)
-		} else {
-			out, err = saveManyPerDocument(ctx, coll, schema, items, filters)
-		}
-		if err != nil {
-			rollbackVersions(items, oldVersions, nil)
-			return err
-		}
-		if out.wcErr != nil {
-			rollbackVersions(items, oldVersions, nil)
-			return &BulkError{Collection: schema.Collection, Errors: out.itemErrors(), WriteConcernError: out.wcErr}
-		}
+		out := saveManyReplace(ctx, coll, schema, items, filters)
 
 		if len(out.unresolved) > 0 {
-			if err := resolveUnmatched(ctx, coll, items, ids, out.unresolved, out.failures, scope); err != nil {
-				rollbackVersions(items, oldVersions, nil)
-				return err
+			if err := resolveUnmatched(ctx, coll, schema, items, ids, out.unresolved, out.failures, scope); err != nil {
+				// The replacements already happened; only the outcome of the
+				// unresolved items is unknown. Report those, keep the rest.
+				for _, i := range out.unresolved {
+					out.failures[i] = fmt.Errorf("goodm: outcome unknown: %w", err)
+				}
 			}
 		}
 
@@ -303,21 +294,20 @@ func SaveMany(ctx context.Context, models interface{}, opts ...UpdateOptions) er
 		if len(out.failures) == 0 {
 			return nil
 		}
-		return &BulkError{Collection: schema.Collection, Errors: out.itemErrors(), Result: out.result}
+		return &BulkError{Collection: schema.Collection, Errors: out.itemErrors(), Result: out.result, WriteConcernError: out.wcErr}
 	})
 }
 
-// forceLegacySaveMany makes SaveMany use the per-document path even on
-// servers that support the client-level bulk write. Tests use it to cover
-// both paths on one server.
-var forceLegacySaveMany bool
+// saveManyConcurrency bounds the number of replacements in flight at once
+// when SaveMany runs outside a transaction.
+const saveManyConcurrency = 8
 
 // saveOutcome is what the write phase of SaveMany learned.
 type saveOutcome struct {
-	failures   map[int]error // items the server rejected or that were classified
+	failures   map[int]error // items the server rejected, or that were classified
 	unresolved []int         // items whose replacement matched no document
 	result     *BulkResult
-	wcErr      error
+	wcErr      error // first write concern error, if any
 }
 
 func (o *saveOutcome) itemErrors() []BulkWriteError {
@@ -329,97 +319,106 @@ func (o *saveOutcome) itemErrors() []BulkWriteError {
 	return errs
 }
 
-// saveManyClientBulk sends every replacement in one client-level bulk write
-// (MongoDB 8.0+) with verbose results, which report the matched count of each
-// operation individually, so no guessing is needed to tell a saved document
-// from one another writer changed first.
-func saveManyClientBulk(ctx context.Context, db *mongo.Database, schema *Schema, items, filters []interface{}) (saveOutcome, error) {
-	out := saveOutcome{failures: map[int]error{}}
-	writes := make([]mongo.ClientBulkWrite, len(items))
-	for i, model := range items {
-		writes[i] = mongo.ClientBulkWrite{
-			Database:   db.Name(),
-			Collection: schema.Collection,
-			Model:      mongo.NewClientReplaceOneModel().SetFilter(filters[i]).SetReplacement(model),
-		}
-	}
-	opts := options.ClientBulkWrite().SetOrdered(false).SetVerboseResults(true)
-	if wc := schema.CollOptions.WriteConcern; wc != nil {
-		opts.SetWriteConcern(wc)
-	}
-
-	res, err := db.Client().BulkWrite(ctx, writes, opts)
-	if err != nil {
-		var cbwe mongo.ClientBulkWriteException
-		if !errors.As(err, &cbwe) {
-			return out, fmt.Errorf("goodm: save many failed: %w", err)
-		}
-		if cbwe.WriteError != nil {
-			return out, fmt.Errorf("goodm: save many failed: %w", err)
-		}
-		for i, we := range cbwe.WriteErrors {
-			we.Index = i
-			out.failures[i] = translateBulkItem(we, schema).Err
-		}
-		if len(cbwe.WriteConcernErrors) > 0 {
-			wce := cbwe.WriteConcernErrors[0]
-			out.wcErr = fmt.Errorf("goodm: write concern error (%d): %s: %w", wce.Code, wce.Message, err)
-			return out, nil
-		}
-		res = cbwe.PartialResult
-	}
-	if res == nil || !res.HasVerboseResults {
-		return out, fmt.Errorf("goodm: save many failed: server returned no per-operation results")
-	}
-	out.result = &BulkResult{MatchedCount: res.MatchedCount, ModifiedCount: res.ModifiedCount}
-	for i := range items {
-		if _, failed := out.failures[i]; failed {
-			continue
-		}
-		if r, ok := res.UpdateResults[i]; !ok || r.MatchedCount == 0 {
-			out.unresolved = append(out.unresolved, i)
-		}
-	}
-	return out, nil
+// replaceResult is the outcome of one document's replacement.
+type replaceResult struct {
+	matched, modified int64
+	err               error // server rejection, write concern, or transport error
+	wc                error // write concern error, if any
 }
 
-// saveManyPerDocument is the path for servers before 8.0, whose bulk writes
-// report only aggregate counts: each document is replaced with its own
-// request so the matched count of every replacement is known exactly.
-// Failures do not stop the batch.
-func saveManyPerDocument(ctx context.Context, coll *mongo.Collection, schema *Schema, items, filters []interface{}) (saveOutcome, error) {
-	out := saveOutcome{failures: map[int]error{}, result: &BulkResult{}}
-	for i, model := range items {
-		res, err := coll.ReplaceOne(ctx, filters[i], model)
+// saveManyReplace replaces each document with its own conditional request,
+// so every replacement's matched count is known exactly and every failure is
+// attributed to one item; failures never stop the batch. Outside a
+// transaction the requests are issued concurrently; a session cannot be used
+// from several goroutines, so inside one they run in order.
+func saveManyReplace(ctx context.Context, coll *mongo.Collection, schema *Schema, items, filters []interface{}) saveOutcome {
+	n := len(items)
+	results := make([]replaceResult, n)
+	replace := func(i int) {
+		res, err := coll.ReplaceOne(ctx, filters[i], items[i])
 		if err != nil {
-			var we mongo.WriteException
-			switch {
-			case errors.As(err, &we) && we.WriteConcernError != nil:
-				out.wcErr = fmt.Errorf("goodm: write concern error (%d): %s: %w", we.WriteConcernError.Code, we.WriteConcernError.Message, err)
-				return out, nil
-			case mongo.IsDuplicateKeyError(err):
-				out.failures[i] = newDuplicateKeyError(err, schema, err.Error())
-			case errors.As(err, &we):
-				out.failures[i] = fmt.Errorf("goodm: write error: %w", err)
-			default:
-				return out, fmt.Errorf("goodm: save many failed on item %d: %w", i, err)
-			}
+			results[i] = classifyReplaceError(err, schema)
+			return
+		}
+		results[i] = replaceResult{matched: res.MatchedCount, modified: res.ModifiedCount}
+	}
+
+	if mongo.SessionFromContext(ctx) != nil || n == 1 {
+		for i := range items {
+			replace(i)
+		}
+	} else {
+		var wg sync.WaitGroup
+		work := make(chan int)
+		workers := saveManyConcurrency
+		if n < workers {
+			workers = n
+		}
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := range work {
+					replace(i)
+				}
+			}()
+		}
+		for i := range items {
+			work <- i
+		}
+		close(work)
+		wg.Wait()
+	}
+
+	out := saveOutcome{failures: map[int]error{}, result: &BulkResult{}}
+	for i, r := range results {
+		if r.wc != nil && out.wcErr == nil {
+			out.wcErr = r.wc
+		}
+		if r.err != nil {
+			out.failures[i] = r.err
 			continue
 		}
-		out.result.MatchedCount += res.MatchedCount
-		out.result.ModifiedCount += res.ModifiedCount
-		if res.MatchedCount == 0 {
+		out.result.MatchedCount += r.matched
+		out.result.ModifiedCount += r.modified
+		if r.matched == 0 {
 			out.unresolved = append(out.unresolved, i)
 		}
 	}
-	return out, nil
+	return out
+}
+
+// classifyReplaceError turns a ReplaceOne failure into the item's error. A
+// server write error (such as a duplicate key) is translated; a write concern
+// error is recorded as well, and stands alone when there is no write error.
+// Anything else (transport, context) is attributed to the item as is.
+func classifyReplaceError(err error, schema *Schema) replaceResult {
+	var r replaceResult
+	var we mongo.WriteException
+	if !errors.As(err, &we) {
+		r.err = fmt.Errorf("goodm: replace failed: %w", err)
+		return r
+	}
+	if we.WriteConcernError != nil {
+		r.wc = fmt.Errorf("goodm: write concern error (%d): %s", we.WriteConcernError.Code, we.WriteConcernError.Message)
+	}
+	if len(we.WriteErrors) > 0 {
+		r.err = translateBulkItem(we.WriteErrors[0], schema).Err
+	} else if r.wc != nil {
+		r.err = r.wc
+	} else {
+		r.err = fmt.Errorf("goodm: replace failed: %w", err)
+	}
+	return r
 }
 
 // resolveUnmatched classifies items whose replacement matched no document:
 // a document that still exists within scope is a version conflict (and the
 // model's version is refreshed from it); anything else is not found. The
-// read goes to the primary so it cannot observe a stale secondary.
-func resolveUnmatched(ctx context.Context, coll *mongo.Collection, items, ids []interface{}, unresolved []int, failures map[int]error, scope interface{}) error {
+// read goes to the primary so it cannot observe a stale secondary, and the
+// documents are decoded into the model type so their _id values compare
+// with the models' through the same Go type.
+func resolveUnmatched(ctx context.Context, coll *mongo.Collection, schema *Schema, items, ids []interface{}, unresolved []int, failures map[int]error, scope interface{}) error {
 	lookup := make([]interface{}, 0, len(unresolved))
 	for _, i := range unresolved {
 		lookup = append(lookup, ids[i])
@@ -435,14 +434,16 @@ func resolveUnmatched(ctx context.Context, coll *mongo.Collection, items, ids []
 
 	versions := map[string]int{}
 	for cursor.Next(ctx) {
-		var doc struct {
-			ID      interface{} `bson:"_id"`
-			Version int         `bson:"__v"`
-		}
-		if err := cursor.Decode(&doc); err != nil {
+		doc := reflect.New(schema.Type).Interface()
+		if err := cursor.Decode(doc); err != nil {
 			return fmt.Errorf("goodm: failed to resolve unmatched documents: %w", err)
 		}
-		versions[idKey(doc.ID)] = doc.Version
+		id, err := modelID(schema, doc)
+		if err != nil {
+			return err
+		}
+		v, _ := getModelVersion(doc)
+		versions[idKey(id)] = v
 	}
 	if err := cursor.Err(); err != nil {
 		return fmt.Errorf("goodm: failed to resolve unmatched documents: %w", err)
@@ -462,13 +463,9 @@ func resolveUnmatched(ctx context.Context, coll *mongo.Collection, items, ids []
 
 // rollbackVersions restores the pre-save version on failed items. Items whose
 // failure is a version conflict keep the version resolveUnmatched refreshed
-// from the database. With failures == nil every item is rolled back.
+// from the database.
 func rollbackVersions(items []interface{}, oldVersions []int, failures map[int]error) {
 	for i, model := range items {
-		if failures == nil {
-			setModelVersion(model, oldVersions[i])
-			continue
-		}
 		if failure, failed := failures[i]; failed && !errors.Is(failure, ErrVersionConflict) {
 			setModelVersion(model, oldVersions[i])
 		}
@@ -488,28 +485,6 @@ func scopedFilter(scope interface{}, filter bson.D) interface{} {
 		return filter
 	}
 	return bson.D{{Key: "$and", Value: bson.A{scope, filter}}}
-}
-
-// serverMajorVersions caches the major server version per client.
-var serverMajorVersions sync.Map // *mongo.Client -> int
-
-// supportsClientBulkWrite reports whether the server accepts the client-level
-// bulkWrite command (MongoDB 8.0+). A failed probe reports false so SaveMany
-// takes the path that works everywhere.
-func supportsClientBulkWrite(ctx context.Context, db *mongo.Database) bool {
-	client := db.Client()
-	if v, ok := serverMajorVersions.Load(client); ok {
-		return v.(int) >= 8
-	}
-	var info struct {
-		VersionArray []int32 `bson:"versionArray"`
-	}
-	if err := db.RunCommand(ctx, bson.D{{Key: "buildInfo", Value: 1}}).Decode(&info); err != nil || len(info.VersionArray) == 0 {
-		return false
-	}
-	major := int(info.VersionArray[0])
-	serverMajorVersions.Store(client, major)
-	return major >= 8
 }
 
 // checkImmutableFieldsBatch loads the stored documents for all items in one
