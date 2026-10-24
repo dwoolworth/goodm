@@ -1,7 +1,6 @@
 package goodm
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -172,6 +171,16 @@ func TestSaveMany_HappyPath(t *testing.T) {
 }
 
 func TestSaveMany_ClassifiesConflictsAndMissing(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		t.Run(map[bool]string{false: "clientBulk", true: "perDocument"}[legacy], func(t *testing.T) {
+			forceLegacySaveMany = legacy
+			defer func() { forceLegacySaveMany = false }()
+			testSaveManyClassification(t)
+		})
+	}
+}
+
+func testSaveManyClassification(t *testing.T) {
 	ctx, db, cleanup := setupTestDB(t)
 	defer cleanup()
 	if err := Enforce(ctx, db); err != nil {
@@ -307,6 +316,16 @@ type testNoTimestamps struct {
 }
 
 func TestSaveMany_ConcurrentWritersFromSameVersion_ExactlyOneWins(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		t.Run(map[bool]string{false: "clientBulk", true: "perDocument"}[legacy], func(t *testing.T) {
+			forceLegacySaveMany = legacy
+			defer func() { forceLegacySaveMany = false }()
+			testSaveManyRace(t)
+		})
+	}
+}
+
+func testSaveManyRace(t *testing.T) {
 	ctx, _, cleanup := setupTestDB(t)
 	defer cleanup()
 
@@ -368,26 +387,24 @@ func TestSaveMany_RejectsDuplicateIDsInBatch(t *testing.T) {
 	}
 }
 
-func TestSaveMany_IdenticalConcurrentWrite_IsNotAConflict(t *testing.T) {
+func TestSaveMany_IdenticalContentFromAnotherWriter_IsStillAConflict(t *testing.T) {
 	ctx, _, cleanup := setupTestDB(t)
 	defer cleanup()
 	u := seedUsers(t, ctx, 1)[0]
 
-	// Another writer stores exactly the content we are about to store.
 	other := *u
 	other.Age = 30
 	if err := Update(ctx, &other); err != nil {
 		t.Fatal(err)
 	}
-	// Make our replacement byte-identical to theirs.
 	mine := other
-	mine.Version = 0
-	if err := SaveMany(ctx, []*testUser{&mine}); err != nil {
-		// The documents differ only in updated_at, so a conflict is the
-		// expected classification unless the two writes share a millisecond.
-		if !errors.Is(err, ErrVersionConflict) {
-			t.Fatalf("unexpected error: %v", err)
-		}
+	mine.Version = 0 // stale: our filter targets version 0
+	err := SaveMany(ctx, []*testUser{&mine})
+	if !errors.Is(err, ErrVersionConflict) {
+		t.Fatalf("a stale version must be a conflict regardless of content, got %v", err)
+	}
+	if mine.Version != 1 {
+		t.Errorf("conflicting model should have its version refreshed to 1, got %d", mine.Version)
 	}
 }
 
@@ -416,7 +433,7 @@ func TestSaveMany_ModelWithoutTimestamps_ClassifiesCorrectly(t *testing.T) {
 	}
 }
 
-func TestBulkPaths_WriteConcernErrorIsFatal(t *testing.T) {
+func TestBulkPaths_WriteConcernErrorIsReported(t *testing.T) {
 	ctx, _, cleanup := setupTestDB(t)
 	defer cleanup()
 	registerModel(t, &testWC5{}, "test_wc5", "")
@@ -424,8 +441,8 @@ func TestBulkPaths_WriteConcernErrorIsFatal(t *testing.T) {
 	m := []*testWC5{{Name: "x"}, {Name: "y"}}
 	err := CreateMany(ctx, m)
 	var be *BulkError
-	if err == nil || errors.As(err, &be) {
-		t.Fatalf("CreateMany: write concern failure must be a plain error, got %v", err)
+	if !errors.As(err, &be) || be.WriteConcernError == nil {
+		t.Fatalf("CreateMany: expected a BulkError carrying the write concern error, got %v", err)
 	}
 	for i, d := range m {
 		if len(d.Events) != 0 {
@@ -441,18 +458,30 @@ func TestBulkPaths_WriteConcernErrorIsFatal(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	m[0].Name = "x2"
-	err = SaveMany(ctx, m)
-	if err == nil || errors.As(err, &be) {
-		t.Fatalf("SaveMany: write concern failure must be a plain error, got %v", err)
+	for _, legacy := range []bool{false, true} {
+		forceLegacySaveMany = legacy
+		m[0].Name = "x2"
+		err = SaveMany(ctx, m)
+		if !errors.As(err, &be) || be.WriteConcernError == nil {
+			t.Fatalf("SaveMany (legacy=%v): expected a BulkError carrying the write concern error, got %v", legacy, err)
+		}
+		if m[0].Version != 0 || len(m[0].Events) != 0 {
+			t.Errorf("SaveMany (legacy=%v): version must be rolled back and AfterSave skipped, got v=%d events=%v", legacy, m[0].Version, m[0].Events)
+		}
 	}
-	if m[0].Version != 0 || len(m[0].Events) != 0 {
-		t.Errorf("SaveMany: version must be rolled back and AfterSave skipped, got v=%d events=%v", m[0].Version, m[0].Events)
-	}
+	forceLegacySaveMany = false
 
 	_, err = NewBulk(&testWC5{}).InsertOne(bson.D{{Key: "name", Value: "z"}}).Execute(ctx)
-	if err == nil || errors.As(err, &be) {
-		t.Fatalf("Bulk: write concern failure must be a plain error, got %v", err)
+	if !errors.As(err, &be) || be.WriteConcernError == nil {
+		t.Fatalf("Bulk: expected a BulkError carrying the write concern error, got %v", err)
+	}
+
+	// A write concern error alongside a rejected item keeps the item error.
+	id := bson.NewObjectID()
+	dup := []*testWC5{{Model: Model{ID: id}, Name: "a"}, {Model: Model{ID: id}, Name: "b"}}
+	err = CreateMany(ctx, dup, CreateOptions{Unordered: true})
+	if !errors.As(err, &be) || be.WriteConcernError == nil || !errors.Is(err, ErrDuplicateKey) {
+		t.Fatalf("expected both the write concern error and the duplicate key error, got %v", err)
 	}
 }
 
@@ -481,17 +510,5 @@ func TestSaveMany_MiddlewareScopeFilter(t *testing.T) {
 	}
 	if err := FindByID(ctx, users[0].ID, &fresh); err != nil || fresh.Age != 99 {
 		t.Fatalf("in-scope document must be written: %+v %v", fresh, err)
-	}
-}
-
-func TestWithIDFirst(t *testing.T) {
-	raw, _ := bson.Marshal(bson.D{{Key: "name", Value: "n"}, {Key: "_id", Value: "k"}, {Key: "x", Value: 1}})
-	out := withIDFirst(raw)
-	elems, _ := out.Elements()
-	if len(elems) != 3 || elems[0].Key() != "_id" || elems[1].Key() != "name" || elems[2].Key() != "x" {
-		t.Fatalf("unexpected order: %v", out)
-	}
-	if !bytes.Equal(withIDFirst(out), out) {
-		t.Fatal("already-first _id must be returned unchanged")
 	}
 }

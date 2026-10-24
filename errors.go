@@ -125,10 +125,16 @@ func (e BulkWriteError) Unwrap() error { return e.Err }
 // BulkError is returned by CreateMany, SaveMany, and Bulk.Execute when some
 // operations failed. Result reports what did succeed. errors.Is matches the
 // typed error of any failed item (e.g. ErrDuplicateKey, ErrVersionConflict).
+//
+// When WriteConcernError is set the server could not satisfy the requested
+// write concern: the writes may or may not have been applied, Result cannot
+// be trusted, no after-hooks have run, and SaveMany has rolled every model's
+// version back. Errors still lists the operations the server rejected.
 type BulkError struct {
-	Collection string
-	Errors     []BulkWriteError
-	Result     *BulkResult
+	Collection        string
+	Errors            []BulkWriteError
+	Result            *BulkResult
+	WriteConcernError error
 }
 
 func (e *BulkError) Error() string {
@@ -140,16 +146,31 @@ func (e *BulkError) Error() string {
 		}
 		msgs = append(msgs, we.Error())
 	}
-	return fmt.Sprintf("goodm: bulk write on %s: %d of the operations failed: %s", e.Collection, len(e.Errors), strings.Join(msgs, "; "))
+	var b strings.Builder
+	fmt.Fprintf(&b, "goodm: bulk write on %s:", e.Collection)
+	if e.WriteConcernError != nil {
+		fmt.Fprintf(&b, " %v (outcome of every operation is unknown)", e.WriteConcernError)
+		if len(e.Errors) > 0 {
+			b.WriteString(";")
+		}
+	}
+	if len(e.Errors) > 0 {
+		fmt.Fprintf(&b, " %d of the operations failed: %s", len(e.Errors), strings.Join(msgs, "; "))
+	}
+	return b.String()
 }
 
-// Unwrap exposes each item's error to errors.Is and errors.As.
+// Unwrap exposes each item's error, and the write concern error if any, to
+// errors.Is and errors.As.
 func (e *BulkError) Unwrap() []error {
-	out := make([]error, 0, len(e.Errors))
+	out := make([]error, 0, len(e.Errors)+1)
 	for _, we := range e.Errors {
 		if we.Err != nil {
 			out = append(out, we.Err)
 		}
+	}
+	if e.WriteConcernError != nil {
+		out = append(out, e.WriteConcernError)
 	}
 	return out
 }
@@ -220,32 +241,44 @@ func isDuplicateKeyCode(code int) bool {
 }
 
 // splitBulkWriteError separates a bulk write failure into per-item errors
-// that can be attributed to one operation and a fatal error that cannot.
-// Duplicate key violations are translated. A write concern error is fatal:
-// the server may have applied some or all writes without acknowledging them
-// at the requested level, so no per-item outcome can be trusted. An error that
-// is not a BulkWriteException, or one carrying no write errors at all, is also
-// returned as fatal.
-func splitBulkWriteError(err error, schema *Schema) (items []BulkWriteError, fatal error) {
+// attributable to one operation and a write concern error that is not.
+// Duplicate key violations are translated. An error that is not a
+// BulkWriteException, or one carrying neither kind of error, is returned as
+// fatal.
+func splitBulkWriteError(err error, schema *Schema) (items []BulkWriteError, wcErr error, fatal error) {
 	var bwe mongo.BulkWriteException
 	if !errors.As(err, &bwe) {
-		return nil, err
+		return nil, nil, err
 	}
 	if bwe.WriteConcernError != nil {
-		return nil, fmt.Errorf("goodm: write concern error (%d): %s: %w", bwe.WriteConcernError.Code, bwe.WriteConcernError.Message, err)
+		wcErr = fmt.Errorf("goodm: write concern error (%d): %s: %w", bwe.WriteConcernError.Code, bwe.WriteConcernError.Message, err)
 	}
-	if len(bwe.WriteErrors) == 0 {
-		return nil, err
+	items = translateWriteErrors(bwe.WriteErrors, schema)
+	if wcErr == nil && len(items) == 0 {
+		return nil, nil, err
 	}
-	items = make([]BulkWriteError, 0, len(bwe.WriteErrors))
-	for _, we := range bwe.WriteErrors {
-		item := BulkWriteError{Index: we.Index, Code: we.Code, Message: we.Message}
-		if isDuplicateKeyCode(we.Code) {
-			item.Err = newDuplicateKeyError(we, schema, we.Message)
-		} else {
-			item.Err = fmt.Errorf("goodm: write error %d: %s", we.Code, we.Message)
-		}
-		items = append(items, item)
+	return items, wcErr, nil
+}
+
+// translateWriteErrors converts driver per-operation errors into BulkWriteErrors.
+func translateWriteErrors(errs []mongo.BulkWriteError, schema *Schema) []BulkWriteError {
+	if len(errs) == 0 {
+		return nil
 	}
-	return items, nil
+	items := make([]BulkWriteError, 0, len(errs))
+	for _, we := range errs {
+		items = append(items, translateBulkItem(we.WriteError, schema))
+	}
+	return items
+}
+
+// translateBulkItem converts one driver per-operation write error.
+func translateBulkItem(we mongo.WriteError, schema *Schema) BulkWriteError {
+	item := BulkWriteError{Index: we.Index, Code: we.Code, Message: we.Message}
+	if isDuplicateKeyCode(we.Code) {
+		item.Err = newDuplicateKeyError(we, schema, we.Message)
+	} else {
+		item.Err = fmt.Errorf("goodm: write error %d: %s", we.Code, we.Message)
+	}
+	return item
 }
