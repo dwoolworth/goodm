@@ -15,7 +15,7 @@ import (
 // saveWithRetry attempts a versioned save, optionally retrying with a 3-way
 // field-level merge when a version conflict occurs. Without retries it still
 // refreshes the model's version on conflict to prevent cascading failures.
-func saveWithRetry(ctx context.Context, coll *mongo.Collection, schema *Schema, model interface{}, opt UpdateOptions, id interface{}) error {
+func saveWithRetry(ctx context.Context, coll *mongo.Collection, schema *Schema, model interface{}, opt UpdateOptions, id interface{}, scope interface{}) error {
 	var base bson.M
 	if opt.MaxRetries > 0 {
 		var err error
@@ -26,7 +26,7 @@ func saveWithRetry(ctx context.Context, coll *mongo.Collection, schema *Schema, 
 	}
 
 	for attempt := 0; ; attempt++ {
-		err := attemptSave(ctx, coll, schema, model, opt.Unset, id)
+		err := attemptSave(ctx, coll, schema, model, opt.Unset, id, scope)
 		if err == nil {
 			return nil
 		}
@@ -37,12 +37,12 @@ func saveWithRetry(ctx context.Context, coll *mongo.Collection, schema *Schema, 
 		// Version conflict — can we retry with merge?
 		if base == nil || attempt >= opt.MaxRetries {
 			// No retry: refresh version so next caller Update() can succeed.
-			refreshModelVersion(ctx, coll, model, id)
+			refreshModelVersion(ctx, coll, model, id, scope)
 			return ErrVersionConflict
 		}
 
 		// 3-way merge: re-read DB state, detect conflicts, apply disjoint changes.
-		if err := mergeFromDB(ctx, coll, model, base, id); err != nil {
+		if err := mergeFromDB(ctx, coll, model, base, id, scope); err != nil {
 			return err
 		}
 	}
@@ -50,12 +50,12 @@ func saveWithRetry(ctx context.Context, coll *mongo.Collection, schema *Schema, 
 
 // attemptSave performs a single versioned replace. Returns ErrVersionConflict
 // if the version filter did not match, or ErrNotFound if the document is gone.
-func attemptSave(ctx context.Context, coll *mongo.Collection, schema *Schema, model interface{}, unsetFields []string, id interface{}) error {
+func attemptSave(ctx context.Context, coll *mongo.Collection, schema *Schema, model interface{}, unsetFields []string, id interface{}, scope interface{}) error {
 	oldVersion, _ := getModelVersion(model)
 	setModelVersion(model, oldVersion+1)
 	setUpdatedAt(model, time.Now())
 
-	filter := buildVersionFilter(id, oldVersion)
+	filter := andFilter(scope, buildVersionFilter(id, oldVersion))
 	matched, err := replaceWithUnset(ctx, coll, schema, filter, model, unsetFields)
 	if err != nil {
 		setModelVersion(model, oldVersion)
@@ -63,7 +63,7 @@ func attemptSave(ctx context.Context, coll *mongo.Collection, schema *Schema, mo
 	}
 	if matched == 0 {
 		setModelVersion(model, oldVersion)
-		return checkUpdateConflict(ctx, coll, id)
+		return checkUpdateConflict(ctx, coll, scope, id)
 	}
 
 	return nil
@@ -72,10 +72,10 @@ func attemptSave(ctx context.Context, coll *mongo.Collection, schema *Schema, mo
 // mergeFromDB re-reads the document, computes a 3-way diff (base vs ours vs theirs),
 // and applies non-conflicting changes from the caller onto the fresh DB state.
 // Returns a *MergeConflictError if both sides modified the same fields.
-func mergeFromDB(ctx context.Context, coll *mongo.Collection, model interface{}, base bson.M, id interface{}) error {
+func mergeFromDB(ctx context.Context, coll *mongo.Collection, model interface{}, base bson.M, id interface{}, scope interface{}) error {
 	// Re-read the current document from the database.
 	fresh := reflect.New(reflect.TypeOf(model).Elem()).Interface()
-	if err := coll.FindOne(ctx, bson.D{{Key: "_id", Value: id}}).Decode(fresh); err != nil {
+	if err := coll.FindOne(ctx, andFilter(scope, bson.D{{Key: "_id", Value: id}})).Decode(fresh); err != nil {
 		if errors.Is(err, mongo.ErrNoDocuments) {
 			return ErrNotFound
 		}
@@ -133,11 +133,11 @@ func buildMergedDoc(theirs, ours bson.M, ourChanges []string) bson.M {
 
 // refreshModelVersion does a best-effort read of the document's current version
 // and updates the model struct so the next Update() call won't cascade-fail.
-func refreshModelVersion(ctx context.Context, coll *mongo.Collection, model interface{}, id interface{}) {
+func refreshModelVersion(ctx context.Context, coll *mongo.Collection, model interface{}, id interface{}, scope interface{}) {
 	var doc struct {
 		Version int `bson:"__v"`
 	}
-	err := coll.FindOne(ctx, bson.D{{Key: "_id", Value: id}},
+	err := coll.FindOne(ctx, andFilter(scope, bson.D{{Key: "_id", Value: id}}),
 		options.FindOne().SetProjection(bson.D{{Key: "__v", Value: 1}})).Decode(&doc)
 	if err == nil {
 		setModelVersion(model, doc.Version)

@@ -54,38 +54,55 @@ type MigrationResult struct {
 func PlanMigration(ctx context.Context, db *mongo.Database, schemas []*Schema) (MigrationPlan, error) {
 	var plan MigrationPlan
 
+	// Several models may share a collection; their indexes are planned as one
+	// set so neither marks the other's indexes as extras.
+	var order []string
+	groups := map[string][]*Schema{}
 	for _, schema := range schemas {
-		coll := db.Collection(schema.Collection)
+		if _, seen := groups[schema.Collection]; !seen {
+			order = append(order, schema.Collection)
+		}
+		groups[schema.Collection] = append(groups[schema.Collection], schema)
+	}
+
+	for _, collection := range order {
+		group := groups[collection]
+		coll := db.Collection(collection)
 
 		existing, err := ListExistingIndexes(ctx, coll)
 		if err != nil {
-			return plan, fmt.Errorf("migration: failed to list indexes on %s: %w", schema.Collection, err)
+			return plan, fmt.Errorf("migration: failed to list indexes on %s: %w", collection, err)
 		}
 		delete(existing, "_id_")
 
 		expected := make(map[string]bool)
-		for _, def := range schema.IndexDefinitions() {
-			def := def
-			expected[def.Name] = true
-			spec, ok := existing[def.Name]
-			if !ok {
-				plan.Actions = append(plan.Actions, MigrationAction{
-					Type:        ActionCreateIndex,
-					Collection:  schema.Collection,
-					Description: fmt.Sprintf("Create index: %s%s", def.Name, describeIndexOptions(def)),
-					IndexName:   def.Name,
-					Definition:  &def,
-				})
-				continue
-			}
-			if mismatch := describeIndexMismatch(spec, def); mismatch != "" {
-				plan.Actions = append(plan.Actions, MigrationAction{
-					Type:        ActionRebuildIndex,
-					Collection:  schema.Collection,
-					Description: fmt.Sprintf("Rebuild index: %s (%s)", def.Name, mismatch),
-					IndexName:   def.Name,
-					Definition:  &def,
-				})
+		for _, schema := range group {
+			for _, def := range schema.IndexDefinitions() {
+				def := def
+				if expected[def.Name] {
+					continue
+				}
+				expected[def.Name] = true
+				spec, ok := existing[def.Name]
+				if !ok {
+					plan.Actions = append(plan.Actions, MigrationAction{
+						Type:        ActionCreateIndex,
+						Collection:  collection,
+						Description: fmt.Sprintf("Create index: %s%s", def.Name, describeIndexOptions(def)),
+						IndexName:   def.Name,
+						Definition:  &def,
+					})
+					continue
+				}
+				if mismatch := describeIndexMismatch(spec, def); mismatch != "" {
+					plan.Actions = append(plan.Actions, MigrationAction{
+						Type:        ActionRebuildIndex,
+						Collection:  collection,
+						Description: fmt.Sprintf("Rebuild index: %s (%s)", def.Name, mismatch),
+						IndexName:   def.Name,
+						Definition:  &def,
+					})
+				}
 			}
 		}
 
@@ -93,20 +110,21 @@ func PlanMigration(ctx context.Context, db *mongo.Database, schemas []*Schema) (
 			if !expected[name] {
 				plan.Actions = append(plan.Actions, MigrationAction{
 					Type:        ActionDropIndex,
-					Collection:  schema.Collection,
+					Collection:  collection,
 					Description: fmt.Sprintf("Drop index: %s (not in schema)", name),
 					IndexName:   name,
 				})
 			}
 		}
 
-		drifts := DetectDrift(ctx, db, schema, DefaultDriftSampleSize)
-		for _, d := range drifts {
-			plan.Actions = append(plan.Actions, MigrationAction{
-				Type:        ActionFieldDrift,
-				Collection:  schema.Collection,
-				Description: fmt.Sprintf("Extra field: %s", d.Field),
-			})
+		for _, schema := range group {
+			for _, d := range DetectDrift(ctx, db, schema, DefaultDriftSampleSize) {
+				plan.Actions = append(plan.Actions, MigrationAction{
+					Type:        ActionFieldDrift,
+					Collection:  collection,
+					Description: fmt.Sprintf("Extra field: %s", d.Field),
+				})
+			}
 		}
 	}
 

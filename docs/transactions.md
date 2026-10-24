@@ -54,7 +54,7 @@ goodm.WithTransaction(outerCtx, func(ctx context.Context) error {
 
 ## Nested Calls
 
-If the context already carries a session, a nested `WithTransaction` runs its callback inside the existing transaction instead of starting a second one. An error from the inner callback therefore aborts the whole outer transaction, and the inner writes are never committed on their own. This lets helpers that wrap themselves in `WithTransaction` be composed freely.
+If the context already carries a session with a transaction in progress, a nested `WithTransaction` runs its callback inside that transaction instead of starting a second one, and ignores its own options. An error from the inner callback therefore aborts the whole outer transaction, and the inner writes are never committed on their own. This lets helpers that wrap themselves in `WithTransaction` be composed freely. A context that carries a session without an active transaction gets a transaction started on that session.
 
 ## Options
 

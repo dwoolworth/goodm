@@ -57,7 +57,7 @@ Body     string    `bson:"body"     goodm:"index=text"`     // text
 Location bson.D    `bson:"loc"      goodm:"index=2dsphere"` // geospatial
 ```
 
-Tags on fields inside subdocuments create dotted-path indexes (`address.city_1`), including for slices of structs (multikey).
+Tags on fields inside subdocuments create dotted-path indexes (`address.city_1`), including for slices of structs (multikey). Take care with `unique` inside an array: every element is indexed, and documents whose array is empty or missing all index as `null` and collide with each other. Use `unique,sparse` or a partial filter from `Indexes()` for those.
 
 ### `sparse`
 
@@ -282,7 +282,7 @@ Because schemas are keyed by type, two packages may each register a struct named
 
 ## Custom ID Types
 
-The `_id` field is whichever struct field carries `bson:"_id"` (a field named `ID` is the fallback), found through embedded structs. When that field is a `bson.ObjectID`, `Create` generates a value if it is zero. Any other type works, but you must set it yourself before `Create` or in a `BeforeCreate` hook; a zero `_id` of a non-ObjectID type is rejected rather than inserted as an empty key.
+The `_id` field is the struct field tagged `bson:"_id"`, found through embedded structs; `Register` rejects a model that has none. A field merely named `ID` is not enough, because the driver would store it as `id`. When the `_id` field is a `bson.ObjectID`, `Create` generates a value if it is zero. Any other type works, but you must set it yourself before `Create` or in a `BeforeCreate` hook; a zero `_id` of a non-ObjectID type is rejected rather than inserted as an empty key.
 
 ```go
 type Setting struct {

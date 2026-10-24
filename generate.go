@@ -2,6 +2,7 @@ package goodm
 
 import (
 	"bytes"
+	"fmt"
 	"go/format"
 	"strings"
 	"text/template"
@@ -18,15 +19,15 @@ type GenerateOptions struct {
 
 // modelTemplateData is the data passed to the code generation template.
 type modelTemplateData struct {
-	Package         string
-	StructName      string
-	CollectionName  string
-	EmbedModel      bool
-	Fields          []templateField
-	CompoundIndexes []templateCompoundIndex
-	NeedsTime       bool
-	NeedsBSON       bool
-	NeedsGoodm      bool
+	Package        string
+	StructName     string
+	CollectionName string
+	EmbedModel     bool
+	Fields         []templateField
+	IndexEntries   []string
+	NeedsTime      bool
+	NeedsBSON      bool
+	NeedsGoodm     bool
 }
 
 type templateField struct {
@@ -36,17 +37,50 @@ type templateField struct {
 	GoodmTag string
 }
 
-type templateCompoundIndex struct {
-	Fields []string
-	Unique bool
-}
-
 func joinFields(fields []string) string {
 	quoted := make([]string, len(fields))
 	for i, f := range fields {
 		quoted[i] = `"` + f + `"`
 	}
 	return strings.Join(quoted, ", ")
+}
+
+// renderIndexEntry renders one element of the generated Indexes() slice.
+// Plain indexes use the constructors; indexes with options use a struct
+// literal, and options discover cannot read back (partial filters,
+// collations) are called out in a comment for the developer to fill in.
+func renderIndexEntry(idx DiscoveredIndex) string {
+	var b strings.Builder
+	if idx.HasPartialFilter || idx.HasCollation {
+		var missing []string
+		if idx.HasPartialFilter {
+			missing = append(missing, "a partial filter")
+		}
+		if idx.HasCollation {
+			missing = append(missing, "a collation")
+		}
+		fmt.Fprintf(&b, "// TODO: index %q has %s that discover cannot reproduce; set PartialFilter/Collation here.\n", idx.Name, strings.Join(missing, " and "))
+	}
+	simple := !idx.Sparse && idx.ExpireAfterSeconds == nil && !idx.HasPartialFilter && !idx.HasCollation
+	switch {
+	case simple && idx.Unique:
+		fmt.Fprintf(&b, "goodm.NewUniqueCompoundIndex(%s),", joinFields(idx.Keys))
+	case simple:
+		fmt.Fprintf(&b, "goodm.NewCompoundIndex(%s),", joinFields(idx.Keys))
+	default:
+		fmt.Fprintf(&b, "{Fields: []string{%s}", joinFields(idx.Keys))
+		if idx.Unique {
+			b.WriteString(", Unique: true")
+		}
+		if idx.Sparse {
+			b.WriteString(", Sparse: true")
+		}
+		if idx.ExpireAfterSeconds != nil {
+			fmt.Fprintf(&b, ", ExpireAfterSeconds: goodm.TTL(%d * time.Second)", *idx.ExpireAfterSeconds)
+		}
+		b.WriteString("},")
+	}
+	return b.String()
 }
 
 var modelTmpl = template.Must(template.New("model").Funcs(template.FuncMap{
@@ -75,16 +109,12 @@ type {{ .StructName }} struct {
 	{{ .GoName }}	{{ .GoType }}	` + "`" + `bson:"{{ .BSONName }}"{{ if .GoodmTag }} goodm:"{{ .GoodmTag }}"{{ end }}` + "`" + `
 {{- end }}
 }
-{{ if .CompoundIndexes }}
-// Indexes returns compound indexes for the {{ .StructName }} model.
+{{ if .IndexEntries }}
+// Indexes returns the indexes of the {{ .StructName }} model that field tags cannot express.
 func (m *{{ .StructName }}) Indexes() []goodm.CompoundIndex {
 	return []goodm.CompoundIndex{
-{{- range .CompoundIndexes }}
-{{- if .Unique }}
-		goodm.NewUniqueCompoundIndex({{ joinFields .Fields }}),
-{{- else }}
-		goodm.NewCompoundIndex({{ joinFields .Fields }}),
-{{- end }}
+{{- range .IndexEntries }}
+		{{ . }}
 {{- end }}
 	}
 }
@@ -115,7 +145,7 @@ func GenerateModel(coll DiscoveredCollection, opts GenerateOptions) ([]byte, err
 		}
 
 		goName := internal.ToExportedName(f.BSONName)
-		goodmTag := internal.FormatGoodmTag(f.IsUnique, f.IsIndexed, f.IsRequired)
+		goodmTag := internal.FormatGoodmTag(f.IsUnique, f.IsIndexed, f.IndexKind, f.Sparse, f.TTL, f.IsRequired)
 
 		if strings.Contains(f.GoType, "time.Time") {
 			needsTime = true
@@ -132,27 +162,29 @@ func GenerateModel(coll DiscoveredCollection, opts GenerateOptions) ([]byte, err
 		})
 	}
 
-	// Collect compound indexes (multi-key only; single-key are tags)
-	var compoundIndexes []templateCompoundIndex
+	// Indexes that tags cannot express: compound, or single-key with a
+	// partial filter or collation. Everything else became a field tag above.
+	var indexEntries []string
 	for _, idx := range coll.Indexes {
-		if len(idx.Keys) > 1 {
-			compoundIndexes = append(compoundIndexes, templateCompoundIndex{
-				Fields: idx.Keys,
-				Unique: idx.Unique,
-			})
+		if idx.Name == "_id_" || idx.SingleFieldTag() {
+			continue
 		}
+		if idx.ExpireAfterSeconds != nil {
+			needsTime = true
+		}
+		indexEntries = append(indexEntries, renderIndexEntry(idx))
 	}
 
 	data := modelTemplateData{
-		Package:         opts.PackageName,
-		StructName:      structName,
-		CollectionName:  coll.Name,
-		EmbedModel:      opts.EmbedModel,
-		Fields:          fields,
-		CompoundIndexes: compoundIndexes,
-		NeedsTime:       needsTime,
-		NeedsBSON:       needsBSON,
-		NeedsGoodm:      opts.EmbedModel || len(compoundIndexes) > 0,
+		Package:        opts.PackageName,
+		StructName:     structName,
+		CollectionName: coll.Name,
+		EmbedModel:     opts.EmbedModel,
+		Fields:         fields,
+		IndexEntries:   indexEntries,
+		NeedsTime:      needsTime,
+		NeedsBSON:      needsBSON,
+		NeedsGoodm:     opts.EmbedModel || len(indexEntries) > 0,
 	}
 
 	var buf bytes.Buffer

@@ -469,19 +469,23 @@ func Update(ctx context.Context, model interface{}, opts ...UpdateOptions) error
 		return err
 	}
 
-	return runMiddleware(ctx, &OpInfo{
+	// Middleware may replace info.Filter (e.g. to scope by tenant); it is
+	// ANDed with the _id and version filters of every read and write below.
+	info := &OpInfo{
 		Operation: OpUpdate, Collection: schema.Collection,
 		ModelName: schema.ModelName, Model: model,
 		Filter: bson.D{{Key: "_id", Value: id}},
-	}, func(ctx context.Context) error {
+	}
+	return runMiddleware(ctx, info, func(ctx context.Context) error {
 		db, err := getDB(opt.DB)
 		if err != nil {
 			return err
 		}
 
 		coll := getCollection(db, schema)
+		scope := info.Filter
 
-		if err := checkImmutableFields(ctx, coll, id, model, schema); err != nil {
+		if err := checkImmutableFields(ctx, coll, scope, id, model, schema); err != nil {
 			return err
 		}
 
@@ -498,7 +502,7 @@ func Update(ctx context.Context, model interface{}, opts ...UpdateOptions) error
 		}
 
 		// Save with optional retry-with-merge on version conflict.
-		if err := saveWithRetry(ctx, coll, schema, model, opt, id); err != nil {
+		if err := saveWithRetry(ctx, coll, schema, model, opt, id, scope); err != nil {
 			return err
 		}
 
@@ -515,12 +519,12 @@ func Update(ctx context.Context, model interface{}, opts ...UpdateOptions) error
 
 // checkImmutableFields verifies that immutable fields have not been modified.
 // Skips the check entirely if no fields are marked immutable.
-func checkImmutableFields(ctx context.Context, coll *mongo.Collection, id interface{}, model interface{}, schema *Schema) error {
+func checkImmutableFields(ctx context.Context, coll *mongo.Collection, scope interface{}, id interface{}, model interface{}, schema *Schema) error {
 	if !hasImmutableFields(schema) {
 		return nil
 	}
 	existing := reflect.New(reflect.TypeOf(model).Elem()).Interface()
-	if err := coll.FindOne(ctx, bson.D{{Key: "_id", Value: id}}).Decode(existing); err != nil {
+	if err := coll.FindOne(ctx, andFilter(scope, bson.D{{Key: "_id", Value: id}})).Decode(existing); err != nil {
 		if errors.Is(err, mongo.ErrNoDocuments) {
 			return ErrNotFound
 		}
@@ -550,10 +554,19 @@ func buildVersionFilter(id interface{}, oldVersion int) bson.D {
 	}
 }
 
-// checkUpdateConflict disambiguates between a missing document and a version conflict
-// when an update matched zero documents.
-func checkUpdateConflict(ctx context.Context, coll *mongo.Collection, id interface{}) error {
-	count, err := coll.CountDocuments(ctx, bson.D{{Key: "_id", Value: id}})
+// andFilter ANDs a middleware-supplied scope filter into filter. A nil scope
+// leaves filter unchanged.
+func andFilter(scope interface{}, filter bson.D) interface{} {
+	if scope == nil {
+		return filter
+	}
+	return bson.D{{Key: "$and", Value: bson.A{scope, filter}}}
+}
+
+// checkUpdateConflict disambiguates between a missing (or out-of-scope)
+// document and a version conflict when an update matched zero documents.
+func checkUpdateConflict(ctx context.Context, coll *mongo.Collection, scope interface{}, id interface{}) error {
+	count, err := coll.CountDocuments(ctx, andFilter(scope, bson.D{{Key: "_id", Value: id}}))
 	if err != nil {
 		return fmt.Errorf("goodm: update failed: %w", err)
 	}
@@ -573,7 +586,8 @@ func checkUpdateConflict(ctx context.Context, coll *mongo.Collection, id interfa
 // fields maps bson field names to their new values. Dotted paths into
 // subdocuments and array elements are allowed ("address.city", "items.0.qty").
 // Each value is validated against the field's schema (required, enum, min,
-// max), and immutable fields are rejected. The caller's map is not modified.
+// max); subdocument values may be structs, bson.M, bson.D, or slices of those.
+// Immutable fields are rejected. The caller's map is not modified.
 //
 //	err := goodm.UpdateFields(ctx, &task, bson.M{"step": 5, "tokens_used": 12000})
 func UpdateFields(ctx context.Context, model interface{}, fields bson.M, opts ...UpdateOptions) error {
@@ -594,11 +608,12 @@ func UpdateFields(ctx context.Context, model interface{}, fields bson.M, opts ..
 		return err
 	}
 
-	return runMiddleware(ctx, &OpInfo{
+	info := &OpInfo{
 		Operation: OpUpdate, Collection: schema.Collection,
 		ModelName: schema.ModelName, Model: model,
 		Filter: bson.D{{Key: "_id", Value: id}},
-	}, func(ctx context.Context) error {
+	}
+	return runMiddleware(ctx, info, func(ctx context.Context) error {
 		var optDB *mongo.Database
 		if len(opts) > 0 {
 			optDB = opts[0].DB
@@ -618,7 +633,7 @@ func UpdateFields(ctx context.Context, model interface{}, fields bson.M, opts ..
 		oldVersion, _ := getModelVersion(model)
 
 		coll := getCollection(db, schema)
-		result, err := coll.UpdateOne(ctx, bson.D{{Key: "_id", Value: id}}, bson.D{
+		result, err := coll.UpdateOne(ctx, andFilter(info.Filter, bson.D{{Key: "_id", Value: id}}), bson.D{
 			{Key: "$set", Value: set},
 			{Key: "$inc", Value: bson.D{{Key: "__v", Value: 1}}},
 		})
@@ -646,14 +661,14 @@ func validateUpdateFields(schema *Schema, fields bson.M) error {
 		if managedFields[name] {
 			return fmt.Errorf("goodm: cannot set managed field %q via UpdateFields", name)
 		}
-		fs, immutable := resolveFieldPath(schema, name)
+		fs, immutable, isElement := resolveFieldPath(schema, name)
 		if fs == nil {
 			return fmt.Errorf("goodm: unknown field %q in %s", name, schema.ModelName)
 		}
 		if immutable {
 			return ValidationErrors{{Field: name, Message: "field is immutable and cannot be changed"}}
 		}
-		errs = append(errs, validateFieldValue(fs, val, name)...)
+		errs = append(errs, validateFieldValue(fs, val, name, isElement)...)
 	}
 	if len(errs) > 0 {
 		return errs
@@ -661,19 +676,21 @@ func validateUpdateFields(schema *Schema, fields bson.M) error {
 	return nil
 }
 
-// resolveFieldPath walks a dotted bson path through the schema, skipping
-// numeric array-index segments. It returns the leaf field and whether the
-// leaf or any ancestor is immutable; the field is nil if the path is unknown.
-func resolveFieldPath(schema *Schema, path string) (*FieldSchema, bool) {
+// resolveFieldPath walks a dotted bson path through the schema. A numeric
+// segment after a slice field selects one element. It returns the leaf
+// field, whether the leaf or any ancestor is immutable, and whether the path
+// ends on a slice element rather than the slice itself; the field is nil if
+// the path is unknown.
+func resolveFieldPath(schema *Schema, path string) (field *FieldSchema, immutable, isElement bool) {
 	fields := schema.Fields
 	var leaf *FieldSchema
-	immutable := false
 	for _, seg := range strings.Split(path, ".") {
-		if _, err := strconv.Atoi(seg); err == nil && leaf != nil && leaf.IsSlice {
+		if _, err := strconv.Atoi(seg); err == nil && leaf != nil && !isElement && isSliceField(leaf) {
+			isElement = true
 			continue
 		}
 		if fields == nil {
-			return nil, false
+			return nil, false, false
 		}
 		var next *FieldSchema
 		for i := range fields {
@@ -683,25 +700,55 @@ func resolveFieldPath(schema *Schema, path string) (*FieldSchema, bool) {
 			}
 		}
 		if next == nil {
-			return nil, false
+			return nil, false, false
 		}
 		leaf = next
+		isElement = false
 		immutable = immutable || next.Immutable
 		fields = next.SubFields
 	}
-	return leaf, immutable
+	return leaf, immutable, isElement
+}
+
+// isSliceField reports whether a schema field holds a slice or array.
+func isSliceField(fs *FieldSchema) bool {
+	return fs.IsSlice || strings.HasPrefix(fs.Type, "[]")
+}
+
+// indirectValue follows interfaces and non-nil pointers to the concrete value.
+func indirectValue(v reflect.Value) reflect.Value {
+	for v.IsValid() && (v.Kind() == reflect.Interface || v.Kind() == reflect.Pointer) {
+		if v.IsNil() {
+			return reflect.Value{}
+		}
+		v = v.Elem()
+	}
+	return v
 }
 
 // validateFieldValue checks one value against a field's required, enum, min,
-// max, and subdocument rules.
-func validateFieldValue(fs *FieldSchema, val interface{}, path string) []ValidationError {
-	if val == nil {
+// max, and subdocument rules. Subdocument values may be Go structs, bson.M,
+// bson.D, or any map with string keys; slices of those for slice fields.
+// isElement means the value is one element of a slice field.
+func validateFieldValue(fs *FieldSchema, val interface{}, path string, isElement bool) []ValidationError {
+	rv := indirectValue(reflect.ValueOf(val))
+	if !rv.IsValid() {
 		if fs.Required {
 			return []ValidationError{{Field: path, Message: "field is required"}}
 		}
 		return nil
 	}
-	rv := reflect.ValueOf(val)
+
+	if len(fs.SubFields) > 0 {
+		if fs.IsSlice && !isElement {
+			return validateSubdocSlice(fs, rv, path)
+		}
+		return validateSubdocValue(fs.SubFields, rv, path)
+	}
+	if isElement {
+		return nil // an element of a scalar slice has no per-element rules
+	}
+
 	var errs []ValidationError
 	if fs.Required && rv.IsZero() {
 		errs = append(errs, ValidationError{Field: path, Message: "field is required"})
@@ -711,20 +758,92 @@ func validateFieldValue(fs *FieldSchema, val interface{}, path string) []Validat
 			errs = append(errs, *err)
 		}
 	}
-	if !isNilPointer(rv) {
-		if fs.Min != nil {
-			if err := validateMin(rv, *fs.Min, path); err != nil {
-				errs = append(errs, *err)
-			}
-		}
-		if fs.Max != nil {
-			if err := validateMax(rv, *fs.Max, path); err != nil {
-				errs = append(errs, *err)
-			}
+	if fs.Min != nil {
+		if err := validateMin(rv, *fs.Min, path); err != nil {
+			errs = append(errs, *err)
 		}
 	}
-	if len(fs.SubFields) > 0 {
-		errs = append(errs, validateSubFields(rv, *fs, path)...)
+	if fs.Max != nil {
+		if err := validateMax(rv, *fs.Max, path); err != nil {
+			errs = append(errs, *err)
+		}
+	}
+	return errs
+}
+
+// validateSubdocSlice validates a value set on a []struct field: its length
+// against min/max and each element as a subdocument.
+func validateSubdocSlice(fs *FieldSchema, rv reflect.Value, path string) []ValidationError {
+	if rv.Kind() != reflect.Slice && rv.Kind() != reflect.Array {
+		return []ValidationError{{Field: path, Message: fmt.Sprintf("expected an array of subdocuments, got %s", rv.Type())}}
+	}
+	var errs []ValidationError
+	if fs.Min != nil {
+		if err := validateMin(rv, *fs.Min, path); err != nil {
+			errs = append(errs, *err)
+		}
+	}
+	if fs.Max != nil {
+		if err := validateMax(rv, *fs.Max, path); err != nil {
+			errs = append(errs, *err)
+		}
+	}
+	for i := 0; i < rv.Len(); i++ {
+		elem := indirectValue(rv.Index(i))
+		if !elem.IsValid() {
+			continue
+		}
+		errs = append(errs, validateSubdocValue(fs.SubFields, elem, fmt.Sprintf("%s[%d]", path, i))...)
+	}
+	return errs
+}
+
+// validateSubdocValue validates one subdocument given as a struct, bson.D,
+// bson.M, or string-keyed map.
+func validateSubdocValue(fields []FieldSchema, rv reflect.Value, path string) []ValidationError {
+	switch {
+	case rv.Kind() == reflect.Struct:
+		return validateFields(rv, fields, path)
+	case rv.Kind() == reflect.Map && rv.Type().Key().Kind() == reflect.String:
+		get := func(name string) (interface{}, bool) {
+			v := rv.MapIndex(reflect.ValueOf(name).Convert(rv.Type().Key()))
+			if !v.IsValid() {
+				return nil, false
+			}
+			return v.Interface(), true
+		}
+		return validateSubdocFields(fields, get, path)
+	case rv.Type() == reflect.TypeOf(bson.D{}):
+		doc := rv.Interface().(bson.D)
+		get := func(name string) (interface{}, bool) {
+			for _, e := range doc {
+				if e.Key == name {
+					return e.Value, true
+				}
+			}
+			return nil, false
+		}
+		return validateSubdocFields(fields, get, path)
+	default:
+		return []ValidationError{{Field: path, Message: fmt.Sprintf("expected a subdocument, got %s", rv.Type())}}
+	}
+}
+
+// validateSubdocFields applies each field's rules to the value looked up by
+// bson name. Missing fields fail only when required.
+func validateSubdocFields(fields []FieldSchema, get func(string) (interface{}, bool), path string) []ValidationError {
+	var errs []ValidationError
+	for i := range fields {
+		fs := &fields[i]
+		fieldPath := path + "." + fs.BSONName
+		val, ok := get(fs.BSONName)
+		if !ok {
+			if fs.Required {
+				errs = append(errs, ValidationError{Field: fieldPath, Message: "field is required"})
+			}
+			continue
+		}
+		errs = append(errs, validateFieldValue(fs, val, fieldPath, false)...)
 	}
 	return errs
 }
@@ -1158,11 +1277,12 @@ func Delete(ctx context.Context, model interface{}, opts ...DeleteOptions) error
 		return fmt.Errorf("goodm: cannot delete document with zero ID")
 	}
 
-	return runMiddleware(ctx, &OpInfo{
+	info := &OpInfo{
 		Operation: OpDelete, Collection: schema.Collection,
 		ModelName: schema.ModelName, Model: model,
 		Filter: bson.D{{Key: "_id", Value: id}},
-	}, func(ctx context.Context) error {
+	}
+	return runMiddleware(ctx, info, func(ctx context.Context) error {
 		var opt DeleteOptions
 		if len(opts) > 0 {
 			opt = opts[0]
@@ -1180,7 +1300,7 @@ func Delete(ctx context.Context, model interface{}, opts ...DeleteOptions) error
 		}
 
 		coll := getCollection(db, schema)
-		result, err := coll.DeleteOne(ctx, bson.D{{Key: "_id", Value: id}}, deleteOneOptions(opt))
+		result, err := coll.DeleteOne(ctx, andFilter(info.Filter, bson.D{{Key: "_id", Value: id}}), deleteOneOptions(opt))
 		if err != nil {
 			return fmt.Errorf("goodm: delete failed: %w", err)
 		}
@@ -1562,7 +1682,7 @@ func validateUnsetFields(schema *Schema, fields []string) error {
 
 // replaceWithUnset builds the replacement document, strips any unset fields, and
 // performs the ReplaceOne. Returns the number of matched documents.
-func replaceWithUnset(ctx context.Context, coll *mongo.Collection, schema *Schema, filter bson.D, model interface{}, unsetFields []string) (int64, error) {
+func replaceWithUnset(ctx context.Context, coll *mongo.Collection, schema *Schema, filter interface{}, model interface{}, unsetFields []string) (int64, error) {
 	replacement, err := buildReplacement(model, unsetFields)
 	if err != nil {
 		return 0, err

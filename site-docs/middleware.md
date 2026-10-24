@@ -104,8 +104,12 @@ goodm.Use(func(ctx context.Context, op *goodm.OpInfo, next func(context.Context)
     }
     scope := bson.E{Key: "tenant", Value: tenant}
     switch op.Operation {
-    case goodm.OpFind, goodm.OpUpdateMany, goodm.OpDeleteMany:
-        op.Filter = bson.D{scope, {Key: "$and", Value: bson.A{op.Filter}}}
+    case goodm.OpFind, goodm.OpUpdate, goodm.OpDelete, goodm.OpUpdateMany, goodm.OpDeleteMany, goodm.OpSaveMany:
+        if op.Filter == nil {
+            op.Filter = bson.D{scope}
+        } else {
+            op.Filter = bson.D{scope, {Key: "$and", Value: bson.A{op.Filter}}}
+        }
     case goodm.OpAggregate:
         op.Pipeline = append([]bson.D{{{Key: "$match", Value: bson.D{scope}}}}, op.Pipeline...)
     }
@@ -113,7 +117,17 @@ goodm.Use(func(ctx context.Context, op *goodm.OpInfo, next func(context.Context)
 })
 ```
 
-`Update`, `UpdateFields`, and `Delete` always address the model by its `_id`; for them `op.Filter` is informational.
+Which operations honor a rewritten `op.Filter`:
+
+| Operations | Behavior |
+|-----------|----------|
+| `Find`, `FindOne`, `FindByID`, `FindCursor`, `Count`, `Exists`, `Distinct`, `UpdateOne`, `UpdateMany`, `DeleteOne`, `DeleteMany`, `FindOneAndUpdate`, `FindOneAndReplace`, `FindOneAndDelete` | Use `op.Filter` as the query |
+| `Update`, `UpdateFields`, `Delete`, `SaveMany` | AND `op.Filter` with their `_id` (and version) filters; an out-of-scope document is reported as `ErrNotFound` |
+| `Pipeline.Execute`, `Pipeline.Cursor` | Use `op.Pipeline` |
+| `Bulk.Execute` | Not scoped: each queued operation carries its own filter |
+| `Populate`, `BatchPopulate` | Not scoped: no middleware runs |
+
+A tenant guard therefore needs to cover the update and delete op types as well as `OpFind`, and cannot rely on middleware for `Bulk` or `Populate`.
 
 ## Aborting Operations
 

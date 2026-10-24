@@ -3,6 +3,7 @@ package goodm
 import (
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 	"time"
 
@@ -224,8 +225,12 @@ func parseTTL(v string) (*int32, error) {
 	return &secs, nil
 }
 
-// indexKeysEqual compares two index key documents by field, direction, and type.
+// indexKeysEqual compares two index key documents by field, direction, and
+// type. The text fields of a compound text index are compared as a set,
+// because the server reports them in alphabetical order regardless of how
+// the index was declared.
 func indexKeysEqual(a, b bson.D) bool {
+	a, b = canonicalTextKeys(a), canonicalTextKeys(b)
 	if len(a) != len(b) {
 		return false
 	}
@@ -235,6 +240,36 @@ func indexKeysEqual(a, b bson.D) bool {
 		}
 	}
 	return true
+}
+
+// canonicalTextKeys gathers every text key into one alphabetically sorted run
+// placed where the first text key appeared. Non-text keys keep their order.
+func canonicalTextKeys(keys bson.D) bson.D {
+	var text []string
+	for _, k := range keys {
+		if indexKeyString(k.Value) == "text" {
+			text = append(text, k.Key)
+		}
+	}
+	if len(text) < 2 {
+		return keys
+	}
+	sort.Strings(text)
+	out := make(bson.D, 0, len(keys))
+	placed := false
+	for _, k := range keys {
+		if indexKeyString(k.Value) != "text" {
+			out = append(out, k)
+			continue
+		}
+		if !placed {
+			for _, f := range text {
+				out = append(out, bson.E{Key: f, Value: "text"})
+			}
+			placed = true
+		}
+	}
+	return out
 }
 
 // indexKeyString normalizes an index key value (direction int or type string)

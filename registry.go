@@ -40,6 +40,9 @@ func Register(model interface{}, collection string) error {
 	// Parse struct fields (recursively handles subdocuments)
 	schema.Fields = parseFields(t, nil)
 	schema.idField = findIDField(t)
+	if schema.idField == nil {
+		return fmt.Errorf("goodm: model %s has no field tagged bson:\"_id\" (embed goodm.Model or tag an ID field)", schema.QualifiedName())
+	}
 
 	// Check for Indexable interface (compound indexes)
 	if indexable, ok := model.(Indexable); ok {
@@ -228,45 +231,32 @@ func parseFields(t reflect.Type, seen map[reflect.Type]bool) []FieldSchema {
 	return result
 }
 
-// findIDField locates the struct field that maps to "_id", searching through
-// embedded structs. It prefers an explicit bson:"_id" tag and falls back to a
-// field named ID. Returns nil if the struct has no identifiable ID field.
+// findIDField locates the struct field tagged bson:"_id", searching through
+// embedded structs. Returns nil if there is none. A field merely named ID is
+// not accepted: the driver would store it under "id", not "_id".
 func findIDField(t reflect.Type) []int {
-	var fallback []int
-	var walk func(t reflect.Type, prefix []int) []int
-	walk = func(t reflect.Type, prefix []int) []int {
-		for i := 0; i < t.NumField(); i++ {
-			f := t.Field(i)
-			if !f.IsExported() && !f.Anonymous {
-				continue
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if !f.IsExported() && !f.Anonymous {
+			continue
+		}
+		name, _ := ParseBSONTag(f.Tag.Get("bson"))
+		if name == "_id" {
+			return []int{i}
+		}
+		if f.Anonymous {
+			ft := f.Type
+			if ft.Kind() == reflect.Pointer {
+				ft = ft.Elem()
 			}
-			idx := append(append([]int{}, prefix...), i)
-			name, _ := ParseBSONTag(f.Tag.Get("bson"))
-			if name == "_id" {
-				return idx
-			}
-			if f.Anonymous {
-				ft := f.Type
-				if ft.Kind() == reflect.Pointer {
-					ft = ft.Elem()
+			if ft.Kind() == reflect.Struct {
+				if inner := findIDField(ft); inner != nil {
+					return append([]int{i}, inner...)
 				}
-				if ft.Kind() == reflect.Struct {
-					if found := walk(ft, idx); found != nil {
-						return found
-					}
-				}
-				continue
-			}
-			if f.Name == "ID" && fallback == nil {
-				fallback = idx
 			}
 		}
-		return nil
 	}
-	if found := walk(t, nil); found != nil {
-		return found
-	}
-	return fallback
+	return nil
 }
 
 // detectHooks checks which hook interfaces a model implements.

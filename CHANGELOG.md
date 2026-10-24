@@ -7,31 +7,32 @@ All notable changes to this project will be documented in this file.
 This release closes the main MongoDB feature gaps found in a review of 0.6.1 and fixes several correctness bugs. It contains breaking changes; see the end of this entry.
 
 ### Added
-- **Index types and options.** Field tags: `index=-1`, `index=hashed`, `index=text`, `index=2dsphere`, `sparse`, and `ttl=<duration|seconds>`. `CompoundIndex` gained `Sparse`, `Name`, `ExpireAfterSeconds` (with the `TTL(time.Duration)` helper), `PartialFilter`, and `Collation`, and its `Fields` entries accept `-field`, `field:text`, `field:hashed`, and `field:2dsphere` markers. Index tags inside subdocuments now create dotted-path indexes. `Enforce` detects mismatches in sparseness, TTL, partial filter, and collation as well as keys and uniqueness.
+- **Index types and options.** Field tags: `index=-1`, `index=hashed`, `index=text`, `index=2dsphere`, `sparse`, and `ttl=<duration|seconds>`. `CompoundIndex` gained `Sparse`, `Name`, `ExpireAfterSeconds` (with the `TTL(time.Duration)` helper), `PartialFilter`, and `Collation`, and its `Fields` entries accept `-field`, `field:text`, `field:hashed`, and `field:2dsphere` markers. Index tags inside subdocuments now create dotted-path indexes (see Changed). `Enforce` detects mismatches in sparseness, TTL, partial filter, and collation as well as keys and uniqueness; the fields of a compound text index are compared as a set.
 - `Schema.IndexDefinitions()` and the `IndexDefinition` type: the single resolved list of indexes a schema expects. `Enforce`, `Migrate`, and `goodm inspect` all work from it.
 - `Migrate` now plans an `ActionRebuildIndex` for indexes whose options differ from the schema and executes it through the same in-place unique conversion as `Enforce`. `MigrationAction.Definition` carries the expected index.
 - `ErrDuplicateKey` and `*DuplicateKeyError` (with `Collection`, `Index`, and `Fields`) for unique index violations from `Create`, `CreateMany`, `Update`, `UpdateFields`, `UpdateOne`, `UpdateMany`, `FindOneAndUpdate`, `SaveMany`, and `Bulk`.
-- Query layer: `FindByID` (accepts hex strings for ObjectID models), `Count`, `Exists`, `Distinct`, `FindOneAndUpdate`, `FindOneAndReplace`, and `FindOneAndDelete`. `FindOptions` gained `Projection`, `Hint`, `Collation`, and `BatchSize`. `UpdateOptions` gained `Upsert` (with the `Upsert()` shorthand), `ArrayFilters`, `Hint`, and `Collation` for the raw operations; `DeleteOptions` gained `Hint` and `Collation`.
+- Query layer: `FindByID` (accepts hex strings for ObjectID models), `Count`, `Exists`, `Distinct`, `FindOneAndUpdate`, `FindOneAndReplace`, and `FindOneAndDelete`. `FindOneAndUpdate` adds `updated_at`, `__v`, and on upsert `created_at` to `bson.D`/`bson.M` updates; aggregation-pipeline updates are passed through unchanged. `FindOptions` gained `Projection`, `Hint`, `Collation`, and `BatchSize`. `UpdateOptions` gained `Upsert` (with the `Upsert()` shorthand), `ArrayFilters`, `Hint`, and `Collation` for the raw operations; `DeleteOptions` gained `Hint` and `Collation`.
 - `NewBulk`: a builder for heterogeneous `BulkWrite` batches (`InsertOne`, `UpdateOne`, `UpdateMany`, `ReplaceOne`, `DeleteOne`, `DeleteMany`, `Unordered`) with per-operation failure reporting.
 - `SaveMany`: the `Update` lifecycle for a slice of models in one round trip, with per-document version filters and per-index classification of conflicts (`ErrVersionConflict`), missing documents (`ErrNotFound`), and duplicate keys.
 - `*BulkError` with per-item `BulkWriteError` entries and a `Result`; returned by `CreateMany`, `SaveMany`, and `Bulk.Execute`. `errors.Is`/`errors.As` see every item's error.
 - `CreateOptions.Unordered` for `CreateMany`; `AfterCreate` now runs only for models that were actually inserted.
 - `BulkResult.UpsertedCount` and `UpsertedIDs`.
 - Pipeline: `PipelineOptions.AllowDiskUse`, `Collation`, `Hint`, `BatchSize`; stages `UnwindPreserve`, `LookupPipeline`, `Set`, `Unset`, `ReplaceRoot`, `Facet`, `Sample`. `Execute` and `Cursor` run middleware under the new `OpAggregate`.
-- Middleware may now modify `OpInfo.Filter` and the new `OpInfo.Pipeline`; the operation reads them after the chain runs. New op types `OpSaveMany`, `OpAggregate`, `OpBulkWrite`.
+- Middleware may now modify `OpInfo.Filter` and the new `OpInfo.Pipeline`; the operation reads them after the chain runs. Every find, `UpdateOne`, `UpdateMany`, `DeleteOne`, `DeleteMany`, the `FindOneAnd*` family, and aggregation use the rewritten filter directly; `Update`, `UpdateFields`, `Delete`, and `SaveMany` AND it with their `_id` and version filters, reporting out-of-scope documents as `ErrNotFound`. `Bulk` operations carry their own filters and `Populate` runs no middleware, so neither is scoped. New op types `OpSaveMany`, `OpAggregate`, `OpBulkWrite`.
 - Registry: `SchemaOf(model)` resolves by type, `Unregister(model)`, `Schema.Type`, `Schema.PkgPath`, `Schema.QualifiedName()`.
-- Custom `_id` types: the ID field is found by its `bson:"_id"` tag (falling back to a field named `ID`) and may be any type. ObjectIDs are still generated automatically; other types must be set before `Create` or in `BeforeCreate`, and a zero value is rejected.
+- Custom `_id` types: the ID field is the one tagged `bson:"_id"` (through embedded structs) and may be any type. ObjectIDs are still generated automatically; other types must be set before `Create` or in `BeforeCreate`, and a zero value is rejected. `Register` rejects a model with no `_id` field.
 - `TransactionOptions.Transaction` for driver-level transaction options.
-- `goodm discover` records index key directions and kinds, so generated `Indexes()` methods preserve descending and special keys.
+- `goodm discover` reads index key directions and kinds (including the fields of text indexes), sparse, and TTL into field tags, emits struct-literal `Indexes()` entries for indexes with options, and leaves a TODO comment for partial filters and collations it cannot read back.
+- `PlanMigration` plans the indexes of models that share a collection as one set.
 
 ### Fixed
 - `min`/`max` were skipped for zero values, so `min=1` accepted `0`, and floats were truncated to integers before comparison, so `max=10` accepted `10.9` and `min=0` accepted `-0.5`. Bounds now apply to every present value and compare numerically; only a nil pointer is treated as absent.
 - Middleware could not change the filter: operations closed over their original argument. The soft-delete and tenant-scoping patterns in the docs now work.
 - Schemas were keyed by bare struct name, so a second `User` type in another package failed to register and an unregistered type with a registered name silently used the wrong collection. The registry is keyed by `reflect.Type`.
-- `UpdateFields` skipped validation of the values it set, allowed immutable fields to change, rejected dotted paths into subdocuments, and mutated the caller's map.
+- `UpdateFields` skipped validation of the values it set, allowed immutable fields to change, rejected dotted paths into subdocuments, and mutated the caller's map. Subdocument values may be structs, `bson.M`, `bson.D`, or slices of those.
 - `Migrate` reconstructed index keys by parsing index names and compared by name only; it now shares index definitions and mismatch detection with `Enforce`.
 - `Populate` and `BatchPopulate` ignored the referenced model's collection options (read preference and concerns).
-- A nested `WithTransaction` started a second session; it now joins the transaction already in the context.
+- A nested `WithTransaction` started a second session; it now joins the transaction already running in the context's session. A context carrying a session without an active transaction gets a transaction started on that session.
 - The hooks documentation listed the immutable check after `BeforeSave`; it runs before.
 - The `FindOne` family compares driver errors with `errors.Is` instead of `==`.
 
@@ -41,7 +42,8 @@ This release closes the main MongoDB feature gaps found in a review of 0.6.1 and
 - **Breaking:** `FieldSchema.Min` and `Max` are `*float64`.
 - **Breaking:** `CreateMany` returns a `*BulkError` for write failures instead of a wrapped driver error, and unique violations everywhere are `*DuplicateKeyError` (the driver error remains reachable through `errors.As`).
 - **Breaking:** `Pipeline.Execute` and `Pipeline.Cursor` now run middleware.
-- **Breaking:** validation of `min`/`max` no longer skips zero values (see Fixed). Optional bounded fields should be pointers.
+- **Breaking:** validation of `min`/`max` no longer skips zero values (see Fixed), and the bounds now apply to the length of slices and maps as well as strings, so a nil slice tagged `min=1` fails. Optional bounded fields should be pointers.
+- **Breaking:** `unique`, `index`, `sparse`, and `ttl` tags on fields inside subdocuments were silently ignored before and now create real (dotted-path, multikey) indexes. A `unique` tag inside an array of subdocuments indexes every element, and documents whose array is empty or missing all index as `null` and collide with each other; use `unique,sparse` or a partial filter for such fields, and expect `Enforce` to fail if existing data already violates the new index.
 - **Breaking:** `UpdateFields` now returns `ValidationErrors` for values that violate the schema or target immutable fields.
 - `IndexSpec` gained `ExpireAfterSeconds`, `PartialFilter`, and `Collation`; text indexes report their keys as `field: "text"`.
 - Minimum Go version is 1.21.
