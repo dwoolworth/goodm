@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/dwoolworth/goodm/internal"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
@@ -469,19 +471,23 @@ func Update(ctx context.Context, model interface{}, opts ...UpdateOptions) error
 		return err
 	}
 
-	return runMiddleware(ctx, &OpInfo{
+	// Middleware may replace info.Filter (e.g. to scope by tenant); it is
+	// ANDed with the _id and version filters of every read and write below.
+	base := bson.D{{Key: "_id", Value: id}}
+	info := &OpInfo{
 		Operation: OpUpdate, Collection: schema.Collection,
-		ModelName: schema.ModelName, Model: model,
-		Filter: bson.D{{Key: "_id", Value: id}},
-	}, func(ctx context.Context) error {
+		ModelName: schema.ModelName, Model: model, Filter: base,
+	}
+	return runMiddleware(ctx, info, func(ctx context.Context) error {
 		db, err := getDB(opt.DB)
 		if err != nil {
 			return err
 		}
 
 		coll := getCollection(db, schema)
+		scope := middlewareScope(info, base)
 
-		if err := checkImmutableFields(ctx, coll, id, model, schema); err != nil {
+		if err := checkImmutableFields(ctx, coll, scope, id, model, schema); err != nil {
 			return err
 		}
 
@@ -498,7 +504,7 @@ func Update(ctx context.Context, model interface{}, opts ...UpdateOptions) error
 		}
 
 		// Save with optional retry-with-merge on version conflict.
-		if err := saveWithRetry(ctx, coll, schema, model, opt, id); err != nil {
+		if err := saveWithRetry(ctx, coll, schema, model, opt, id, scope); err != nil {
 			return err
 		}
 
@@ -515,12 +521,12 @@ func Update(ctx context.Context, model interface{}, opts ...UpdateOptions) error
 
 // checkImmutableFields verifies that immutable fields have not been modified.
 // Skips the check entirely if no fields are marked immutable.
-func checkImmutableFields(ctx context.Context, coll *mongo.Collection, id interface{}, model interface{}, schema *Schema) error {
+func checkImmutableFields(ctx context.Context, coll *mongo.Collection, scope interface{}, id interface{}, model interface{}, schema *Schema) error {
 	if !hasImmutableFields(schema) {
 		return nil
 	}
 	existing := reflect.New(reflect.TypeOf(model).Elem()).Interface()
-	if err := coll.FindOne(ctx, bson.D{{Key: "_id", Value: id}}).Decode(existing); err != nil {
+	if err := coll.FindOne(ctx, andFilter(scope, bson.D{{Key: "_id", Value: id}})).Decode(existing); err != nil {
 		if errors.Is(err, mongo.ErrNoDocuments) {
 			return ErrNotFound
 		}
@@ -550,10 +556,45 @@ func buildVersionFilter(id interface{}, oldVersion int) bson.D {
 	}
 }
 
-// checkUpdateConflict disambiguates between a missing document and a version conflict
-// when an update matched zero documents.
-func checkUpdateConflict(ctx context.Context, coll *mongo.Collection, id interface{}) error {
-	count, err := coll.CountDocuments(ctx, bson.D{{Key: "_id", Value: id}})
+// andFilter ANDs a middleware-supplied scope filter into filter. A nil,
+// typed-nil, or empty scope leaves filter unchanged.
+func andFilter(scope interface{}, filter bson.D) interface{} {
+	if isEmptyFilter(scope) {
+		return filter
+	}
+	return bson.D{{Key: "$and", Value: bson.A{scope, filter}}}
+}
+
+// isEmptyFilter reports whether a filter value is nil, a typed nil, or an
+// empty document.
+func isEmptyFilter(f interface{}) bool {
+	if f == nil {
+		return true
+	}
+	v := reflect.ValueOf(f)
+	switch v.Kind() {
+	case reflect.Slice, reflect.Map:
+		return v.IsNil() || v.Len() == 0
+	case reflect.Pointer, reflect.Interface:
+		return v.IsNil()
+	}
+	return false
+}
+
+// middlewareScope returns the filter middleware left in info, or nil when it
+// is still the base filter the operation started with, so an untouched
+// operation keeps its plain _id query.
+func middlewareScope(info *OpInfo, base bson.D) interface{} {
+	if reflect.DeepEqual(info.Filter, base) {
+		return nil
+	}
+	return info.Filter
+}
+
+// checkUpdateConflict disambiguates between a missing (or out-of-scope)
+// document and a version conflict when an update matched zero documents.
+func checkUpdateConflict(ctx context.Context, coll *mongo.Collection, scope interface{}, id interface{}) error {
+	count, err := coll.CountDocuments(ctx, andFilter(scope, bson.D{{Key: "_id", Value: id}}))
 	if err != nil {
 		return fmt.Errorf("goodm: update failed: %w", err)
 	}
@@ -572,8 +613,11 @@ func checkUpdateConflict(ctx context.Context, coll *mongo.Collection, id interfa
 //
 // fields maps bson field names to their new values. Dotted paths into
 // subdocuments and array elements are allowed ("address.city", "items.0.qty").
-// Each value is validated against the field's schema (required, enum, min,
-// max), and immutable fields are rejected. The caller's map is not modified.
+// Each value is converted to the field's Go type (see convertValue for the
+// conversions allowed) and validated against the field's schema (required,
+// enum, min, max); the path must exist on the model, so an index past the end
+// of a slice is rejected. Immutable fields are rejected. The caller's map is
+// not modified.
 //
 //	err := goodm.UpdateFields(ctx, &task, bson.M{"step": 5, "tokens_used": 12000})
 func UpdateFields(ctx context.Context, model interface{}, fields bson.M, opts ...UpdateOptions) error {
@@ -590,15 +634,17 @@ func UpdateFields(ctx context.Context, model interface{}, fields bson.M, opts ..
 		return fmt.Errorf("goodm: cannot update document with zero ID")
 	}
 
-	if err := validateUpdateFields(schema, fields); err != nil {
+	values, stored, err := prepareUpdateFields(schema, model, fields)
+	if err != nil {
 		return err
 	}
 
-	return runMiddleware(ctx, &OpInfo{
+	base := bson.D{{Key: "_id", Value: id}}
+	info := &OpInfo{
 		Operation: OpUpdate, Collection: schema.Collection,
-		ModelName: schema.ModelName, Model: model,
-		Filter: bson.D{{Key: "_id", Value: id}},
-	}, func(ctx context.Context) error {
+		ModelName: schema.ModelName, Model: model, Filter: base,
+	}
+	return runMiddleware(ctx, info, func(ctx context.Context) error {
 		var optDB *mongo.Database
 		if len(opts) > 0 {
 			optDB = opts[0].DB
@@ -608,9 +654,10 @@ func UpdateFields(ctx context.Context, model interface{}, fields bson.M, opts ..
 			return err
 		}
 
-		// Work on a copy so the caller's map is left untouched.
-		set := make(bson.M, len(fields)+1)
-		for k, v := range fields {
+		// Send the converted values (not the caller's map, which is left
+		// untouched) so the stored document matches what the model will hold.
+		set := make(bson.M, len(stored)+1)
+		for k, v := range stored {
 			set[k] = v
 		}
 		now := time.Now()
@@ -618,7 +665,7 @@ func UpdateFields(ctx context.Context, model interface{}, fields bson.M, opts ..
 		oldVersion, _ := getModelVersion(model)
 
 		coll := getCollection(db, schema)
-		result, err := coll.UpdateOne(ctx, bson.D{{Key: "_id", Value: id}}, bson.D{
+		result, err := coll.UpdateOne(ctx, andFilter(middlewareScope(info, base), base), bson.D{
 			{Key: "$set", Value: set},
 			{Key: "$inc", Value: bson.D{{Key: "__v", Value: 1}}},
 		})
@@ -632,48 +679,604 @@ func UpdateFields(ctx context.Context, model interface{}, fields bson.M, opts ..
 		// Reflect the changes back onto the struct
 		setUpdatedAt(model, now)
 		setModelVersion(model, oldVersion+1)
-		applyFieldsToModel(model, fields)
+		applyFieldsToModel(model, values)
 
 		return nil
 	})
 }
 
-// validateUpdateFields checks that every key in fields is a known, mutable,
-// non-managed schema field and that its value satisfies the field's rules.
-func validateUpdateFields(schema *Schema, fields bson.M) error {
+// prepareUpdateFields checks that every key in fields is a known, mutable,
+// non-managed schema field whose path exists on the model, converts each
+// value to the field's Go type, and validates it. The returned values are
+// copied onto the model after the write; the matching stored values are
+// returned separately (a nil stays a BSON null).
+func prepareUpdateFields(schema *Schema, model interface{}, fields bson.M) (values map[string]reflect.Value, stored bson.M, err error) {
 	var errs ValidationErrors
+	values = make(map[string]reflect.Value, len(fields))
+	stored = make(bson.M, len(fields))
+	root := reflect.ValueOf(model)
+	if root.Kind() == reflect.Pointer {
+		root = root.Elem()
+	}
 	for name, val := range fields {
 		if managedFields[name] {
-			return fmt.Errorf("goodm: cannot set managed field %q via UpdateFields", name)
+			return nil, nil, fmt.Errorf("goodm: cannot set managed field %q via UpdateFields", name)
 		}
-		fs, immutable := resolveFieldPath(schema, name)
+		fs, immutable, isElement := resolveFieldPath(schema, name)
 		if fs == nil {
-			return fmt.Errorf("goodm: unknown field %q in %s", name, schema.ModelName)
+			return nil, nil, fmt.Errorf("goodm: unknown field %q in %s", name, schema.ModelName)
 		}
 		if immutable {
-			return ValidationErrors{{Field: name, Message: "field is immutable and cannot be changed"}}
+			return nil, nil, ValidationErrors{{Field: name, Message: "field is immutable and cannot be changed"}}
 		}
-		errs = append(errs, validateFieldValue(fs, val, name)...)
+		if _, ok := walkPath(root, name); !ok {
+			errs = append(errs, ValidationError{Field: name, Message: "path does not exist on the model (index out of range or nil subdocument)"})
+			continue
+		}
+		target := fs.goType
+		if isElement {
+			target = target.Elem()
+		}
+		v, err := convertValue(val, target)
+		if err != nil {
+			errs = append(errs, ValidationError{Field: name, Message: fmt.Sprintf("cannot assign %T to %s: %v", val, target, err)})
+			continue
+		}
+		if isElement {
+			errs = append(errs, validateSliceElement(v, fs, name)...)
+		} else {
+			errs = append(errs, validateOneField(v, fs, name)...)
+		}
+		values[name] = v
+		if isNilValue(val) {
+			stored[name] = nil
+		} else {
+			stored[name] = v.Interface()
+		}
 	}
 	if len(errs) > 0 {
-		return errs
+		return nil, nil, errs
 	}
-	return nil
+	return values, stored, nil
 }
 
-// resolveFieldPath walks a dotted bson path through the schema, skipping
-// numeric array-index segments. It returns the leaf field and whether the
-// leaf or any ancestor is immutable; the field is nil if the path is unknown.
-func resolveFieldPath(schema *Schema, path string) (*FieldSchema, bool) {
+// isNilValue reports whether val is nil or a typed nil pointer/interface.
+func isNilValue(val interface{}) bool {
+	if val == nil {
+		return true
+	}
+	rv := reflect.ValueOf(val)
+	switch rv.Kind() {
+	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice:
+		return rv.IsNil()
+	}
+	return false
+}
+
+// walkPath follows a dotted path from root and reports whether it addresses
+// a settable value. A segment declared by a nil inline pointer embed is still
+// a top-level key of the document, so from there the rest of the path is
+// checked against the types alone; applyFieldsToModel allocates the embed
+// after the write.
+func walkPath(root reflect.Value, path string) (reflect.Value, bool) {
+	segs := strings.Split(path, ".")
+	target := root
+	for i, seg := range segs {
+		next, ok := stepInto(target, seg)
+		if ok {
+			target = next
+			continue
+		}
+		cur := target
+		if cur.Kind() == reflect.Pointer && !cur.IsNil() {
+			cur = cur.Elem()
+		}
+		if cur.Kind() == reflect.Struct && typePathExists(cur.Type(), segs[i:]) {
+			return reflect.Value{}, true
+		}
+		return reflect.Value{}, false
+	}
+	return target, target.IsValid() && target.CanSet()
+}
+
+// typePathExists reports whether a dotted path can be resolved on a type
+// whose value is entirely zero (it sits behind a nil inline embed), meaning
+// none of its fields exist in the stored document either. The path may only
+// pass through struct values and inline embeds: a numeric segment on an
+// absent array makes the server create an object in its place, and a nil
+// pointer cannot be descended into. The last segment may name anything.
+func typePathExists(t reflect.Type, segs []string) bool {
+	for i, seg := range segs {
+		last := i == len(segs)-1
+		if t.Kind() == reflect.Pointer {
+			if i > 0 {
+				return false // a nil pointer on the path
+			}
+			t = t.Elem()
+		}
+		if t.Kind() != reflect.Struct {
+			return false // arrays, slices, maps, scalars: absent, nothing to descend into
+		}
+		var found *reflect.StructField
+		for _, f := range internal.StructFields(t) {
+			if bsonFieldName(f) == seg {
+				f := f
+				found = &f
+				break
+			}
+		}
+		if found == nil {
+			return false
+		}
+		t = found.Type
+		if !last && t.Kind() == reflect.Pointer {
+			return false
+		}
+	}
+	return true
+}
+
+// convertValue converts a caller-supplied value to a field's Go type. Only
+// conversions that preserve meaning are allowed: a value of the right type;
+// numbers to numbers of another width when the value is representable;
+// documents (structs, bson.D, bson.M, string-keyed maps) to structs and
+// maps, matched by bson name with undeclared keys dropped; arrays to slices
+// and arrays, element by element; hex strings to ObjectIDs; and anything
+// into an interface{} field. nil becomes the zero value.
+func convertValue(val interface{}, t reflect.Type) (reflect.Value, error) {
+	if isNilValue(val) {
+		return reflect.Zero(t), nil
+	}
+	rv := reflect.ValueOf(val)
+	for rv.Kind() == reflect.Interface || rv.Kind() == reflect.Pointer {
+		if rv.IsNil() {
+			return reflect.Zero(t), nil // a pointer chain ending in nil is nil
+		}
+		rv = rv.Elem()
+	}
+	if !rv.IsValid() {
+		return reflect.Zero(t), nil
+	}
+
+	if t.Kind() == reflect.Pointer {
+		inner, err := convertValue(val, t.Elem())
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		ptr := reflect.New(t.Elem())
+		ptr.Elem().Set(inner)
+		return ptr, nil
+	}
+	if (rv.Kind() == reflect.Float32 || rv.Kind() == reflect.Float64) && math.IsNaN(rv.Float()) {
+		return reflect.Value{}, fmt.Errorf("NaN is not a value")
+	}
+	if rv.Type().AssignableTo(t) {
+		return rv, nil
+	}
+	if t.Kind() == reflect.Interface {
+		return rv, nil
+	}
+
+	switch valueClass(t) {
+	case classNumber:
+		if valueClass(rv.Type()) != classNumber {
+			return reflect.Value{}, fmt.Errorf("not a number")
+		}
+		return convertNumber(rv, t)
+	case classBSOND:
+		pairs, err := documentPairs(rv)
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		return reflect.ValueOf(pairs).Convert(t), nil
+	case classString:
+		if rv.Kind() != reflect.String {
+			return reflect.Value{}, fmt.Errorf("not a string")
+		}
+		return rv.Convert(t), nil
+	case classBool:
+		if rv.Kind() != reflect.Bool {
+			return reflect.Value{}, fmt.Errorf("not a bool")
+		}
+		return rv.Convert(t), nil
+	case classObjectID:
+		if rv.Kind() == reflect.String {
+			oid, err := bson.ObjectIDFromHex(rv.String())
+			if err != nil {
+				return reflect.Value{}, err
+			}
+			return reflect.ValueOf(oid).Convert(t), nil
+		}
+		if valueClass(rv.Type()) == classObjectID {
+			return rv.Convert(t), nil
+		}
+		return reflect.Value{}, fmt.Errorf("not an ObjectID")
+	case classTime:
+		if rv.Type() == dateTimeType {
+			return reflect.ValueOf(rv.Interface().(bson.DateTime).Time()).Convert(t), nil
+		}
+		if valueClass(rv.Type()) == classTime && rv.Type().ConvertibleTo(t) {
+			return rv.Convert(t), nil
+		}
+		return reflect.Value{}, fmt.Errorf("not a time.Time")
+	case classBinary:
+		if t == bsonBinaryType && rv.Kind() == reflect.Slice && rv.Type().Elem().Kind() == reflect.Uint8 {
+			return reflect.ValueOf(bson.Binary{Data: rv.Bytes()}), nil
+		}
+		if rv.Type() == bsonBinaryType {
+			bin := rv.Interface().(bson.Binary)
+			if t == bsonBinaryType {
+				return rv, nil
+			}
+			if bin.Subtype != 0 && bin.Subtype != 2 {
+				return reflect.Value{}, fmt.Errorf("binary subtype %d does not convert to %s", bin.Subtype, t)
+			}
+			if !reflect.TypeOf(bin.Data).ConvertibleTo(t) {
+				return reflect.Value{}, fmt.Errorf("binary data does not convert to %s", t)
+			}
+			return reflect.ValueOf(bin.Data).Convert(t), nil
+		}
+		if valueClass(rv.Type()) == classBinary && rv.Type().ConvertibleTo(t) {
+			return rv.Convert(t), nil
+		}
+		return reflect.Value{}, fmt.Errorf("not a byte slice")
+	case classDecimal:
+		if valueClass(rv.Type()) == classDecimal && rv.Type().ConvertibleTo(t) {
+			return rv.Convert(t), nil
+		}
+		return reflect.Value{}, fmt.Errorf("not a Decimal128")
+	case classDocument:
+		return convertDocument(rv, t)
+	case classArray:
+		return convertArray(rv, t)
+	}
+	return reflect.Value{}, fmt.Errorf("unsupported field type %s", t)
+}
+
+type typeClass int
+
+const (
+	classOther typeClass = iota
+	classNumber
+	classString
+	classBool
+	classTime
+	classObjectID
+	classDecimal
+	classBinary
+	classDocument
+	classArray
+	classBSOND // a bson.D field: an ordered document that accepts any document source
+)
+
+var (
+	timeType       = reflect.TypeOf(time.Time{})
+	dateTimeType   = reflect.TypeOf(bson.DateTime(0))
+	objectIDType   = reflect.TypeOf(bson.ObjectID{})
+	decimalType    = reflect.TypeOf(bson.Decimal128{})
+	bsonBinaryType = reflect.TypeOf(bson.Binary{})
+	bsonDType      = reflect.TypeOf(bson.D{})
+	bsonEType      = reflect.TypeOf(bson.E{})
+	bsonRawType    = reflect.TypeOf(bson.Raw{})
+)
+
+// bsonScalarStructs are struct types that encode as BSON scalars, so they
+// are never documents.
+var bsonScalarStructs = map[reflect.Type]bool{
+	reflect.TypeOf(bson.Regex{}):         true,
+	reflect.TypeOf(bson.Timestamp{}):     true,
+	reflect.TypeOf(bson.Undefined{}):     true,
+	reflect.TypeOf(bson.Null{}):          true,
+	reflect.TypeOf(bson.MinKey{}):        true,
+	reflect.TypeOf(bson.MaxKey{}):        true,
+	reflect.TypeOf(bson.CodeWithScope{}): true,
+	reflect.TypeOf(bson.DBPointer{}):     true,
+}
+
+// valueClass groups Go types by the BSON shape they take.
+func valueClass(t reflect.Type) typeClass {
+	if bsonScalarStructs[t] {
+		return classOther
+	}
+	switch {
+	case t == timeType, t == dateTimeType:
+		return classTime
+	case t == objectIDType:
+		return classObjectID
+	case t == decimalType:
+		return classDecimal
+	case t == bsonBinaryType || (t.Kind() == reflect.Slice && t.Elem().Kind() == reflect.Uint8):
+		return classBinary
+	case t == bsonDType:
+		return classBSOND
+	case t == bsonRawType:
+		return classDocument
+	}
+	switch t.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Float32, reflect.Float64:
+		return classNumber
+	case reflect.String:
+		return classString
+	case reflect.Bool:
+		return classBool
+	case reflect.Struct, reflect.Map:
+		return classDocument
+	case reflect.Slice:
+		if t.Elem() == bsonEType {
+			return classBSOND
+		}
+		return classArray
+	case reflect.Array:
+		return classArray
+	}
+	return classOther
+}
+
+// convertNumber converts between numeric kinds, rejecting values the target
+// cannot represent: fractions into integers, negatives into unsigned,
+// overflow, and infinities.
+func convertNumber(rv reflect.Value, t reflect.Type) (reflect.Value, error) {
+	out := reflect.New(t).Elem()
+	switch {
+	case out.CanInt():
+		var n int64
+		switch {
+		case rv.CanInt():
+			n = rv.Int()
+		case rv.CanUint():
+			if rv.Uint() > math.MaxInt64 {
+				return reflect.Value{}, fmt.Errorf("value overflows %s", t)
+			}
+			n = int64(rv.Uint())
+		default:
+			f := rv.Float()
+			if f != math.Trunc(f) || math.IsInf(f, 0) || math.IsNaN(f) {
+				return reflect.Value{}, fmt.Errorf("value %v is not an integer", f)
+			}
+			if f < -0x1p63 || f >= 0x1p63 { // float64(MaxInt64) rounds up to 2^63
+				return reflect.Value{}, fmt.Errorf("value overflows %s", t)
+			}
+			n = int64(f)
+		}
+		if out.OverflowInt(n) {
+			return reflect.Value{}, fmt.Errorf("value %d overflows %s", n, t)
+		}
+		out.SetInt(n)
+	case out.CanUint():
+		var n uint64
+		switch {
+		case rv.CanUint():
+			n = rv.Uint()
+		case rv.CanInt():
+			if rv.Int() < 0 {
+				return reflect.Value{}, fmt.Errorf("value %d is negative", rv.Int())
+			}
+			n = uint64(rv.Int())
+		default:
+			f := rv.Float()
+			if f != math.Trunc(f) || math.IsInf(f, 0) || math.IsNaN(f) || f < 0 {
+				return reflect.Value{}, fmt.Errorf("value %v is not a non-negative integer", f)
+			}
+			if f >= 0x1p64 {
+				return reflect.Value{}, fmt.Errorf("value overflows %s", t)
+			}
+			n = uint64(f)
+		}
+		if out.OverflowUint(n) {
+			return reflect.Value{}, fmt.Errorf("value %d overflows %s", n, t)
+		}
+		out.SetUint(n)
+	default: // float target
+		var f float64
+		switch {
+		case rv.CanInt():
+			f = float64(rv.Int())
+			if f >= 0x1p63 || int64(f) != rv.Int() {
+				return reflect.Value{}, fmt.Errorf("value %d is not exactly representable as %s", rv.Int(), t)
+			}
+		case rv.CanUint():
+			f = float64(rv.Uint())
+			if f >= 0x1p64 || uint64(f) != rv.Uint() {
+				return reflect.Value{}, fmt.Errorf("value %d is not exactly representable as %s", rv.Uint(), t)
+			}
+		default:
+			f = rv.Float()
+			if math.IsNaN(f) {
+				return reflect.Value{}, fmt.Errorf("NaN is not a value")
+			}
+		}
+		if out.OverflowFloat(f) {
+			return reflect.Value{}, fmt.Errorf("value %v overflows %s", f, t)
+		}
+		if t.Kind() == reflect.Float32 && (rv.CanInt() || rv.CanUint()) && float64(float32(f)) != f {
+			return reflect.Value{}, fmt.Errorf("value %v is not exactly representable as %s", f, t)
+		}
+		out.SetFloat(f)
+	}
+	return out, nil
+}
+
+// convertDocument converts a struct, bson.D, bson.M, or string-keyed map into
+// a struct or map type by bson field name.
+func convertDocument(rv reflect.Value, t reflect.Type) (reflect.Value, error) {
+	pairs, err := documentPairs(rv)
+	if err != nil {
+		return reflect.Value{}, err
+	}
+	out := reflect.New(t).Elem()
+	switch t.Kind() {
+	case reflect.Struct:
+		for _, p := range pairs {
+			f := fieldByBSONName(out, p.Key, true)
+			if !f.IsValid() || !f.CanSet() {
+				continue // undeclared key: dropped, as Update drops it
+			}
+			v, err := convertValue(p.Value, f.Type())
+			if err != nil {
+				return reflect.Value{}, fmt.Errorf("%s: %w", p.Key, err)
+			}
+			f.Set(v)
+		}
+	case reflect.Map:
+		if t.Key().Kind() != reflect.String {
+			return reflect.Value{}, fmt.Errorf("map keys must be strings")
+		}
+		out = reflect.MakeMapWithSize(t, len(pairs))
+		for _, p := range pairs {
+			v, err := convertValue(p.Value, t.Elem())
+			if err != nil {
+				return reflect.Value{}, fmt.Errorf("%s: %w", p.Key, err)
+			}
+			out.SetMapIndex(reflect.ValueOf(p.Key).Convert(t.Key()), v)
+		}
+	default:
+		return reflect.Value{}, fmt.Errorf("not a document type")
+	}
+	return out, nil
+}
+
+// documentPairs flattens a document-shaped value into key/value pairs. Struct
+// sources are read field by field through reflection (not marshaled), so
+// their values keep their Go types.
+func documentPairs(rv reflect.Value) (bson.D, error) {
+	switch {
+	case rv.Type() == bsonDType || (rv.Kind() == reflect.Slice && rv.Type().Elem() == bsonEType):
+		out := make(bson.D, rv.Len())
+		for i := range out {
+			out[i] = rv.Index(i).Interface().(bson.E)
+		}
+		return out, nil
+	case rv.Kind() == reflect.Map && rv.Type().Key().Kind() == reflect.String:
+		out := make(bson.D, 0, rv.Len())
+		iter := rv.MapRange()
+		for iter.Next() {
+			out = append(out, bson.E{Key: iter.Key().String(), Value: iter.Value().Interface()})
+		}
+		return out, nil
+	case rv.Type() == bsonRawType:
+		var out bson.D
+		if err := bson.Unmarshal(rv.Interface().(bson.Raw), &out); err != nil {
+			return nil, err
+		}
+		return out, nil
+	case rv.Kind() == reflect.Struct && valueClass(rv.Type()) == classDocument:
+		return structPairs(rv), nil
+	}
+	return nil, fmt.Errorf("not a document")
+}
+
+// structPairs lists a struct's fields by bson name as the driver would
+// encode them: exported fields only, inline embeds flattened, fields tagged
+// "-" skipped, and omitempty fields skipped when zero.
+func structPairs(v reflect.Value) bson.D {
+	var out bson.D
+	t := v.Type()
+	for i := 0; i < t.NumField(); i++ {
+		sf := t.Field(i)
+		if !sf.IsExported() {
+			continue
+		}
+		f := v.Field(i)
+		if internal.IsInlineStruct(sf) {
+			if f.Kind() == reflect.Pointer {
+				if f.IsNil() {
+					continue
+				}
+				f = f.Elem()
+			}
+			out = append(out, structPairs(f)...)
+			continue
+		}
+		if bsonTagInline(sf.Tag.Get("bson")) && f.Kind() == reflect.Map && f.Type().Key().Kind() == reflect.String {
+			// An inline map's entries are stored beside the struct's fields.
+			iter := f.MapRange()
+			for iter.Next() {
+				out = append(out, bson.E{Key: iter.Key().String(), Value: iter.Value().Interface()})
+			}
+			continue
+		}
+		name := bsonFieldName(sf)
+		if name == "-" {
+			continue
+		}
+		if internal.HasOmitEmpty(sf.Tag.Get("bson")) && f.IsZero() {
+			continue
+		}
+		out = append(out, bson.E{Key: name, Value: f.Interface()})
+	}
+	return out
+}
+
+// convertArray converts a slice or array element by element. A fixed-size
+// target array accepts at most its length and is zero-padded.
+func convertArray(rv reflect.Value, t reflect.Type) (reflect.Value, error) {
+	if rv.Kind() != reflect.Slice && rv.Kind() != reflect.Array {
+		return reflect.Value{}, fmt.Errorf("not an array")
+	}
+	if rv.Type() == bsonDType || (rv.Kind() == reflect.Slice && rv.Type().Elem() == bsonEType) {
+		return reflect.Value{}, fmt.Errorf("a document is not an array")
+	}
+	n := rv.Len()
+	var out reflect.Value
+	switch t.Kind() {
+	case reflect.Slice:
+		out = reflect.MakeSlice(t, n, n)
+	case reflect.Array:
+		if n > t.Len() {
+			return reflect.Value{}, fmt.Errorf("%d elements do not fit in %s", n, t)
+		}
+		out = reflect.New(t).Elem()
+	default:
+		return reflect.Value{}, fmt.Errorf("not an array type")
+	}
+	for i := 0; i < n; i++ {
+		v, err := convertValue(rv.Index(i).Interface(), t.Elem())
+		if err != nil {
+			return reflect.Value{}, fmt.Errorf("[%d]: %w", i, err)
+		}
+		out.Index(i).Set(v)
+	}
+	return out, nil
+}
+
+// validateSliceElement validates one element of a slice field: a subdocument
+// element is validated by its inner fields; scalar elements have no rules.
+func validateSliceElement(v reflect.Value, fs *FieldSchema, path string) []ValidationError {
+	if len(fs.SubFields) == 0 {
+		return nil
+	}
+	if v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return nil
+		}
+		v = v.Elem()
+	}
+	if v.Kind() != reflect.Struct {
+		return nil
+	}
+	return validateFields(v, fs.SubFields, path)
+}
+
+// resolveFieldPath walks a dotted bson path through the schema. A numeric
+// segment after a slice or array field selects one element. It returns the
+// leaf field, whether the leaf or any ancestor is immutable, and whether the
+// path ends on an element rather than the field itself; the field is nil if
+// the path is unknown.
+func resolveFieldPath(schema *Schema, path string) (field *FieldSchema, immutable, isElement bool) {
 	fields := schema.Fields
 	var leaf *FieldSchema
-	immutable := false
 	for _, seg := range strings.Split(path, ".") {
-		if _, err := strconv.Atoi(seg); err == nil && leaf != nil && leaf.IsSlice {
+		if n, err := strconv.Atoi(seg); err == nil && leaf != nil && !isElement && isSliceField(leaf) {
+			if n < 0 {
+				return nil, false, false
+			}
+			isElement = true
 			continue
 		}
 		if fields == nil {
-			return nil, false
+			return nil, false, false
 		}
 		var next *FieldSchema
 		for i := range fields {
@@ -683,75 +1286,63 @@ func resolveFieldPath(schema *Schema, path string) (*FieldSchema, bool) {
 			}
 		}
 		if next == nil {
-			return nil, false
+			return nil, false, false
 		}
 		leaf = next
+		isElement = false
 		immutable = immutable || next.Immutable
 		fields = next.SubFields
 	}
-	return leaf, immutable
+	return leaf, immutable, isElement
 }
 
-// validateFieldValue checks one value against a field's required, enum, min,
-// max, and subdocument rules.
-func validateFieldValue(fs *FieldSchema, val interface{}, path string) []ValidationError {
-	if val == nil {
-		if fs.Required {
-			return []ValidationError{{Field: path, Message: "field is required"}}
-		}
-		return nil
+// isSliceField reports whether a schema field holds a slice or array.
+func isSliceField(fs *FieldSchema) bool {
+	if fs.goType == nil {
+		return fs.IsSlice || strings.HasPrefix(fs.Type, "[]")
 	}
-	rv := reflect.ValueOf(val)
-	var errs []ValidationError
-	if fs.Required && rv.IsZero() {
-		errs = append(errs, ValidationError{Field: path, Message: "field is required"})
-	}
-	if len(fs.Enum) > 0 && !rv.IsZero() {
-		if err := validateEnum(rv, fs.Enum, path); err != nil {
-			errs = append(errs, *err)
-		}
-	}
-	if !isNilPointer(rv) {
-		if fs.Min != nil {
-			if err := validateMin(rv, *fs.Min, path); err != nil {
-				errs = append(errs, *err)
-			}
-		}
-		if fs.Max != nil {
-			if err := validateMax(rv, *fs.Max, path); err != nil {
-				errs = append(errs, *err)
-			}
-		}
-	}
-	if len(fs.SubFields) > 0 {
-		errs = append(errs, validateSubFields(rv, *fs, path)...)
-	}
-	return errs
+	k := fs.goType.Kind()
+	return k == reflect.Slice || k == reflect.Array
 }
 
-// applyFieldsToModel reflects $set values back onto the Go struct so the caller
-// sees the updated state without a re-read. Dotted paths are followed through
-// nested structs, pointers, and slice indices; values that cannot be assigned
-// are skipped.
-func applyFieldsToModel(model interface{}, fields bson.M) {
+// applyFieldsToModel copies the converted values onto the Go struct so the
+// caller sees the updated state without a re-read. Dotted paths are followed
+// through nested structs, pointers, and slice indices; a path that cannot be
+// reached on the current model (e.g. an index past the end of a slice) is
+// skipped.
+func applyFieldsToModel(model interface{}, values map[string]reflect.Value) {
 	root := reflect.ValueOf(model)
 	if root.Kind() == reflect.Pointer {
 		root = root.Elem()
 	}
-	for path, val := range fields {
+	for path, val := range values {
 		target := root
 		ok := true
 		for _, seg := range strings.Split(path, ".") {
-			target, ok = stepInto(target, seg)
+			target, ok = stepIntoAlloc(target, seg)
 			if !ok {
 				break
 			}
 		}
-		if !ok || !target.CanSet() {
+		if !ok || !target.CanSet() || !val.Type().AssignableTo(target.Type()) {
 			continue
 		}
-		assignValue(target, val)
+		target.Set(val)
 	}
+}
+
+// stepIntoAlloc is stepInto for a write that has already happened: a nil
+// inline pointer embed declaring the segment is allocated so the value can
+// be copied onto the model.
+func stepIntoAlloc(v reflect.Value, seg string) (reflect.Value, bool) {
+	if v.Kind() == reflect.Pointer && !v.IsNil() {
+		v = v.Elem()
+	}
+	if v.Kind() == reflect.Struct {
+		f := fieldByBSONName(v, seg, true)
+		return f, f.IsValid()
+	}
+	return stepInto(v, seg)
 }
 
 // stepInto resolves one path segment from v: a bson field name on a struct or
@@ -765,7 +1356,7 @@ func stepInto(v reflect.Value, seg string) (reflect.Value, bool) {
 	}
 	switch v.Kind() {
 	case reflect.Struct:
-		f := fieldByBSONName(v, seg)
+		f := fieldByBSONName(v, seg, false)
 		return f, f.IsValid()
 	case reflect.Slice, reflect.Array:
 		i, err := strconv.Atoi(seg)
@@ -777,56 +1368,93 @@ func stepInto(v reflect.Value, seg string) (reflect.Value, bool) {
 	return v, false
 }
 
-// fieldByBSONName finds the struct field whose bson name matches, descending
-// into embedded structs.
-func fieldByBSONName(v reflect.Value, name string) reflect.Value {
+// fieldByBSONName finds the struct field the driver stores under name: a
+// direct field first, then fields flattened from inline struct fields, which
+// is the driver's own precedence. With alloc set, a nil inline pointer is
+// allocated when it declares the name; otherwise the walk stops there.
+func fieldByBSONName(v reflect.Value, name string, alloc bool) reflect.Value {
+	if name == "-" {
+		return reflect.Value{}
+	}
 	t := v.Type()
 	for i := 0; i < t.NumField(); i++ {
 		sf := t.Field(i)
-		if sf.Anonymous {
-			inner := v.Field(i)
-			if inner.Kind() == reflect.Pointer {
-				if inner.IsNil() {
+		if !sf.IsExported() || bsonTagInline(sf.Tag.Get("bson")) {
+			continue // inline structs are searched below; inline maps have no name of their own
+		}
+		if bsonFieldName(sf) == name {
+			return v.Field(i)
+		}
+	}
+	for i := 0; i < t.NumField(); i++ {
+		sf := t.Field(i)
+		if !internal.IsInlineStruct(sf) {
+			continue
+		}
+		inner := v.Field(i)
+		if inner.Kind() == reflect.Pointer {
+			if inner.IsNil() {
+				if !alloc || !inner.CanSet() || !typeHasBSONName(inner.Type().Elem(), name) {
 					continue
 				}
-				inner = inner.Elem()
+				inner.Set(reflect.New(inner.Type().Elem()))
 			}
-			if inner.Kind() == reflect.Struct {
-				if f := fieldByBSONName(inner, name); f.IsValid() {
-					return f
-				}
-			}
-			continue
+			inner = inner.Elem()
 		}
-		if !sf.IsExported() {
-			continue
-		}
-		bsonName, _ := ParseBSONTag(sf.Tag.Get("bson"))
-		if bsonName == "" {
-			bsonName = strings.ToLower(sf.Name)
-		}
-		if bsonName == name {
-			return v.Field(i)
+		if f := fieldByBSONName(inner, name, alloc); f.IsValid() {
+			return f
 		}
 	}
 	return reflect.Value{}
 }
 
-// assignValue sets val onto target when it is assignable or convertible.
-func assignValue(target reflect.Value, val interface{}) {
-	if val == nil {
-		target.Set(reflect.Zero(target.Type()))
-		return
+// typeHasBSONName reports whether a struct type stores a field under name,
+// directly or through inline embeds.
+func typeHasBSONName(t reflect.Type, name string) bool {
+	for _, f := range internal.StructFields(t) {
+		if bsonFieldName(f) == name {
+			return true
+		}
 	}
-	rv := reflect.ValueOf(val)
-	switch {
-	case rv.Type().AssignableTo(target.Type()):
-		target.Set(rv)
-	case rv.Type().ConvertibleTo(target.Type()) && rv.Kind() != reflect.String && target.Kind() != reflect.String:
-		target.Set(rv.Convert(target.Type()))
-	case rv.Kind() == reflect.String && target.Kind() == reflect.String:
-		target.SetString(rv.String())
+	return false
+}
+
+// bsonFieldName is the name the driver stores a field under: its tag, or the
+// lowercased Go name; "-" for fields the driver skips.
+func bsonFieldName(sf reflect.StructField) string {
+	name, _ := ParseBSONTag(sf.Tag.Get("bson"))
+	if name == "" {
+		return strings.ToLower(sf.Name)
 	}
+	return name
+}
+
+// fieldByIndex follows a FieldSchema's index path from a struct value,
+// tolerating nil pointer embeds along the way (returns an invalid Value).
+func fieldByIndex(v reflect.Value, index []int) reflect.Value {
+	cur := v
+	for _, i := range index {
+		if cur.Kind() == reflect.Pointer {
+			if cur.IsNil() {
+				return reflect.Value{}
+			}
+			cur = cur.Elem()
+		}
+		if cur.Kind() != reflect.Struct || i >= cur.NumField() {
+			return reflect.Value{}
+		}
+		cur = cur.Field(i)
+	}
+	return cur
+}
+
+// schemaField returns the value of fs within v, by index path when the
+// schema recorded one and by Go name otherwise.
+func schemaField(v reflect.Value, fs *FieldSchema) reflect.Value {
+	if len(fs.index) > 0 {
+		return fieldByIndex(v, fs.index)
+	}
+	return v.FieldByName(fs.Name)
 }
 
 // UpdateOne performs a partial update on a single document matching filter.
@@ -1158,11 +1786,12 @@ func Delete(ctx context.Context, model interface{}, opts ...DeleteOptions) error
 		return fmt.Errorf("goodm: cannot delete document with zero ID")
 	}
 
-	return runMiddleware(ctx, &OpInfo{
+	base := bson.D{{Key: "_id", Value: id}}
+	info := &OpInfo{
 		Operation: OpDelete, Collection: schema.Collection,
-		ModelName: schema.ModelName, Model: model,
-		Filter: bson.D{{Key: "_id", Value: id}},
-	}, func(ctx context.Context) error {
+		ModelName: schema.ModelName, Model: model, Filter: base,
+	}
+	return runMiddleware(ctx, info, func(ctx context.Context) error {
 		var opt DeleteOptions
 		if len(opts) > 0 {
 			opt = opts[0]
@@ -1180,7 +1809,7 @@ func Delete(ctx context.Context, model interface{}, opts ...DeleteOptions) error
 		}
 
 		coll := getCollection(db, schema)
-		result, err := coll.DeleteOne(ctx, bson.D{{Key: "_id", Value: id}}, deleteOneOptions(opt))
+		result, err := coll.DeleteOne(ctx, andFilter(middlewareScope(info, base), base), deleteOneOptions(opt))
 		if err != nil {
 			return fmt.Errorf("goodm: delete failed: %w", err)
 		}
@@ -1433,13 +2062,39 @@ func coerceID(schema *Schema, id interface{}) (interface{}, error) {
 	return id, nil
 }
 
-// setTimestamps sets CreatedAt (if zero) and UpdatedAt on a model via reflection.
-func setTimestamps(model interface{}, now time.Time) {
+// managedField returns the model's field stored under one of goodm's managed
+// bson names, resolved through the registered schema so a promoted Go field
+// of the same name elsewhere cannot be mistaken for it. Unregistered values
+// fall back to the Go field name.
+func managedField(model interface{}, bsonName, goName string) reflect.Value {
 	v := reflect.ValueOf(model)
 	if v.Kind() == reflect.Pointer {
 		v = v.Elem()
 	}
-	if f := v.FieldByName("CreatedAt"); f.IsValid() && f.CanSet() && f.Type() == reflect.TypeOf(time.Time{}) {
+	if v.Kind() != reflect.Struct {
+		return reflect.Value{}
+	}
+	if schema, ok := SchemaOf(model); ok {
+		var path []int
+		switch bsonName {
+		case "created_at":
+			path = schema.createdAt
+		case "updated_at":
+			path = schema.updatedAt
+		case "__v":
+			path = schema.version
+		}
+		if path == nil {
+			return reflect.Value{}
+		}
+		return fieldByIndex(v, path)
+	}
+	return v.FieldByName(goName)
+}
+
+// setTimestamps sets created_at (if zero) and updated_at on a model.
+func setTimestamps(model interface{}, now time.Time) {
+	if f := managedField(model, "created_at", "CreatedAt"); f.IsValid() && f.CanSet() && f.Type() == reflect.TypeOf(time.Time{}) {
 		if f.Interface().(time.Time).IsZero() {
 			f.Set(reflect.ValueOf(now))
 		}
@@ -1447,13 +2102,9 @@ func setTimestamps(model interface{}, now time.Time) {
 	setUpdatedAt(model, now)
 }
 
-// setUpdatedAt sets only UpdatedAt on a model via reflection.
+// setUpdatedAt sets only updated_at on a model.
 func setUpdatedAt(model interface{}, now time.Time) {
-	v := reflect.ValueOf(model)
-	if v.Kind() == reflect.Pointer {
-		v = v.Elem()
-	}
-	if f := v.FieldByName("UpdatedAt"); f.IsValid() && f.CanSet() && f.Type() == reflect.TypeOf(time.Time{}) {
+	if f := managedField(model, "updated_at", "UpdatedAt"); f.IsValid() && f.CanSet() && f.Type() == reflect.TypeOf(time.Time{}) {
 		f.Set(reflect.ValueOf(now))
 	}
 }
@@ -1487,8 +2138,8 @@ func validateImmutable(old, new interface{}, schema *Schema) []ValidationError {
 		if !field.Immutable {
 			continue
 		}
-		oldField := oldV.FieldByName(field.Name)
-		newField := newV.FieldByName(field.Name)
+		oldField := schemaField(oldV, &field)
+		newField := schemaField(newV, &field)
 		if !oldField.IsValid() || !newField.IsValid() {
 			continue
 		}
@@ -1513,26 +2164,18 @@ func hasImmutableFields(schema *Schema) bool {
 	return false
 }
 
-// getModelVersion extracts the Version field from a model via reflection.
+// getModelVersion extracts the __v field from a model.
 func getModelVersion(model interface{}) (int, error) {
-	v := reflect.ValueOf(model)
-	if v.Kind() == reflect.Pointer {
-		v = v.Elem()
-	}
-	f := v.FieldByName("Version")
+	f := managedField(model, "__v", "Version")
 	if !f.IsValid() || !f.CanInt() {
 		return 0, fmt.Errorf("goodm: model has no Version field")
 	}
 	return int(f.Int()), nil
 }
 
-// setModelVersion sets the Version field on a model via reflection.
+// setModelVersion sets the __v field on a model.
 func setModelVersion(model interface{}, version int) {
-	v := reflect.ValueOf(model)
-	if v.Kind() == reflect.Pointer {
-		v = v.Elem()
-	}
-	if f := v.FieldByName("Version"); f.IsValid() && f.CanSet() && f.CanInt() {
+	if f := managedField(model, "__v", "Version"); f.IsValid() && f.CanSet() && f.CanInt() {
 		f.SetInt(int64(version))
 	}
 }
@@ -1562,7 +2205,7 @@ func validateUnsetFields(schema *Schema, fields []string) error {
 
 // replaceWithUnset builds the replacement document, strips any unset fields, and
 // performs the ReplaceOne. Returns the number of matched documents.
-func replaceWithUnset(ctx context.Context, coll *mongo.Collection, schema *Schema, filter bson.D, model interface{}, unsetFields []string) (int64, error) {
+func replaceWithUnset(ctx context.Context, coll *mongo.Collection, schema *Schema, filter interface{}, model interface{}, unsetFields []string) (int64, error) {
 	replacement, err := buildReplacement(model, unsetFields)
 	if err != nil {
 		return 0, err

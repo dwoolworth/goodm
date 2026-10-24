@@ -36,8 +36,8 @@ goodm discover --db myapp
 3. Reads existing indexes
 4. Generates Go struct definitions with:
    - `bson` tags matching field names
-   - `goodm` tags for `unique`, `index`, `required` (inferred from indexes and field prevalence)
-   - Compound index declarations
+   - `goodm` tags for `unique`, `index` (with its kind), `sparse`, `ttl`, and `required` (inferred from indexes and field prevalence)
+   - An `Indexes()` method for compound indexes and for single-field indexes with options tags cannot express; partial filters and collations are flagged with a TODO comment because the index listing does not contain enough to reproduce them
    - `init()` registration function
 
 **Example output** (`models/users.go`):

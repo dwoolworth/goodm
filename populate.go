@@ -61,7 +61,7 @@ func Populate(ctx context.Context, model interface{}, refs Refs, opts ...Populat
 			return fmt.Errorf("goodm: field %q has no ref tag", bsonName)
 		}
 
-		fv := v.FieldByName(field.Name)
+		fv := schemaField(v, field)
 		if !fv.IsValid() {
 			return fmt.Errorf("goodm: field %q not found in model struct", field.Name)
 		}
@@ -235,7 +235,7 @@ func collectRefIDs(mv reflect.Value, fs *FieldSchema) []bson.ObjectID {
 		if el.Kind() == reflect.Pointer {
 			el = el.Elem()
 		}
-		fv := el.FieldByName(fs.Name)
+		fv := schemaField(el, fs)
 		if !fv.IsValid() {
 			continue
 		}

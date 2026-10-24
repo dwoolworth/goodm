@@ -22,7 +22,7 @@ Status string `bson:"status" goodm:"enum=draft|published|archived"`
 
 ### Min / Max
 
-Fields tagged `min=N` or `max=N` are bounded: numbers (ints and floats) by value, strings, slices, and maps by length. Bounds may be fractional. The zero value is checked like any other, so `min=1` rejects `0` and `min=0` rejects `-0.5`; only a nil pointer counts as absent.
+Fields tagged `min=N` or `max=N` are bounded: numbers (ints and floats) by value, strings, slices, and maps by length. Bounds may be fractional. The zero value is checked like any other, so `min=1` rejects `0`, `min=0` rejects `-0.5`, and a nil or empty slice has length 0; only a nil pointer counts as absent.
 
 ```go
 Age    int     `bson:"age"    goodm:"min=13,max=120"`

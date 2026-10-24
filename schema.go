@@ -37,7 +37,13 @@ type FieldSchema struct {
 	Immutable bool          // cannot be changed after creation
 	SubFields []FieldSchema // inner fields for struct/[]struct subdocuments
 	IsSlice   bool          // true if field is []struct or []*struct
+
+	goType reflect.Type // the Go type of the field, used to convert values set via UpdateFields
+	index  []int        // reflect index path from the enclosing struct, through inline embeds
 }
+
+// GoType returns the Go type of the field.
+func (f *FieldSchema) GoType() reflect.Type { return f.goType }
 
 // isLeafType returns true for struct types that serialize as atomic BSON values
 // and should NOT be recursed into for subdocument parsing.
@@ -58,7 +64,10 @@ type Schema struct {
 	Hooks           []string          // hook interface names the model implements
 	CollOptions     CollectionOptions // per-schema read/write concern and read preference
 
-	idField []int // reflect field index path of the _id field, nil if none
+	idField   []int // reflect field index path of the _id field, nil if none
+	createdAt []int // index path of the time.Time field stored as created_at, if any
+	updatedAt []int // index path of the time.Time field stored as updated_at, if any
+	version   []int // index path of the integer field stored as __v, if any
 }
 
 // QualifiedName returns the package path and struct name, e.g.

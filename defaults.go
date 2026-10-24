@@ -21,7 +21,7 @@ func applyDefaults(model interface{}, schema *Schema) error {
 // including fields inside subdocuments and slice elements.
 func applyFieldDefaults(v reflect.Value, fields []FieldSchema) error {
 	for _, field := range fields {
-		fv := v.FieldByName(field.Name)
+		fv := schemaField(v, &field)
 		if !fv.IsValid() || !fv.CanSet() {
 			continue
 		}

@@ -54,38 +54,60 @@ type MigrationResult struct {
 func PlanMigration(ctx context.Context, db *mongo.Database, schemas []*Schema) (MigrationPlan, error) {
 	var plan MigrationPlan
 
+	// Several models may share a collection; their indexes are planned as one
+	// set so neither marks the other's indexes as extras.
+	var order []string
+	groups := map[string][]*Schema{}
 	for _, schema := range schemas {
-		coll := db.Collection(schema.Collection)
+		if _, seen := groups[schema.Collection]; !seen {
+			order = append(order, schema.Collection)
+		}
+		groups[schema.Collection] = append(groups[schema.Collection], schema)
+	}
+
+	for _, collection := range order {
+		group := groups[collection]
+		coll := db.Collection(collection)
 
 		existing, err := ListExistingIndexes(ctx, coll)
 		if err != nil {
-			return plan, fmt.Errorf("migration: failed to list indexes on %s: %w", schema.Collection, err)
+			return plan, fmt.Errorf("migration: failed to list indexes on %s: %w", collection, err)
 		}
 		delete(existing, "_id_")
 
 		expected := make(map[string]bool)
-		for _, def := range schema.IndexDefinitions() {
-			def := def
-			expected[def.Name] = true
-			spec, ok := existing[def.Name]
-			if !ok {
-				plan.Actions = append(plan.Actions, MigrationAction{
-					Type:        ActionCreateIndex,
-					Collection:  schema.Collection,
-					Description: fmt.Sprintf("Create index: %s%s", def.Name, describeIndexOptions(def)),
-					IndexName:   def.Name,
-					Definition:  &def,
-				})
-				continue
-			}
-			if mismatch := describeIndexMismatch(spec, def); mismatch != "" {
-				plan.Actions = append(plan.Actions, MigrationAction{
-					Type:        ActionRebuildIndex,
-					Collection:  schema.Collection,
-					Description: fmt.Sprintf("Rebuild index: %s (%s)", def.Name, mismatch),
-					IndexName:   def.Name,
-					Definition:  &def,
-				})
+		declared := map[string]indexOrigin{}
+		for _, schema := range group {
+			for _, def := range schema.IndexDefinitions() {
+				def := def
+				if prev, seen := declared[def.Name]; seen {
+					if !indexDefinitionsEqual(prev.def, def) {
+						return plan, fmt.Errorf("migration: index %s on %s is defined differently by %s and %s", def.Name, collection, prev.schema.QualifiedName(), schema.QualifiedName())
+					}
+					continue
+				}
+				declared[def.Name] = indexOrigin{schema: schema, def: def}
+				expected[def.Name] = true
+				spec, ok := existing[def.Name]
+				if !ok {
+					plan.Actions = append(plan.Actions, MigrationAction{
+						Type:        ActionCreateIndex,
+						Collection:  collection,
+						Description: fmt.Sprintf("Create index: %s%s", def.Name, describeIndexOptions(def)),
+						IndexName:   def.Name,
+						Definition:  &def,
+					})
+					continue
+				}
+				if mismatch := describeIndexMismatch(spec, def); mismatch != "" {
+					plan.Actions = append(plan.Actions, MigrationAction{
+						Type:        ActionRebuildIndex,
+						Collection:  collection,
+						Description: fmt.Sprintf("Rebuild index: %s (%s)", def.Name, mismatch),
+						IndexName:   def.Name,
+						Definition:  &def,
+					})
+				}
 			}
 		}
 
@@ -93,24 +115,48 @@ func PlanMigration(ctx context.Context, db *mongo.Database, schemas []*Schema) (
 			if !expected[name] {
 				plan.Actions = append(plan.Actions, MigrationAction{
 					Type:        ActionDropIndex,
-					Collection:  schema.Collection,
+					Collection:  collection,
 					Description: fmt.Sprintf("Drop index: %s (not in schema)", name),
 					IndexName:   name,
 				})
 			}
 		}
 
-		drifts := DetectDrift(ctx, db, schema, DefaultDriftSampleSize)
-		for _, d := range drifts {
+		// Drift is judged against every field any model of the collection declares.
+		known := map[string]bool{}
+		for _, schema := range group {
+			for f := range knownFields(schema) {
+				known[f] = true
+			}
+		}
+		for _, d := range detectDriftIn(ctx, db, collection, known, DefaultDriftSampleSize) {
 			plan.Actions = append(plan.Actions, MigrationAction{
 				Type:        ActionFieldDrift,
-				Collection:  schema.Collection,
+				Collection:  collection,
 				Description: fmt.Sprintf("Extra field: %s", d.Field),
 			})
 		}
 	}
 
 	return plan, nil
+}
+
+// indexOrigin records which schema first declared an index name.
+type indexOrigin struct {
+	schema *Schema
+	def    IndexDefinition
+}
+
+// indexDefinitionsEqual reports whether two definitions describe the same
+// index, comparing partial filters and collations by meaning rather than by
+// how they were written.
+func indexDefinitionsEqual(a, b IndexDefinition) bool {
+	return indexKeysEqual(a.Keys, b.Keys) &&
+		a.Unique == b.Unique &&
+		a.Sparse == b.Sparse &&
+		ttlEqual(a.ExpireAfterSeconds, b.ExpireAfterSeconds) &&
+		filtersEquivalent(a.PartialFilter, b.PartialFilter) &&
+		collationsEquivalent(a.Collation, b.Collation)
 }
 
 // describeIndexOptions renders the notable options of a definition for plan output.

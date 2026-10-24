@@ -3,6 +3,7 @@ package goodm
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -245,6 +246,21 @@ func TestBuildReplacement_WithUnset(t *testing.T) {
 	}
 }
 
+// validateUpdateFields adapts prepareUpdateFields for the assertions below.
+func validateUpdateFields(schema *Schema, fields bson.M) error {
+	_, _, err := prepareUpdateFields(schema, &testUser{}, fields)
+	return err
+}
+
+// valueMap converts plain values into the converted-value map applyFieldsToModel takes.
+func valueMap(fields bson.M) map[string]reflect.Value {
+	out := make(map[string]reflect.Value, len(fields))
+	for k, v := range fields {
+		out[k] = reflect.ValueOf(v)
+	}
+	return out
+}
+
 func TestValidateUpdateFields(t *testing.T) {
 	registerTestModels()
 	defer unregisterTestModels()
@@ -298,7 +314,7 @@ func TestApplyFieldsToModel(t *testing.T) {
 		Role:  "user",
 	}
 
-	applyFieldsToModel(u, bson.M{"age": 30, "role": "admin"})
+	applyFieldsToModel(u, valueMap(bson.M{"age": 30, "role": "admin"}))
 
 	if u.Age != 30 {
 		t.Fatalf("expected age 30, got %d", u.Age)

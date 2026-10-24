@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"strconv"
 	"strings"
 	"unicode"
 )
@@ -35,13 +36,24 @@ func SanitizeStructName(collectionName string) string {
 }
 
 // FormatGoodmTag builds the `goodm:"..."` tag value from field attributes.
-func FormatGoodmTag(unique, index, required bool) string {
+// indexKind is "" or "1" for ascending, else "-1", "hashed", "text", etc.
+func FormatGoodmTag(unique, indexed bool, indexKind string, sparse bool, ttl *int32, required bool) string {
 	var parts []string
 	if unique {
 		parts = append(parts, "unique")
 	}
-	if index {
-		parts = append(parts, "index")
+	if indexed || (unique && indexKind != "" && indexKind != "1") {
+		if indexKind == "" || indexKind == "1" {
+			parts = append(parts, "index")
+		} else {
+			parts = append(parts, "index="+indexKind)
+		}
+	}
+	if sparse {
+		parts = append(parts, "sparse")
+	}
+	if ttl != nil {
+		parts = append(parts, "ttl="+strconv.Itoa(int(*ttl)))
 	}
 	if required {
 		parts = append(parts, "required")

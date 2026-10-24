@@ -491,8 +491,22 @@ func hasDuplicateValues(ctx context.Context, coll *mongo.Collection, def IndexDe
 // that exist in the database but not in the schema. The sampleSize parameter
 // controls how many documents are sampled (use DefaultDriftSampleSize if unsure).
 func DetectDrift(ctx context.Context, db *mongo.Database, schema *Schema, sampleSize int) []DriftError {
+	return detectDriftIn(ctx, db, schema.Collection, knownFields(schema), sampleSize)
+}
+
+// knownFields returns the set of top-level bson field names a schema declares.
+func knownFields(schema *Schema) map[string]bool {
+	known := make(map[string]bool, len(schema.Fields))
+	for _, f := range schema.Fields {
+		known[f.BSONName] = true
+	}
+	return known
+}
+
+// detectDriftIn samples a collection and reports top-level fields not in known.
+func detectDriftIn(ctx context.Context, db *mongo.Database, collection string, known map[string]bool, sampleSize int) []DriftError {
 	var drifts []DriftError
-	coll := db.Collection(schema.Collection)
+	coll := db.Collection(collection)
 
 	if sampleSize <= 0 {
 		sampleSize = DefaultDriftSampleSize
@@ -504,11 +518,6 @@ func DetectDrift(ctx context.Context, db *mongo.Database, schema *Schema, sample
 	}
 	defer func() { _ = cursor.Close(ctx) }()
 
-	knownFields := make(map[string]bool)
-	for _, f := range schema.Fields {
-		knownFields[f.BSONName] = true
-	}
-
 	seen := make(map[string]bool)
 	for cursor.Next(ctx) {
 		var doc bson.D
@@ -516,10 +525,10 @@ func DetectDrift(ctx context.Context, db *mongo.Database, schema *Schema, sample
 			continue
 		}
 		for _, elem := range doc {
-			if !knownFields[elem.Key] && !seen[elem.Key] {
+			if !known[elem.Key] && !seen[elem.Key] {
 				seen[elem.Key] = true
 				drifts = append(drifts, DriftError{
-					Collection: schema.Collection,
+					Collection: collection,
 					Field:      elem.Key,
 					Message:    "field exists in database but not in schema",
 				})

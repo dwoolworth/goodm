@@ -31,7 +31,7 @@ func init() {
 | `UpdatedAt` | `updated_at` | `time.Time` | Set on Create, refreshed on Update |
 | `Version` | `__v` | `int` | Set to 0 on Create, incremented on each Update (optimistic concurrency) |
 
-Always embed with `bson:",inline"` to flatten the fields into the document.
+Always embed with `bson:",inline"` to flatten the fields into the document. goodm follows the driver's default registry here: any exported struct or pointer-to-struct field tagged `inline`, embedded or named, is flattened into the document; an exported embedded struct without the tag is a subdocument field named by its tag or its lowercased type name; unexported fields and embeds are ignored entirely; an inline map declares no schema fields. `Register` rejects a model that stores two fields under the same bson name. The managed fields (`_id`, `created_at`, `updated_at`, `__v`) are located by those bson names, not by Go field names.
 
 ## Tag Reference
 
@@ -57,7 +57,7 @@ Body     string    `bson:"body"     goodm:"index=text"`     // text
 Location bson.D    `bson:"loc"      goodm:"index=2dsphere"` // geospatial
 ```
 
-Tags on fields inside subdocuments create dotted-path indexes (`address.city_1`), including for slices of structs (multikey).
+Tags on fields inside subdocuments create dotted-path indexes (`address.city_1`), including for slices of structs (multikey). Take care with `unique` inside an array: every element is indexed, and documents whose array is empty or missing all index as `null` and collide with each other. Use `unique,sparse` or a partial filter from `Indexes()` for those.
 
 ### `sparse`
 
@@ -282,7 +282,7 @@ Because schemas are keyed by type, two packages may each register a struct named
 
 ## Custom ID Types
 
-The `_id` field is whichever struct field carries `bson:"_id"` (a field named `ID` is the fallback), found through embedded structs. When that field is a `bson.ObjectID`, `Create` generates a value if it is zero. Any other type works, but you must set it yourself before `Create` or in a `BeforeCreate` hook; a zero `_id` of a non-ObjectID type is rejected rather than inserted as an empty key.
+The `_id` field is the struct field tagged `bson:"_id"`, found directly or through embedded structs tagged `bson:",inline"`; `Register` rejects a model that has none, and in particular one that embeds `goodm.Model` without the inline tag, because the driver would store its `_id` as a nested document. A field merely named `ID` is not enough, because the driver would store it as `id`. When the `_id` field is a `bson.ObjectID`, `Create` generates a value if it is zero. Any other type works, but you must set it yourself before `Create` or in a `BeforeCreate` hook; a zero `_id` of a non-ObjectID type is rejected rather than inserted as an empty key.
 
 ```go
 type Setting struct {
@@ -292,7 +292,7 @@ type Setting struct {
 }
 ```
 
-Timestamps and versioning are applied when the struct has `CreatedAt`, `UpdatedAt`, and `Version` fields (as `goodm.Model` provides) and skipped otherwise.
+Timestamps and versioning are applied to the fields stored as `created_at` and `updated_at` (which must be `time.Time`) and `__v` (a signed integer), as `goodm.Model` declares them, and skipped when the struct has none; the Go field names do not matter.
 
 ## Inspecting Schemas
 

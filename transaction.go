@@ -2,10 +2,12 @@ package goodm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/session"
 )
 
 // TransactionOptions configures the WithTransaction operation.
@@ -25,9 +27,11 @@ type TransactionOptions struct {
 // transaction is committed. Transient transaction errors are retried
 // automatically by the driver.
 //
-// If ctx already carries a session (a nested WithTransaction call), fn runs
-// inside the existing transaction instead of starting a second one, so an
-// error from the inner fn aborts the whole outer transaction.
+// If ctx already carries a session with a transaction in progress (a nested
+// WithTransaction call), fn runs inside that transaction instead of starting
+// a second one, so an error from the inner fn aborts the whole outer
+// transaction; the inner call's options are ignored. If ctx carries a session
+// without an active transaction, a transaction is started on that session.
 //
 // Example:
 //
@@ -41,14 +45,39 @@ type TransactionOptions struct {
 //	    return nil
 //	})
 func WithTransaction(ctx context.Context, fn func(ctx context.Context) error, opts ...TransactionOptions) error {
-	if mongo.SessionFromContext(ctx) != nil {
-		return fn(ctx)
-	}
-
 	var opt TransactionOptions
 	if len(opts) > 0 {
 		opt = opts[0]
 	}
+	var txnOpts []options.Lister[options.TransactionOptions]
+	if opt.Transaction != nil {
+		txnOpts = append(txnOpts, opt.Transaction)
+	}
+	callback := func(ctx context.Context) (interface{}, error) {
+		return nil, fn(ctx)
+	}
+
+	if sess := mongo.SessionFromContext(ctx); sess != nil {
+		// Decide whether a transaction is already running before calling fn,
+		// so an error fn itself returns can never be mistaken for nesting.
+		// StartTransaction is purely local until the first operation, and
+		// AbortTransaction on a transaction in that state is local too.
+		switch err := sess.StartTransaction(txnOpts...); {
+		case errors.Is(err, session.ErrTransactInProgress):
+			// Nested call: join the transaction already running on this session.
+			return fn(ctx)
+		case err != nil:
+			return fmt.Errorf("goodm: failed to start transaction: %w", err)
+		}
+		if err := sess.AbortTransaction(ctx); err != nil {
+			return fmt.Errorf("goodm: failed to reset transaction state: %w", err)
+		}
+		if _, err := sess.WithTransaction(ctx, callback, txnOpts...); err != nil {
+			return fmt.Errorf("goodm: transaction failed: %w", err)
+		}
+		return nil
+	}
+
 	db, err := getDB(opt.DB)
 	if err != nil {
 		return err
@@ -59,22 +88,14 @@ func WithTransaction(ctx context.Context, fn func(ctx context.Context) error, op
 		return ErrNoDatabase
 	}
 
-	session, err := client.StartSession()
+	sess, err := client.StartSession()
 	if err != nil {
 		return fmt.Errorf("goodm: failed to start session: %w", err)
 	}
-	defer session.EndSession(ctx)
+	defer sess.EndSession(ctx)
 
-	var txnOpts []options.Lister[options.TransactionOptions]
-	if opt.Transaction != nil {
-		txnOpts = append(txnOpts, opt.Transaction)
-	}
-	_, err = session.WithTransaction(ctx, func(ctx context.Context) (interface{}, error) {
-		return nil, fn(ctx)
-	}, txnOpts...)
-	if err != nil {
+	if _, err := sess.WithTransaction(ctx, callback, txnOpts...); err != nil {
 		return fmt.Errorf("goodm: transaction failed: %w", err)
 	}
-
 	return nil
 }

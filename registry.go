@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/dwoolworth/goodm/internal"
 )
@@ -38,8 +39,21 @@ func Register(model interface{}, collection string) error {
 	}
 
 	// Parse struct fields (recursively handles subdocuments)
+	if bad := invalidInlineField(t, nil); bad != "" {
+		return fmt.Errorf("goodm: model %s: field %s is tagged bson:\",inline\" but inline fields must be a struct, a struct pointer, or a map", schema.QualifiedName(), bad)
+	}
 	schema.Fields = parseFields(t, nil)
+	if dup := duplicateBSONName(schema.Fields); dup != "" {
+		return fmt.Errorf("goodm: model %s has two fields stored as %q; the driver keeps only one", schema.QualifiedName(), dup)
+	}
 	schema.idField = findIDField(t)
+	schema.createdAt, schema.updatedAt, schema.version = findManagedFields(schema.Fields)
+	if schema.idField == nil {
+		if embedsModelWithoutInline(t) {
+			return fmt.Errorf("goodm: model %s embeds goodm.Model without the bson:\",inline\" tag, so its _id would be stored nested; embed it as goodm.Model with the tag bson:\",inline\"", schema.QualifiedName())
+		}
+		return fmt.Errorf("goodm: model %s has no field tagged bson:\"_id\" (embed goodm.Model with bson:\",inline\" or tag an ID field)", schema.QualifiedName())
+	}
 
 	// Check for Indexable interface (compound indexes)
 	if indexable, ok := model.(Indexable); ok {
@@ -200,6 +214,8 @@ func parseFields(t reflect.Type, seen map[reflect.Type]bool) []FieldSchema {
 		fs.Name = f.Name
 		fs.BSONName = bsonName
 		fs.Type = internal.TypeName(f.Type)
+		fs.goType = f.Type
+		fs.index = f.Index
 
 		// Determine underlying type (deref pointers, unwrap slices)
 		fieldType := f.Type
@@ -228,45 +244,124 @@ func parseFields(t reflect.Type, seen map[reflect.Type]bool) []FieldSchema {
 	return result
 }
 
-// findIDField locates the struct field that maps to "_id", searching through
-// embedded structs. It prefers an explicit bson:"_id" tag and falls back to a
-// field named ID. Returns nil if the struct has no identifiable ID field.
+// findIDField locates the field tagged bson:"_id" among the fields the driver
+// stores at the top level (see internal.StructFields) and returns its index
+// path. Returns nil if there is none.
 func findIDField(t reflect.Type) []int {
-	var fallback []int
-	var walk func(t reflect.Type, prefix []int) []int
-	walk = func(t reflect.Type, prefix []int) []int {
-		for i := 0; i < t.NumField(); i++ {
-			f := t.Field(i)
-			if !f.IsExported() && !f.Anonymous {
-				continue
-			}
-			idx := append(append([]int{}, prefix...), i)
-			name, _ := ParseBSONTag(f.Tag.Get("bson"))
-			if name == "_id" {
-				return idx
-			}
-			if f.Anonymous {
-				ft := f.Type
-				if ft.Kind() == reflect.Pointer {
-					ft = ft.Elem()
-				}
-				if ft.Kind() == reflect.Struct {
-					if found := walk(ft, idx); found != nil {
-						return found
-					}
-				}
-				continue
-			}
-			if f.Name == "ID" && fallback == nil {
-				fallback = idx
+	for _, f := range internal.StructFields(t) {
+		if name, _ := ParseBSONTag(f.Tag.Get("bson")); name == "_id" {
+			return f.Index
+		}
+	}
+	return nil
+}
+
+// findManagedFields locates the fields goodm maintains by the bson names the
+// documents use, so a promoted Go field of the same name elsewhere in the
+// struct cannot be mistaken for them.
+func findManagedFields(fields []FieldSchema) (createdAt, updatedAt, version []int) {
+	for _, f := range fields {
+		switch {
+		case f.BSONName == "created_at" && f.goType == reflect.TypeOf(time.Time{}):
+			createdAt = f.index
+		case f.BSONName == "updated_at" && f.goType == reflect.TypeOf(time.Time{}):
+			updatedAt = f.index
+		case f.BSONName == "__v" && f.goType != nil && isIntKind(f.goType.Kind()):
+			version = f.index
+		}
+	}
+	return
+}
+
+func isIntKind(k reflect.Kind) bool {
+	switch k {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return true
+	}
+	return false
+}
+
+// invalidInlineField returns the Go name of the first exported field, at any
+// depth, tagged bson:",inline" whose type the driver cannot inline (anything
+// but a struct, a struct pointer, or a map), or "". The driver would reject
+// the model on its first write; reporting it at Register is kinder.
+func invalidInlineField(t reflect.Type, seen map[reflect.Type]bool) string {
+	if t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t.Kind() != reflect.Struct || isLeafType(t) || seen[t] {
+		return ""
+	}
+	if seen == nil {
+		seen = map[reflect.Type]bool{}
+	}
+	seen[t] = true
+	defer delete(seen, t)
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		ft := f.Type
+		if ft.Kind() == reflect.Pointer {
+			ft = ft.Elem()
+		}
+		if bsonTagInline(f.Tag.Get("bson")) {
+			// The driver inlines a struct, a pointer to a struct, or a map
+			// (but not a pointer to a map).
+			inlineOK := ft.Kind() == reflect.Struct || (f.Type.Kind() == reflect.Map)
+			if !inlineOK {
+				return f.Name
 			}
 		}
-		return nil
+		if ft.Kind() == reflect.Slice || ft.Kind() == reflect.Array {
+			ft = ft.Elem()
+			if ft.Kind() == reflect.Pointer {
+				ft = ft.Elem()
+			}
+		}
+		if ft.Kind() == reflect.Struct {
+			if bad := invalidInlineField(ft, seen); bad != "" {
+				return f.Name + "." + bad
+			}
+		}
 	}
-	if found := walk(t, nil); found != nil {
-		return found
+	return ""
+}
+
+// duplicateBSONName returns a bson path two visible fields share, at any
+// depth, or "". The driver stores only one of them, so such a model is
+// ambiguous.
+func duplicateBSONName(fields []FieldSchema) string {
+	return duplicateBSONNameAt(fields, "")
+}
+
+func duplicateBSONNameAt(fields []FieldSchema, prefix string) string {
+	seen := map[string]bool{}
+	for _, f := range fields {
+		if seen[f.BSONName] {
+			return prefix + f.BSONName
+		}
+		seen[f.BSONName] = true
+		if len(f.SubFields) > 0 {
+			if dup := duplicateBSONNameAt(f.SubFields, prefix+f.BSONName+"."); dup != "" {
+				return dup
+			}
+		}
 	}
-	return fallback
+	return ""
+}
+
+// embedsModelWithoutInline reports whether t embeds goodm.Model without the
+// bson:",inline" tag, the most likely cause of a missing _id.
+func embedsModelWithoutInline(t reflect.Type) bool {
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if f.Anonymous && f.Type == reflect.TypeOf(Model{}) && !bsonTagInline(f.Tag.Get("bson")) {
+			return true
+		}
+	}
+	return false
 }
 
 // detectHooks checks which hook interfaces a model implements.

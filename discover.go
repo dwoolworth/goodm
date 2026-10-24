@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -25,13 +24,36 @@ type DiscoveredField struct {
 	IsRequired bool   // appears in every sampled doc
 	IsUnique   bool   // has a unique index
 	IsIndexed  bool   // has a non-unique index
+	IndexKind  string // "" for ascending, else "-1", "hashed", "text", "2dsphere"
+	Sparse     bool   // the single-field index is sparse
+	TTL        *int32 // expireAfterSeconds of the single-field index
 }
 
 // DiscoveredIndex describes an index found on a collection.
 type DiscoveredIndex struct {
-	Name   string
-	Keys   []string // field names in order, in CompoundIndex syntax ("-field" for descending, "field:text" etc.)
-	Unique bool
+	Name               string
+	Keys               []string // field names in order, in CompoundIndex syntax ("-field" for descending, "field:text" etc.)
+	Unique             bool
+	Sparse             bool
+	ExpireAfterSeconds *int32
+	HasPartialFilter   bool // cannot be reproduced from the index listing alone
+	HasCollation       bool // cannot be reproduced from the index listing alone
+
+	// Tagged is set when Discover expressed this index as tags on a field;
+	// every other index belongs in the generated Indexes() method.
+	Tagged bool
+}
+
+// SingleFieldTag reports whether the index can be expressed entirely by tags
+// on one field: one key, MongoDB's default name, and no option that only
+// Indexes() can declare.
+func (idx DiscoveredIndex) SingleFieldTag() bool {
+	return len(idx.Keys) == 1 && !idx.HasPartialFilter && !idx.HasCollation && idx.Name == idx.DerivedName()
+}
+
+// DerivedName is the name goodm would give an index with these keys.
+func (idx DiscoveredIndex) DerivedName() string {
+	return compoundIndexName(CompoundIndex{Fields: idx.Keys})
 }
 
 // DiscoveredCollection holds the discovery results for a single collection.
@@ -98,16 +120,31 @@ func discoverCollection(ctx context.Context, coll *mongo.Collection, opts Discov
 	}
 	dc.Indexes = indexes
 
-	// Merge index info into fields
+	// Express at most one single-field index per field as tags; any further
+	// index on the same field (e.g. a hashed index next to a unique one) is
+	// left for Indexes().
 	for i := range dc.Fields {
-		for _, idx := range dc.Indexes {
-			if len(idx.Keys) == 1 && strings.TrimPrefix(idx.Keys[0], "-") == dc.Fields[i].BSONName {
-				if idx.Unique {
-					dc.Fields[i].IsUnique = true
-				} else {
-					dc.Fields[i].IsIndexed = true
-				}
+		for j := range dc.Indexes {
+			idx := &dc.Indexes[j]
+			if !idx.SingleFieldTag() || idx.Tagged {
+				continue
 			}
+			field, kind := parseIndexField(idx.Keys[0])
+			if field != dc.Fields[i].BSONName {
+				continue
+			}
+			if idx.Unique {
+				dc.Fields[i].IsUnique = true
+			} else {
+				dc.Fields[i].IsIndexed = true
+			}
+			if kind != "1" {
+				dc.Fields[i].IndexKind = kind
+			}
+			dc.Fields[i].Sparse = idx.Sparse
+			dc.Fields[i].TTL = idx.ExpireAfterSeconds
+			idx.Tagged = true
+			break
 		}
 	}
 
@@ -178,30 +215,33 @@ func detectIndexes(ctx context.Context, coll *mongo.Collection) ([]DiscoveredInd
 
 	var indexes []DiscoveredIndex
 	for cursor.Next(ctx) {
-		var raw bson.M
-		if err := cursor.Decode(&raw); err != nil {
+		var idx struct {
+			Name                    string   `bson:"name"`
+			Key                     bson.D   `bson:"key"`
+			Unique                  bool     `bson:"unique"`
+			Sparse                  bool     `bson:"sparse"`
+			ExpireAfterSeconds      *int32   `bson:"expireAfterSeconds"`
+			PartialFilterExpression bson.Raw `bson:"partialFilterExpression"`
+			Collation               bson.Raw `bson:"collation"`
+			Weights                 bson.D   `bson:"weights"`
+		}
+		if err := cursor.Decode(&idx); err != nil {
 			continue
 		}
 
-		name, _ := raw["name"].(string)
-
-		// Parse key document
 		var keys []string
-		if keyDoc, ok := raw["key"].(bson.D); ok {
-			for _, k := range keyDoc {
-				keys = append(keys, discoveredKey(k))
-			}
-		}
-
-		unique := false
-		if u, ok := raw["unique"].(bool); ok {
-			unique = u
+		for _, k := range normalizeTextKeys(idx.Key, idx.Weights) {
+			keys = append(keys, discoveredKey(k))
 		}
 
 		indexes = append(indexes, DiscoveredIndex{
-			Name:   name,
-			Keys:   keys,
-			Unique: unique,
+			Name:               idx.Name,
+			Keys:               keys,
+			Unique:             idx.Unique,
+			Sparse:             idx.Sparse,
+			ExpireAfterSeconds: idx.ExpireAfterSeconds,
+			HasPartialFilter:   len(idx.PartialFilterExpression) > 0,
+			HasCollation:       len(idx.Collation) > 0,
 		})
 	}
 

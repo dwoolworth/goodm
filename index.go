@@ -2,7 +2,9 @@ package goodm
 
 import (
 	"fmt"
+	"math"
 	"reflect"
+	"sort"
 	"strings"
 	"time"
 
@@ -154,9 +156,23 @@ func (ci CompoundIndex) definition() IndexDefinition {
 		Unique:             ci.Unique,
 		Sparse:             ci.Sparse,
 		ExpireAfterSeconds: ci.ExpireAfterSeconds,
-		PartialFilter:      ci.PartialFilter,
+		PartialFilter:      normalizePartialFilter(ci.PartialFilter),
 		Collation:          ci.Collation,
 	}
+}
+
+// normalizePartialFilter converts a partial filter into its canonical ordered
+// form before it is created or compared, so a filter written with unordered
+// maps is stored by the server in a deterministic order and later matches.
+func normalizePartialFilter(f interface{}) interface{} {
+	if f == nil {
+		return nil
+	}
+	c, err := canonicalBSON(f)
+	if err != nil {
+		return f
+	}
+	return c
 }
 
 // Keys returns the index key document described by Fields, resolving the
@@ -224,8 +240,12 @@ func parseTTL(v string) (*int32, error) {
 	return &secs, nil
 }
 
-// indexKeysEqual compares two index key documents by field, direction, and type.
+// indexKeysEqual compares two index key documents by field, direction, and
+// type. The text fields of a compound text index are compared as a set,
+// because the server reports them in alphabetical order regardless of how
+// the index was declared.
 func indexKeysEqual(a, b bson.D) bool {
+	a, b = canonicalTextKeys(a), canonicalTextKeys(b)
 	if len(a) != len(b) {
 		return false
 	}
@@ -235,6 +255,36 @@ func indexKeysEqual(a, b bson.D) bool {
 		}
 	}
 	return true
+}
+
+// canonicalTextKeys gathers every text key into one alphabetically sorted run
+// placed where the first text key appeared. Non-text keys keep their order.
+func canonicalTextKeys(keys bson.D) bson.D {
+	var text []string
+	for _, k := range keys {
+		if indexKeyString(k.Value) == "text" {
+			text = append(text, k.Key)
+		}
+	}
+	if len(text) < 2 {
+		return keys
+	}
+	sort.Strings(text)
+	out := make(bson.D, 0, len(keys))
+	placed := false
+	for _, k := range keys {
+		if indexKeyString(k.Value) != "text" {
+			out = append(out, k)
+			continue
+		}
+		if !placed {
+			for _, f := range text {
+				out = append(out, bson.E{Key: f, Value: "text"})
+			}
+			placed = true
+		}
+	}
+	return out
 }
 
 // indexKeyString normalizes an index key value (direction int or type string)
@@ -256,7 +306,7 @@ func indexKeyString(v interface{}) string {
 }
 
 // partialFiltersEqual compares a desired partial filter against the raw
-// expression reported by the server, after normalizing both through BSON.
+// expression reported by the server, after canonicalizing both.
 func partialFiltersEqual(desired interface{}, existing bson.Raw) bool {
 	if desired == nil && len(existing) == 0 {
 		return true
@@ -264,15 +314,155 @@ func partialFiltersEqual(desired interface{}, existing bson.Raw) bool {
 	if desired == nil || len(existing) == 0 {
 		return false
 	}
-	want, err := toBsonMap(desired)
+	want, err := canonicalBSON(desired)
 	if err != nil {
 		return false
 	}
-	var have bson.M
-	if err := bson.Unmarshal(existing, &have); err != nil {
+	have, err := canonicalBSON(existing)
+	if err != nil {
 		return false
 	}
 	return reflect.DeepEqual(want, have)
+}
+
+// filtersEquivalent compares two filter documents from Go code canonically.
+func filtersEquivalent(a, b interface{}) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	ca, errA := canonicalBSON(a)
+	cb, errB := canonicalBSON(b)
+	return errA == nil && errB == nil && reflect.DeepEqual(ca, cb)
+}
+
+// canonicalBSON round-trips a document through BSON and returns a form in
+// which documents have sorted keys and all numbers are float64, so two ways
+// of writing the same filter (bson.M vs bson.D, int vs int64) compare equal.
+func canonicalBSON(v interface{}) (interface{}, error) {
+	// Sort unordered maps before marshaling: once a bson.M has been encoded
+	// its random order is indistinguishable from a deliberate bson.D order.
+	raw, err := bson.Marshal(bson.D{{Key: "v", Value: canonicalValueAt(v, true)}})
+	if err != nil {
+		return nil, err
+	}
+	var holder struct {
+		V interface{} `bson:"v"`
+	}
+	if err := bson.Unmarshal(raw, &holder); err != nil {
+		return nil, err
+	}
+	return canonicalValue(holder.V), nil
+}
+
+func canonicalValue(v interface{}) interface{} {
+	return canonicalValueAt(v, true)
+}
+
+// canonicalValueAt canonicalizes v. Keys are sorted only where MongoDB treats
+// order as irrelevant: the top-level filter and documents made of operators
+// ($gt, $in, ...). A subdocument under a field name is an exact-match value,
+// where order is significant, so it keeps its order. Integers stay exact;
+// a float that is an integer within 2^53 becomes an int64 so 5 and 5.0
+// compare equal, while larger values keep their type.
+func canonicalValueAt(v interface{}, top bool) interface{} {
+	switch x := v.(type) {
+	case bson.D:
+		out := make(bson.D, len(x))
+		allOps := len(x) > 0
+		for i, e := range x {
+			out[i] = bson.E{Key: e.Key, Value: canonicalValueAt(e.Value, isFilterListOperator(e.Key))}
+			if !strings.HasPrefix(e.Key, "$") {
+				allOps = false
+			}
+		}
+		if top || allOps {
+			sort.SliceStable(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+		}
+		return out
+	case bson.M:
+		return canonicalMap(x)
+	case map[string]interface{}:
+		return canonicalMap(x)
+	case bson.A:
+		out := make(bson.A, len(x))
+		for i, e := range x {
+			out[i] = canonicalValueAt(e, top)
+		}
+		return out
+	case []interface{}:
+		out := make(bson.A, len(x))
+		for i, e := range x {
+			out[i] = canonicalValueAt(e, top)
+		}
+		return out
+	case int:
+		return int64(x)
+	case int32:
+		return int64(x)
+	case float32:
+		return canonicalFloat(float64(x))
+	case float64:
+		return canonicalFloat(x)
+	}
+	// Any other string-keyed map (a named map type, map[string]string) is
+	// unordered too and must be sorted before it is marshaled.
+	if rv := reflect.ValueOf(v); rv.IsValid() && rv.Kind() == reflect.Map && rv.Type().Key().Kind() == reflect.String {
+		m := make(map[string]interface{}, rv.Len())
+		iter := rv.MapRange()
+		for iter.Next() {
+			m[iter.Key().String()] = iter.Value().Interface()
+		}
+		return canonicalMap(m)
+	}
+	return v
+}
+
+// canonicalMap converts an unordered map into a key-sorted bson.D.
+func canonicalMap(m map[string]interface{}) bson.D {
+	out := make(bson.D, 0, len(m))
+	for k, val := range m {
+		out = append(out, bson.E{Key: k, Value: canonicalValueAt(val, isFilterListOperator(k))})
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out
+}
+
+// isFilterListOperator reports whether an operator's array holds filter
+// documents (whose key order is irrelevant) rather than values.
+func isFilterListOperator(key string) bool {
+	return key == "$and" || key == "$or" || key == "$nor"
+}
+
+func canonicalFloat(f float64) interface{} {
+	if f == math.Trunc(f) && math.Abs(f) < 1<<53 {
+		return int64(f)
+	}
+	return f
+}
+
+// collationsEquivalent compares two collations from Go code with the server's
+// defaults filled in, so {Locale: "en"} equals {Locale: "en", Strength: 3}.
+func collationsEquivalent(a, b *options.Collation) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return normalizeCollation(*a) == normalizeCollation(*b)
+}
+
+func normalizeCollation(c options.Collation) options.Collation {
+	if c.Strength == 0 {
+		c.Strength = 3
+	}
+	if c.CaseFirst == "" {
+		c.CaseFirst = "off"
+	}
+	if c.Alternate == "" {
+		c.Alternate = "non-ignorable"
+	}
+	if c.MaxVariable == "" {
+		c.MaxVariable = "punct"
+	}
+	return c
 }
 
 // collationsEqual reports whether the collation the server stores satisfies
