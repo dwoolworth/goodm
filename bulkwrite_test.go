@@ -765,11 +765,11 @@ func (b badValue) MarshalBSONValue() (byte, []byte, error) {
 
 func (b *badValue) UnmarshalBSONValue(byte, []byte) error { return nil }
 
-func TestSaveMany_ClientSideFailureInTransaction_AbortsIt(t *testing.T) {
+func TestSaveMany_ClientSideFailureInTransaction_DoesNotAbort(t *testing.T) {
 	ctx, db, cleanup := setupTestDB(t)
 	defer cleanup()
 	registerModel(t, &testBadMarshal{}, "test_bad_marshal", "")
-	docs := []*testBadMarshal{{Name: "a"}, {Name: "b"}}
+	docs := []*testBadMarshal{{Name: "a"}, {Name: "b"}, {Name: "c"}}
 	if err := CreateMany(ctx, docs); err != nil {
 		t.Fatal(err)
 	}
@@ -786,18 +786,66 @@ func TestSaveMany_ClientSideFailureInTransaction_AbortsIt(t *testing.T) {
 
 	docs[0].Name = "a2"
 	docs[1].Bad = badValue{fail: true} // fails in the driver, never reaches the server
+	docs[2].Name = "c2"
 	err = SaveMany(sessCtx, docs)
 	var be *BulkError
-	if !errors.As(err, &be) || len(be.Errors) != 2 || docs[0].Version != 0 {
-		t.Fatalf("expected both items reported and versions restored, got %v (v0=%d)", err, docs[0].Version)
+	if !errors.As(err, &be) || len(be.Errors) != 1 || be.Errors[0].Index != 1 {
+		t.Fatalf("a client-side failure must be reported for its item only, got %v", err)
 	}
-	// The caller commits anyway: the commit must fail and item 0 must not persist.
-	if err := sess.CommitTransaction(ctx); err == nil {
-		t.Error("commit after SaveMany aborted the transaction must fail")
+	if docs[0].Version != 1 || docs[2].Version != 1 {
+		t.Errorf("items written in the still-open transaction keep their new version: %d %d", docs[0].Version, docs[2].Version)
+	}
+	// Later writes in the same transaction must still be inside it, and the
+	// caller's commit decides the outcome.
+	extra := &testBadMarshal{Name: "extra"}
+	if err := Create(sessCtx, extra); err != nil {
+		t.Fatalf("Create in the still-open transaction: %v", err)
+	}
+	if ok, _ := Exists(ctx, bson.D{{Key: "_id", Value: extra.ID}}, &testBadMarshal{}); ok {
+		t.Fatal("a write after the batch failure leaked out of the transaction")
+	}
+	if err := sess.CommitTransaction(ctx); err != nil {
+		t.Fatalf("commit must still work: %v", err)
 	}
 	var fresh testBadMarshal
-	if err := FindByID(ctx, docs[0].ID, &fresh); err != nil || fresh.Name != "a" || fresh.Version != 0 {
-		t.Errorf("item 0 must not have been persisted: %+v %v", fresh, err)
+	if err := FindByID(ctx, docs[0].ID, &fresh); err != nil || fresh.Name != "a2" || fresh.Version != 1 {
+		t.Errorf("item 0 must be committed with the transaction: %+v %v", fresh, err)
+	}
+	if ok, _ := Exists(ctx, bson.D{{Key: "_id", Value: extra.ID}}, &testBadMarshal{}); !ok {
+		t.Error("the later write must be committed with the transaction")
+	}
+}
+
+func TestSaveMany_ServerErrorInTransaction_LaterWriteFailsLoudly(t *testing.T) {
+	ctx, db, cleanup := setupTestDB(t)
+	defer cleanup()
+	if err := Enforce(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	users := seedUsers(t, ctx, 2)
+	users[1].Email = users[0].Email
+
+	// A driver-managed transaction (no retry loop): after the server aborts
+	// it on the duplicate key, a later write must fail rather than commit on
+	// its own, which is what resetting the client state would have caused.
+	sess, err := db.Client().StartSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.EndSession(ctx)
+	if err := sess.StartTransaction(); err != nil {
+		t.Fatal(err)
+	}
+	sessCtx := mongo.NewSessionContext(ctx, sess)
+	if err := SaveMany(sessCtx, users); !errors.Is(err, ErrDuplicateKey) {
+		t.Fatalf("expected the duplicate key failure, got %v", err)
+	}
+	if err := Create(sessCtx, &testUser{Email: "later@test.com", Name: "L"}); err == nil {
+		t.Fatal("a write after a server-aborted batch must fail")
+	}
+	_ = sess.AbortTransaction(ctx)
+	if ok, _ := Exists(ctx, bson.D{{Key: "email", Value: "later@test.com"}}, &testUser{}); ok {
+		t.Fatal("the later write leaked out of the aborted transaction")
 	}
 }
 
@@ -830,6 +878,21 @@ func TestCreateMany_InTransaction_FailureReportsNothingInserted(t *testing.T) {
 	}
 	if len(be.Errors) != 3 || be.Result.InsertedCount != 0 {
 		t.Errorf("every item must be reported as not inserted with nothing counted: %+v %+v", be.Errors, be.Result)
+	}
+	// Ordered: items after the failure were never sent.
+	for _, h := range hooked {
+		h.Events = nil
+	}
+	hooked2 := []*testHookUser{{Email: "u0@test.com", Name: "Dup"}, {Email: "c@test.com", Name: "C"}}
+	_ = WithTransaction(ctx, func(ctx context.Context) error {
+		err := CreateMany(ctx, hooked2)
+		if !errors.As(err, &be) {
+			t.Fatalf("expected a BulkError, got %v", err)
+		}
+		return err
+	})
+	if len(be.Errors) != 2 || !errors.Is(be.Errors[1].Err, ErrNotAttempted) {
+		t.Errorf("ordered insert: item 1 must be ErrNotAttempted, got %+v", be.Errors)
 	}
 	for i, h := range hooked {
 		for _, e := range h.Events {
