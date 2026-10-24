@@ -166,23 +166,13 @@ func GenerateModel(coll DiscoveredCollection, opts GenerateOptions) ([]byte, err
 		})
 	}
 
-	// Indexes that tags cannot express: compound, single-key with options
-	// or a custom name, or single-key on a path that is not a generated
-	// field (a dotted path, or a field absent from the sample). Everything
-	// else became a field tag above.
-	generated := map[string]bool{}
-	for _, f := range fields {
-		generated[f.BSONName] = true
-	}
+	// Every index Discover did not express as a field tag: compound indexes,
+	// single-key indexes with options or a custom name, second indexes on a
+	// field, and single-key indexes on paths that are not generated fields.
 	var indexEntries []string
 	for _, idx := range coll.Indexes {
-		if idx.Name == "_id_" {
+		if idx.Name == "_id_" || idx.Tagged {
 			continue
-		}
-		if idx.SingleFieldTag() {
-			if field, _ := parseIndexField(idx.Keys[0]); generated[field] {
-				continue
-			}
 		}
 		if idx.ExpireAfterSeconds != nil {
 			needsTime = true

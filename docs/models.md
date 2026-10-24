@@ -31,7 +31,7 @@ func init() {
 | `UpdatedAt` | `updated_at` | `time.Time` | Set on Create, refreshed on Update |
 | `Version` | `__v` | `int` | Set to 0 on Create, incremented on each Update (optimistic concurrency) |
 
-Always embed with `bson:",inline"` to flatten the fields into the document.
+Always embed with `bson:",inline"` to flatten the fields into the document. goodm follows the driver here: only an embedded struct tagged `inline` is flattened; any other embedded struct is a subdocument field named by its tag or its lowercased type name.
 
 ## Tag Reference
 

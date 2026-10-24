@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 
@@ -567,5 +568,244 @@ func TestDiscover_CustomNamesAndDottedPaths(t *testing.T) {
 	}
 	if strings.Contains(code, `goodm:"index"`) {
 		t.Errorf("a custom-named index must not become a plain tag:\n%s", code)
+	}
+}
+
+// --- third-round review findings ---
+
+func TestUpdateFields_RejectsPathsNotOnModel(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testArrayField{}, "test_array_field", "")
+
+	o := &testOrder{Name: "o", Address: testAddress{Street: "s", City: "c"}, Items: []testOrderItem{{Name: "a", Quantity: 1}}}
+	if err := Create(ctx, o); err != nil {
+		t.Fatal(err)
+	}
+	var ve ValidationErrors
+	if err := UpdateFields(ctx, o, bson.M{"items.2": testOrderItem{Name: "z", Quantity: 5}}); !errors.As(err, &ve) {
+		t.Errorf("index past the end of a slice must be rejected, got %v", err)
+	}
+	if err := UpdateFields(ctx, o, bson.M{"items.2.quantity": 5}); !errors.As(err, &ve) {
+		t.Errorf("nested path past the end of a slice must be rejected, got %v", err)
+	}
+	m := &testArrayField{}
+	if err := Create(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	if err := UpdateFields(ctx, m, bson.M{"coords.5": 1.0}); !errors.As(err, &ve) {
+		t.Errorf("index past a fixed array must be rejected, got %v", err)
+	}
+	var fresh testOrder
+	if err := FindByID(ctx, o.ID, &fresh); err != nil || len(fresh.Items) != 1 {
+		t.Errorf("nothing should have been written: %+v %v", fresh.Items, err)
+	}
+}
+
+func TestUpdateFields_ConversionWhitelist(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testArrayField{}, "test_array_field", "")
+
+	u := seedUsers(t, ctx, 1)[0]
+	m := &testArrayField{Score: 1}
+	if err := Create(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	post := &testPost{Title: "p"}
+	if err := Create(ctx, post); err != nil {
+		t.Fatal(err)
+	}
+
+	var ve ValidationErrors
+	rejected := []struct {
+		model  interface{}
+		fields bson.M
+		why    string
+	}{
+		{m, bson.M{"score": true}, "bool into int"},
+		{m, bson.M{"score": "7"}, "string into int"},
+		{u, bson.M{"email": 42}, "number into string"},
+		{post, bson.M{"author": "hello world!"}, "12-byte string into ObjectID"},
+		{u, bson.M{"profile": int64(1)}, "number into ObjectID"},
+		{m, bson.M{"coords": "nope"}, "string into array"},
+		{m, bson.M{"nested": bson.A{1}}, "array into struct"},
+		{m, bson.M{"nested.inner": []bson.M{{"name": "x", "quantity": true}}}, "bool into nested int"},
+	}
+	for _, c := range rejected {
+		if err := UpdateFields(ctx, c.model, c.fields); !errors.As(err, &ve) {
+			t.Errorf("%s should be a validation error, got %v", c.why, err)
+		}
+	}
+
+	// Allowed conversions.
+	hex := bson.NewObjectID()
+	if err := UpdateFields(ctx, post, bson.M{"author": hex.Hex()}); err != nil || post.AuthorID != hex {
+		t.Errorf("hex string into ObjectID: %v %v", err, post.AuthorID)
+	}
+	if err := UpdateFields(ctx, m, bson.M{"score": int64(9), "coords": []int{1, 2}}); err != nil || m.Score != 9 || m.Coords != [2]float64{1, 2} {
+		t.Errorf("numeric widening and int array into float array: %v %+v", err, m)
+	}
+	if err := UpdateFields(ctx, m, bson.M{"score": uint8(3)}); err != nil || m.Score != 3 {
+		t.Errorf("uint8 into int: %v", err)
+	}
+	if err := UpdateFields(ctx, m, bson.M{"score": int64(math.MaxInt64)}); err != nil {
+		t.Errorf("int64 into int on a 64-bit platform: %v", err)
+	}
+	// nil stores null and leaves the model at the zero value.
+	if err := UpdateFields(ctx, u, bson.M{"age": nil}); err != nil || u.Age != 0 {
+		t.Errorf("nil: %v age=%d", err, u.Age)
+	}
+	var raw bson.M
+	if err := DB().Collection("test_users").FindOne(ctx, bson.D{{Key: "_id", Value: u.ID}}).Decode(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := raw["age"]; !ok || v != nil {
+		t.Errorf("nil should be stored as null, got %v", raw["age"])
+	}
+}
+
+type testFloat32 struct {
+	Model `bson:",inline"`
+	F     float32 `bson:"f"`
+}
+
+func TestUpdateFields_Float32(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testFloat32{}, "test_f32", "")
+	m := &testFloat32{}
+	if err := Create(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	if err := UpdateFields(ctx, m, bson.M{"f": 0.1}); err != nil || m.F != float32(0.1) {
+		t.Fatalf("0.1 into float32: %v f=%v", err, m.F)
+	}
+	var fresh testFloat32
+	if err := FindByID(ctx, m.ID, &fresh); err != nil || fresh.F != float32(0.1) {
+		t.Fatalf("stored float32 must read back: %v f=%v", err, fresh.F)
+	}
+}
+
+// TestAudit is exported so the driver stores it (an unexported embedded
+// struct is skipped by the driver and by goodm alike).
+type TestAudit struct {
+	By string `bson:"by"`
+}
+
+type testNonInlineEmbed struct {
+	Model     `bson:",inline"`
+	TestAudit        // not inline: stored as "testaudit": {by: ...}
+	Name      string `bson:"name"`
+}
+
+func TestNonInlineEmbed_IsASubdocument(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testNonInlineEmbed{}, "test_non_inline", "")
+
+	schema, _ := SchemaOf(&testNonInlineEmbed{})
+	if schema.HasField("by") {
+		t.Fatal("a non-inline embed must not be flattened into the schema")
+	}
+	if f := schema.GetField("testaudit"); f == nil || len(f.SubFields) != 1 {
+		t.Fatalf("expected a testaudit subdocument field, got %+v", f)
+	}
+
+	m := &testNonInlineEmbed{TestAudit: TestAudit{By: "a"}, Name: "n"}
+	if err := Create(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	if err := UpdateFields(ctx, m, bson.M{"by": "b"}); err == nil {
+		t.Error("top-level \"by\" is not a field of this document and must be rejected")
+	}
+	if err := UpdateFields(ctx, m, bson.M{"testaudit.by": "b"}); err != nil || m.By != "b" {
+		t.Fatalf("nested path through the embed: %v by=%q", err, m.By)
+	}
+	var fresh testNonInlineEmbed
+	if err := FindByID(ctx, m.ID, &fresh); err != nil || fresh.By != "b" {
+		t.Errorf("not persisted where the driver reads it: %+v %v", fresh, err)
+	}
+}
+
+type testSharedPartialA struct {
+	Model `bson:",inline"`
+	Age   int `bson:"age"`
+}
+
+func (m *testSharedPartialA) Indexes() []CompoundIndex {
+	return []CompoundIndex{{Fields: []string{"age"}, Name: "adults", PartialFilter: bson.M{"age": bson.M{"$gt": 5, "$lt": 100}}}}
+}
+
+type testSharedPartialB struct {
+	Model `bson:",inline"`
+	Age   int64 `bson:"age"`
+}
+
+func (m *testSharedPartialB) Indexes() []CompoundIndex {
+	return []CompoundIndex{{Fields: []string{"age"}, Name: "adults", PartialFilter: bson.D{{Key: "age", Value: bson.D{{Key: "$lt", Value: int64(100)}, {Key: "$gt", Value: 5}}}}}}
+}
+
+func TestPlanMigration_EquivalentDefinitionsAreNotConflicts(t *testing.T) {
+	ctx, db, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testSharedPartialA{}, "test_shared_partial", "")
+	registerModel(t, &testSharedPartialB{}, "test_shared_partial", "")
+	sa, _ := SchemaOf(&testSharedPartialA{})
+	sb, _ := SchemaOf(&testSharedPartialB{})
+	for i := 0; i < 50; i++ {
+		if _, err := PlanMigration(ctx, db, []*Schema{sa, sb}); err != nil {
+			t.Fatalf("run %d: equivalent partial filters reported as a conflict: %v", i, err)
+		}
+	}
+	if !collationsEquivalent(&options.Collation{Locale: "en"}, &options.Collation{Locale: "en", Strength: 3}) {
+		t.Error("collation defaults must compare equal")
+	}
+	if collationsEquivalent(&options.Collation{Locale: "en"}, &options.Collation{Locale: "en", Strength: 2}) {
+		t.Error("different strengths must differ")
+	}
+	// Enforce twice with a nested-map partial filter must be stable too.
+	if err := Enforce(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 10; i++ {
+		if err := Enforce(ctx, db, EnforceOptions{IndexMismatchPolicy: IndexMismatchError}); err != nil {
+			t.Fatalf("Enforce run %d reported a mismatch on an identical partial filter: %v", i, err)
+		}
+	}
+}
+
+func TestDiscover_TwoIndexesOnOneField(t *testing.T) {
+	ctx, db, cleanup := setupTestDB(t)
+	defer cleanup()
+	coll := db.Collection("disc3")
+	if _, err := coll.InsertOne(ctx, bson.D{{Key: "email", Value: "e"}, {Key: "score", Value: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := coll.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{{Key: "email", Value: 1}}, Options: options.Index().SetUnique(true)},
+		{Keys: bson.D{{Key: "email", Value: "hashed"}}},
+		{Keys: bson.D{{Key: "score", Value: 1}}, Options: options.Index().SetSparse(true)},
+		{Keys: bson.D{{Key: "score", Value: -1}}, Options: options.Index().SetExpireAfterSeconds(60)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found, err := Discover(ctx, db, DiscoverOptions{Collections: []string{"disc3"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, err := GenerateModel(found[0], GenerateOptions{PackageName: "models", EmbedModel: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := string(src)
+	if strings.Contains(code, "unique,index=hashed") || strings.Contains(code, "index=-1,ttl=60\"") && strings.Contains(code, "sparse") && !strings.Contains(code, "Indexes()") {
+		t.Errorf("indexes on one field must not be merged into one tag:\n%s", code)
+	}
+	tags := strings.Count(code, `goodm:"`)
+	entries := strings.Count(code, "Fields: []string") + strings.Count(code, "goodm.NewCompoundIndex(") + strings.Count(code, "goodm.NewUniqueCompoundIndex(")
+	if tags != 2 || entries != 2 {
+		t.Errorf("expected 2 field tags and 2 Indexes() entries, got %d and %d:\n%s", tags, entries, code)
 	}
 }

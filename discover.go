@@ -38,6 +38,10 @@ type DiscoveredIndex struct {
 	ExpireAfterSeconds *int32
 	HasPartialFilter   bool // cannot be reproduced from the index listing alone
 	HasCollation       bool // cannot be reproduced from the index listing alone
+
+	// Tagged is set when Discover expressed this index as tags on a field;
+	// every other index belongs in the generated Indexes() method.
+	Tagged bool
 }
 
 // SingleFieldTag reports whether the index can be expressed entirely by tags
@@ -116,10 +120,13 @@ func discoverCollection(ctx context.Context, coll *mongo.Collection, opts Discov
 	}
 	dc.Indexes = indexes
 
-	// Merge single-field index info into fields
+	// Express at most one single-field index per field as tags; any further
+	// index on the same field (e.g. a hashed index next to a unique one) is
+	// left for Indexes().
 	for i := range dc.Fields {
-		for _, idx := range dc.Indexes {
-			if !idx.SingleFieldTag() {
+		for j := range dc.Indexes {
+			idx := &dc.Indexes[j]
+			if !idx.SingleFieldTag() || idx.Tagged {
 				continue
 			}
 			field, kind := parseIndexField(idx.Keys[0])
@@ -136,6 +143,8 @@ func discoverCollection(ctx context.Context, coll *mongo.Collection, opts Discov
 			}
 			dc.Fields[i].Sparse = idx.Sparse
 			dc.Fields[i].TTL = idx.ExpireAfterSeconds
+			idx.Tagged = true
+			break
 		}
 	}
 

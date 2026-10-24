@@ -5,8 +5,12 @@ import (
 	"strings"
 )
 
-// StructFields returns all exported fields of a struct, flattening embedded structs.
-// It accepts a reflect.Type that must be a struct type.
+// StructFields returns all exported fields of a struct, flattening embedded
+// structs the way the BSON driver does: only an anonymous struct tagged
+// bson:",inline" is flattened. Any other embedded struct is returned as a
+// field of its own, which the driver stores as a subdocument named by its
+// tag or its lowercased type name. It accepts a reflect.Type that must be a
+// struct type.
 func StructFields(t reflect.Type) []reflect.StructField {
 	if t.Kind() == reflect.Pointer {
 		t = t.Elem()
@@ -21,15 +25,30 @@ func StructFields(t reflect.Type) []reflect.StructField {
 		if !f.IsExported() {
 			continue
 		}
-		// Flatten embedded structs
-		if f.Anonymous {
-			embedded := StructFields(f.Type)
-			fields = append(fields, embedded...)
-			continue
+		if f.Anonymous && IsInlineTag(f.Tag.Get("bson")) {
+			ft := f.Type
+			if ft.Kind() == reflect.Pointer {
+				ft = ft.Elem()
+			}
+			if ft.Kind() == reflect.Struct {
+				fields = append(fields, StructFields(ft)...)
+				continue
+			}
 		}
 		fields = append(fields, f)
 	}
 	return fields
+}
+
+// IsInlineTag reports whether a `bson:"..."` tag carries the inline option.
+func IsInlineTag(tag string) bool {
+	parts := strings.Split(tag, ",")
+	for _, p := range parts[1:] {
+		if strings.TrimSpace(p) == "inline" {
+			return true
+		}
+	}
+	return false
 }
 
 // TypeName returns a human-readable type name for a reflect.Type.

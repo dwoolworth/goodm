@@ -3,6 +3,8 @@ package goodm
 import (
 	"strconv"
 	"strings"
+
+	"github.com/dwoolworth/goodm/internal"
 )
 
 // ParseGoodmTag parses a `goodm:"..."` struct tag value into FieldSchema attributes.
@@ -95,11 +97,5 @@ func ParseBSONTag(tag string) (name string, omitempty bool) {
 
 // bsonTagInline reports whether a `bson:"..."` tag carries the inline option.
 func bsonTagInline(tag string) bool {
-	parts := strings.Split(tag, ",")
-	for _, p := range parts[1:] {
-		if strings.TrimSpace(p) == "inline" {
-			return true
-		}
-	}
-	return false
+	return internal.IsInlineTag(tag)
 }

@@ -291,7 +291,7 @@ func indexKeyString(v interface{}) string {
 }
 
 // partialFiltersEqual compares a desired partial filter against the raw
-// expression reported by the server, after normalizing both through BSON.
+// expression reported by the server, after canonicalizing both.
 func partialFiltersEqual(desired interface{}, existing bson.Raw) bool {
 	if desired == nil && len(existing) == 0 {
 		return true
@@ -299,15 +299,107 @@ func partialFiltersEqual(desired interface{}, existing bson.Raw) bool {
 	if desired == nil || len(existing) == 0 {
 		return false
 	}
-	want, err := toBsonMap(desired)
+	want, err := canonicalBSON(desired)
 	if err != nil {
 		return false
 	}
-	var have bson.M
-	if err := bson.Unmarshal(existing, &have); err != nil {
+	have, err := canonicalBSON(existing)
+	if err != nil {
 		return false
 	}
 	return reflect.DeepEqual(want, have)
+}
+
+// filtersEquivalent compares two filter documents from Go code canonically.
+func filtersEquivalent(a, b interface{}) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	ca, errA := canonicalBSON(a)
+	cb, errB := canonicalBSON(b)
+	return errA == nil && errB == nil && reflect.DeepEqual(ca, cb)
+}
+
+// canonicalBSON round-trips a document through BSON and returns a form in
+// which documents have sorted keys and all numbers are float64, so two ways
+// of writing the same filter (bson.M vs bson.D, int vs int64) compare equal.
+func canonicalBSON(v interface{}) (interface{}, error) {
+	raw, err := bson.Marshal(bson.D{{Key: "v", Value: v}})
+	if err != nil {
+		return nil, err
+	}
+	var holder struct {
+		V interface{} `bson:"v"`
+	}
+	if err := bson.Unmarshal(raw, &holder); err != nil {
+		return nil, err
+	}
+	return canonicalValue(holder.V), nil
+}
+
+func canonicalValue(v interface{}) interface{} {
+	switch x := v.(type) {
+	case bson.D:
+		out := make(bson.D, len(x))
+		for i, e := range x {
+			out[i] = bson.E{Key: e.Key, Value: canonicalValue(e.Value)}
+		}
+		sort.SliceStable(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+		return out
+	case bson.M:
+		out := make(bson.D, 0, len(x))
+		for k, val := range x {
+			out = append(out, bson.E{Key: k, Value: canonicalValue(val)})
+		}
+		sort.SliceStable(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+		return out
+	case bson.A:
+		out := make(bson.A, len(x))
+		for i, e := range x {
+			out[i] = canonicalValue(e)
+		}
+		return out
+	case []interface{}:
+		out := make(bson.A, len(x))
+		for i, e := range x {
+			out[i] = canonicalValue(e)
+		}
+		return out
+	case int:
+		return float64(x)
+	case int32:
+		return float64(x)
+	case int64:
+		return float64(x)
+	case float32:
+		return float64(x)
+	}
+	return v
+}
+
+// collationsEquivalent compares two collations from Go code with the server's
+// defaults filled in, so {Locale: "en"} equals {Locale: "en", Strength: 3}.
+func collationsEquivalent(a, b *options.Collation) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return normalizeCollation(*a) == normalizeCollation(*b)
+}
+
+func normalizeCollation(c options.Collation) options.Collation {
+	if c.Strength == 0 {
+		c.Strength = 3
+	}
+	if c.CaseFirst == "" {
+		c.CaseFirst = "off"
+	}
+	if c.Alternate == "" {
+		c.Alternate = "non-ignorable"
+	}
+	if c.MaxVariable == "" {
+		c.MaxVariable = "punct"
+	}
+	return c
 }
 
 // collationsEqual reports whether the collation the server stores satisfies

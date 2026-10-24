@@ -3,9 +3,7 @@ package goodm
 import (
 	"context"
 	"fmt"
-	"reflect"
 
-	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
@@ -149,24 +147,16 @@ type indexOrigin struct {
 	def    IndexDefinition
 }
 
-// indexDefinitionsEqual reports whether two definitions describe the same index.
+// indexDefinitionsEqual reports whether two definitions describe the same
+// index, comparing partial filters and collations by meaning rather than by
+// how they were written.
 func indexDefinitionsEqual(a, b IndexDefinition) bool {
-	if !indexKeysEqual(a.Keys, b.Keys) || a.Unique != b.Unique || a.Sparse != b.Sparse || !ttlEqual(a.ExpireAfterSeconds, b.ExpireAfterSeconds) {
-		return false
-	}
-	pa, errA := toBsonMapOrNil(a.PartialFilter)
-	pb, errB := toBsonMapOrNil(b.PartialFilter)
-	if errA != nil || errB != nil || !reflect.DeepEqual(pa, pb) {
-		return false
-	}
-	return reflect.DeepEqual(a.Collation, b.Collation)
-}
-
-func toBsonMapOrNil(v interface{}) (bson.M, error) {
-	if v == nil {
-		return nil, nil
-	}
-	return toBsonMap(v)
+	return indexKeysEqual(a.Keys, b.Keys) &&
+		a.Unique == b.Unique &&
+		a.Sparse == b.Sparse &&
+		ttlEqual(a.ExpireAfterSeconds, b.ExpireAfterSeconds) &&
+		filtersEquivalent(a.PartialFilter, b.PartialFilter) &&
+		collationsEquivalent(a.Collation, b.Collation)
 }
 
 // describeIndexOptions renders the notable options of a definition for plan output.

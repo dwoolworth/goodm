@@ -248,7 +248,7 @@ func TestBuildReplacement_WithUnset(t *testing.T) {
 
 // validateUpdateFields adapts prepareUpdateFields for the assertions below.
 func validateUpdateFields(schema *Schema, fields bson.M) error {
-	_, err := prepareUpdateFields(schema, fields)
+	_, _, err := prepareUpdateFields(schema, &testUser{}, fields)
 	return err
 }
 
