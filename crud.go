@@ -753,17 +753,65 @@ func isNilValue(val interface{}) bool {
 	return false
 }
 
-// walkPath follows a dotted path from root and returns the addressed value.
+// walkPath follows a dotted path from root and reports whether it addresses
+// a settable value. A segment declared by a nil inline pointer embed is still
+// a top-level key of the document, so from there the rest of the path is
+// checked against the types alone; applyFieldsToModel allocates the embed
+// after the write.
 func walkPath(root reflect.Value, path string) (reflect.Value, bool) {
+	segs := strings.Split(path, ".")
 	target := root
-	var ok bool
-	for _, seg := range strings.Split(path, ".") {
-		target, ok = stepInto(target, seg)
-		if !ok {
-			return target, false
+	for i, seg := range segs {
+		next, ok := stepInto(target, seg)
+		if ok {
+			target = next
+			continue
 		}
+		cur := target
+		if cur.Kind() == reflect.Pointer && !cur.IsNil() {
+			cur = cur.Elem()
+		}
+		if cur.Kind() == reflect.Struct && typePathExists(cur.Type(), segs[i:]) {
+			return reflect.Value{}, true
+		}
+		return reflect.Value{}, false
 	}
 	return target, target.IsValid() && target.CanSet()
+}
+
+// typePathExists reports whether a dotted path can be resolved on a type:
+// struct segments by bson name through inline embeds, numeric segments on
+// slices (any index) and arrays (within bounds).
+func typePathExists(t reflect.Type, segs []string) bool {
+	for _, seg := range segs {
+		if t.Kind() == reflect.Pointer {
+			t = t.Elem()
+		}
+		switch t.Kind() {
+		case reflect.Struct:
+			var found *reflect.StructField
+			for _, f := range internal.StructFields(t) {
+				if bsonFieldName(f) == seg {
+					f := f
+					found = &f
+					break
+				}
+			}
+			if found == nil {
+				return false
+			}
+			t = found.Type
+		case reflect.Slice, reflect.Array:
+			n, err := strconv.Atoi(seg)
+			if err != nil || n < 0 || (t.Kind() == reflect.Array && n >= t.Len()) {
+				return false
+			}
+			t = t.Elem()
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // convertValue converts a caller-supplied value to a field's Go type. Only
@@ -861,6 +909,9 @@ func convertValue(val interface{}, t reflect.Type) (reflect.Value, error) {
 			if bin.Subtype != 0 && bin.Subtype != 2 {
 				return reflect.Value{}, fmt.Errorf("binary subtype %d does not convert to %s", bin.Subtype, t)
 			}
+			if !reflect.TypeOf(bin.Data).ConvertibleTo(t) {
+				return reflect.Value{}, fmt.Errorf("binary data does not convert to %s", t)
+			}
 			return reflect.ValueOf(bin.Data).Convert(t), nil
 		}
 		if valueClass(rv.Type()) == classBinary && rv.Type().ConvertibleTo(t) {
@@ -907,8 +958,24 @@ var (
 	bsonRawType    = reflect.TypeOf(bson.Raw{})
 )
 
+// bsonScalarStructs are struct types that encode as BSON scalars, so they
+// are never documents.
+var bsonScalarStructs = map[reflect.Type]bool{
+	reflect.TypeOf(bson.Regex{}):         true,
+	reflect.TypeOf(bson.Timestamp{}):     true,
+	reflect.TypeOf(bson.Undefined{}):     true,
+	reflect.TypeOf(bson.Null{}):          true,
+	reflect.TypeOf(bson.MinKey{}):        true,
+	reflect.TypeOf(bson.MaxKey{}):        true,
+	reflect.TypeOf(bson.CodeWithScope{}): true,
+	reflect.TypeOf(bson.DBPointer{}):     true,
+}
+
 // valueClass groups Go types by the BSON shape they take.
 func valueClass(t reflect.Type) typeClass {
+	if bsonScalarStructs[t] {
+		return classOther
+	}
 	switch {
 	case t == timeType, t == dateTimeType:
 		return classTime
@@ -1040,7 +1107,7 @@ func convertDocument(rv reflect.Value, t reflect.Type) (reflect.Value, error) {
 	switch t.Kind() {
 	case reflect.Struct:
 		for _, p := range pairs {
-			f := fieldByBSONName(out, p.Key)
+			f := fieldByBSONName(out, p.Key, true)
 			if !f.IsValid() || !f.CanSet() {
 				continue // undeclared key: dropped, as Update drops it
 			}
@@ -1110,16 +1177,14 @@ func structPairs(v reflect.Value) bson.D {
 			continue
 		}
 		f := v.Field(i)
-		if sf.Anonymous && bsonTagInline(sf.Tag.Get("bson")) {
+		if internal.IsInlineStruct(sf) {
 			if f.Kind() == reflect.Pointer {
 				if f.IsNil() {
 					continue
 				}
 				f = f.Elem()
 			}
-			if f.Kind() == reflect.Struct {
-				out = append(out, structPairs(f)...)
-			}
+			out = append(out, structPairs(f)...)
 			continue
 		}
 		name := bsonFieldName(sf)
@@ -1244,7 +1309,7 @@ func applyFieldsToModel(model interface{}, values map[string]reflect.Value) {
 		target := root
 		ok := true
 		for _, seg := range strings.Split(path, ".") {
-			target, ok = stepInto(target, seg)
+			target, ok = stepIntoAlloc(target, seg)
 			if !ok {
 				break
 			}
@@ -1254,6 +1319,20 @@ func applyFieldsToModel(model interface{}, values map[string]reflect.Value) {
 		}
 		target.Set(val)
 	}
+}
+
+// stepIntoAlloc is stepInto for a write that has already happened: a nil
+// inline pointer embed declaring the segment is allocated so the value can
+// be copied onto the model.
+func stepIntoAlloc(v reflect.Value, seg string) (reflect.Value, bool) {
+	if v.Kind() == reflect.Pointer && !v.IsNil() {
+		v = v.Elem()
+	}
+	if v.Kind() == reflect.Struct {
+		f := fieldByBSONName(v, seg, true)
+		return f, f.IsValid()
+	}
+	return stepInto(v, seg)
 }
 
 // stepInto resolves one path segment from v: a bson field name on a struct or
@@ -1267,7 +1346,7 @@ func stepInto(v reflect.Value, seg string) (reflect.Value, bool) {
 	}
 	switch v.Kind() {
 	case reflect.Struct:
-		f := fieldByBSONName(v, seg)
+		f := fieldByBSONName(v, seg, false)
 		return f, f.IsValid()
 	case reflect.Slice, reflect.Array:
 		i, err := strconv.Atoi(seg)
@@ -1280,14 +1359,17 @@ func stepInto(v reflect.Value, seg string) (reflect.Value, bool) {
 }
 
 // fieldByBSONName finds the struct field the driver stores under name: a
-// direct field first, then fields promoted through exported inline embeds,
-// which is the driver's own precedence. A nil pointer embed is allocated
-// only when it declares the name.
-func fieldByBSONName(v reflect.Value, name string) reflect.Value {
+// direct field first, then fields flattened from inline struct fields, which
+// is the driver's own precedence. With alloc set, a nil inline pointer is
+// allocated when it declares the name; otherwise the walk stops there.
+func fieldByBSONName(v reflect.Value, name string, alloc bool) reflect.Value {
+	if name == "-" {
+		return reflect.Value{}
+	}
 	t := v.Type()
 	for i := 0; i < t.NumField(); i++ {
 		sf := t.Field(i)
-		if !sf.IsExported() || (sf.Anonymous && bsonTagInline(sf.Tag.Get("bson"))) {
+		if !sf.IsExported() || internal.IsInlineStruct(sf) {
 			continue
 		}
 		if bsonFieldName(sf) == name {
@@ -1296,23 +1378,21 @@ func fieldByBSONName(v reflect.Value, name string) reflect.Value {
 	}
 	for i := 0; i < t.NumField(); i++ {
 		sf := t.Field(i)
-		if !sf.IsExported() || !sf.Anonymous || !bsonTagInline(sf.Tag.Get("bson")) {
+		if !internal.IsInlineStruct(sf) {
 			continue
 		}
 		inner := v.Field(i)
 		if inner.Kind() == reflect.Pointer {
 			if inner.IsNil() {
-				if !inner.CanSet() || inner.Type().Elem().Kind() != reflect.Struct || !typeHasBSONName(inner.Type().Elem(), name) {
+				if !alloc || !inner.CanSet() || !typeHasBSONName(inner.Type().Elem(), name) {
 					continue
 				}
 				inner.Set(reflect.New(inner.Type().Elem()))
 			}
 			inner = inner.Elem()
 		}
-		if inner.Kind() == reflect.Struct {
-			if f := fieldByBSONName(inner, name); f.IsValid() {
-				return f
-			}
+		if f := fieldByBSONName(inner, name, alloc); f.IsValid() {
+			return f
 		}
 	}
 	return reflect.Value{}
@@ -1972,13 +2052,39 @@ func coerceID(schema *Schema, id interface{}) (interface{}, error) {
 	return id, nil
 }
 
-// setTimestamps sets CreatedAt (if zero) and UpdatedAt on a model via reflection.
-func setTimestamps(model interface{}, now time.Time) {
+// managedField returns the model's field stored under one of goodm's managed
+// bson names, resolved through the registered schema so a promoted Go field
+// of the same name elsewhere cannot be mistaken for it. Unregistered values
+// fall back to the Go field name.
+func managedField(model interface{}, bsonName, goName string) reflect.Value {
 	v := reflect.ValueOf(model)
 	if v.Kind() == reflect.Pointer {
 		v = v.Elem()
 	}
-	if f := v.FieldByName("CreatedAt"); f.IsValid() && f.CanSet() && f.Type() == reflect.TypeOf(time.Time{}) {
+	if v.Kind() != reflect.Struct {
+		return reflect.Value{}
+	}
+	if schema, ok := SchemaOf(model); ok {
+		var path []int
+		switch bsonName {
+		case "created_at":
+			path = schema.createdAt
+		case "updated_at":
+			path = schema.updatedAt
+		case "__v":
+			path = schema.version
+		}
+		if path == nil {
+			return reflect.Value{}
+		}
+		return fieldByIndex(v, path)
+	}
+	return v.FieldByName(goName)
+}
+
+// setTimestamps sets created_at (if zero) and updated_at on a model.
+func setTimestamps(model interface{}, now time.Time) {
+	if f := managedField(model, "created_at", "CreatedAt"); f.IsValid() && f.CanSet() && f.Type() == reflect.TypeOf(time.Time{}) {
 		if f.Interface().(time.Time).IsZero() {
 			f.Set(reflect.ValueOf(now))
 		}
@@ -1986,13 +2092,9 @@ func setTimestamps(model interface{}, now time.Time) {
 	setUpdatedAt(model, now)
 }
 
-// setUpdatedAt sets only UpdatedAt on a model via reflection.
+// setUpdatedAt sets only updated_at on a model.
 func setUpdatedAt(model interface{}, now time.Time) {
-	v := reflect.ValueOf(model)
-	if v.Kind() == reflect.Pointer {
-		v = v.Elem()
-	}
-	if f := v.FieldByName("UpdatedAt"); f.IsValid() && f.CanSet() && f.Type() == reflect.TypeOf(time.Time{}) {
+	if f := managedField(model, "updated_at", "UpdatedAt"); f.IsValid() && f.CanSet() && f.Type() == reflect.TypeOf(time.Time{}) {
 		f.Set(reflect.ValueOf(now))
 	}
 }
@@ -2052,26 +2154,18 @@ func hasImmutableFields(schema *Schema) bool {
 	return false
 }
 
-// getModelVersion extracts the Version field from a model via reflection.
+// getModelVersion extracts the __v field from a model.
 func getModelVersion(model interface{}) (int, error) {
-	v := reflect.ValueOf(model)
-	if v.Kind() == reflect.Pointer {
-		v = v.Elem()
-	}
-	f := v.FieldByName("Version")
+	f := managedField(model, "__v", "Version")
 	if !f.IsValid() || !f.CanInt() {
 		return 0, fmt.Errorf("goodm: model has no Version field")
 	}
 	return int(f.Int()), nil
 }
 
-// setModelVersion sets the Version field on a model via reflection.
+// setModelVersion sets the __v field on a model.
 func setModelVersion(model interface{}, version int) {
-	v := reflect.ValueOf(model)
-	if v.Kind() == reflect.Pointer {
-		v = v.Elem()
-	}
-	if f := v.FieldByName("Version"); f.IsValid() && f.CanSet() && f.CanInt() {
+	if f := managedField(model, "__v", "Version"); f.IsValid() && f.CanSet() && f.CanInt() {
 		f.SetInt(int64(version))
 	}
 }

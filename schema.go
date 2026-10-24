@@ -64,7 +64,10 @@ type Schema struct {
 	Hooks           []string          // hook interface names the model implements
 	CollOptions     CollectionOptions // per-schema read/write concern and read preference
 
-	idField []int // reflect field index path of the _id field, nil if none
+	idField   []int // reflect field index path of the _id field, nil if none
+	createdAt []int // index path of the time.Time field stored as created_at, if any
+	updatedAt []int // index path of the time.Time field stored as updated_at, if any
+	version   []int // index path of the integer field stored as __v, if any
 }
 
 // QualifiedName returns the package path and struct name, e.g.

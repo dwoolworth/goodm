@@ -1203,3 +1203,184 @@ func TestUpdateFields_Float32ExactnessBinaryAndNaN(t *testing.T) {
 		t.Errorf("omitempty zero field must be skipped: %v", pairs)
 	}
 }
+
+// --- sixth-round review findings ---
+
+type testMeta struct {
+	Email string `bson:"email" goodm:"unique"`
+	Tag   string `bson:"tag"`
+}
+
+type testNamedInline struct {
+	Model `bson:",inline"`
+	Meta  testMeta `bson:",inline"` // named, not embedded: the driver still flattens it
+	Name  string   `bson:"name"`
+}
+
+func TestNamedInlineStructField_IsFlattened(t *testing.T) {
+	ctx, db, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testNamedInline{}, "test_named_inline", "")
+	schema, _ := SchemaOf(&testNamedInline{})
+	if !schema.HasField("email") || schema.HasField("meta") {
+		t.Fatalf("a named inline struct must be flattened: %+v", schema.Fields)
+	}
+	if err := Enforce(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	a := &testNamedInline{Meta: testMeta{Email: "a@x"}, Name: "a"}
+	b := &testNamedInline{Meta: testMeta{Email: "b@x"}, Name: "b"}
+	if err := Create(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	if err := Create(ctx, b); err != nil {
+		t.Fatalf("distinct emails must not collide on a phantom meta.email index: %v", err)
+	}
+	if err := UpdateFields(ctx, a, bson.M{"email": "a2@x"}); err != nil || a.Meta.Email != "a2@x" {
+		t.Errorf("UpdateFields on a flattened field: %v %+v", err, a.Meta)
+	}
+	if err := UpdateFields(ctx, a, bson.M{"meta.email": "nope"}); err == nil {
+		t.Error("the Go field name of an inline struct is not a document path")
+	}
+}
+
+type RvAudit struct {
+	UpdatedAt time.Time `bson:"when"`
+	Version   int       `bson:"rev"`
+}
+
+type testAmbiguousManaged struct {
+	Model   `bson:",inline"`
+	RvAudit `bson:"audit"`
+	Name    string `bson:"name"`
+}
+
+func TestManagedFields_ResolvedByBSONName(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testAmbiguousManaged{}, "test_ambiguous", "")
+	m := &testAmbiguousManaged{Name: "n"}
+	if err := Create(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	if m.Model.UpdatedAt.IsZero() || !m.RvAudit.UpdatedAt.IsZero() {
+		t.Errorf("updated_at must land on Model, not the subdocument: %v %v", m.Model.UpdatedAt, m.RvAudit.UpdatedAt)
+	}
+	m.Name = "n2"
+	if err := Update(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	if m.Model.Version != 1 || m.RvAudit.Version != 0 {
+		t.Errorf("__v must increment on Model only: model=%d audit=%d", m.Model.Version, m.RvAudit.Version)
+	}
+	stale := *m
+	stale.Model.Version = 0
+	stale.Name = "stale"
+	if err := Update(ctx, &stale); !errors.Is(err, ErrVersionConflict) {
+		t.Errorf("optimistic locking must still work: %v", err)
+	}
+}
+
+type myByte uint8
+
+type testConvMore struct {
+	Model `bson:",inline"`
+	Bytes []myByte `bson:"bytes"`
+	Doc   struct {
+		A int `bson:"a"`
+	} `bson:"doc"`
+	Ignored string `bson:"-"`
+}
+
+type RvReqExtra struct {
+	Nick string `bson:"nick" goodm:"required"`
+}
+
+type testNilReq struct {
+	Model       `bson:",inline"`
+	*RvReqExtra `bson:",inline"`
+	Age         int `bson:"age" goodm:"min=0"`
+}
+
+func TestConverterAndValidation_RoundSix(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testConvMore{}, "test_conv_more", "")
+	registerModel(t, &testNilReq{}, "test_nil_req", "")
+
+	m := &testConvMore{}
+	if err := Create(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	var ve ValidationErrors
+	if err := UpdateFields(ctx, m, bson.M{"bytes": bson.Binary{Data: []byte{1}}}); !errors.As(err, &ve) {
+		t.Errorf("binary into a named byte slice must be a validation error, not a panic: %v", err)
+	}
+	if err := UpdateFields(ctx, m, bson.M{"doc": bson.Regex{Pattern: "x"}}); !errors.As(err, &ve) {
+		t.Errorf("a BSON regex is not a document: %v", err)
+	}
+	if err := UpdateFields(ctx, m, bson.M{"-": 1}); err == nil {
+		t.Error("the - key must be rejected")
+	}
+
+	// A required field behind a nil inline pointer embed is missing.
+	if err := Create(ctx, &testNilReq{}); !errors.As(err, &ve) || !hasFieldError(ve, "nick") {
+		t.Errorf("required field in a nil inline embed must fail Create, got %v", err)
+	}
+	n := &testNilReq{RvReqExtra: &RvReqExtra{Nick: "k"}}
+	if err := Create(ctx, n); err != nil {
+		t.Fatal(err)
+	}
+	// A failed UpdateFields must not touch the model (no embed allocation).
+	n2 := &testNilReq{Model: n.Model, Age: 1}
+	if err := UpdateFields(ctx, n2, bson.M{"nick": "x", "age": -1}); !errors.As(err, &ve) {
+		t.Fatalf("expected a validation error, got %v", err)
+	}
+	if n2.RvReqExtra != nil {
+		t.Error("a failed UpdateFields must leave a nil inline embed nil")
+	}
+	// A successful one allocates it to reflect the value.
+	if err := UpdateFields(ctx, n2, bson.M{"nick": "y"}); err != nil || n2.RvReqExtra == nil || n2.Nick != "y" {
+		t.Errorf("successful UpdateFields through a nil embed: %v %+v", err, n2.RvReqExtra)
+	}
+}
+
+type Doc map[string]any
+
+func TestCanonicalBSON_NamedMapTypes(t *testing.T) {
+	f := bson.M{"s": Doc{"a": 1, "b": 2, "c": 3, "d": 4}, "t": map[string]string{"x": "1", "y": "2", "z": "3"}}
+	for i := 0; i < 50; i++ {
+		if !filtersEquivalent(f, f) {
+			t.Fatalf("run %d: a filter must equal itself regardless of map iteration order", i)
+		}
+	}
+}
+
+type RvRefBase struct {
+	Author bson.ObjectID `bson:"author" goodm:"ref=test_users"`
+}
+
+type testPopulateShadow struct {
+	Model     `bson:",inline"`
+	RvRefBase `bson:",inline"`
+	Author    string `bson:"author_name"` // same Go name as the promoted ref field
+}
+
+func TestPopulate_UsesSchemaPathForShadowedGoName(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testPopulateShadow{}, "test_pop_shadow", "")
+	u := seedUsers(t, ctx, 1)[0]
+	p := &testPopulateShadow{RvRefBase: RvRefBase{Author: u.ID}, Author: "name"}
+	if err := Create(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	var author testUser
+	if err := Populate(ctx, p, Refs{"author": &author}); err != nil || author.ID != u.ID {
+		t.Fatalf("Populate must read the promoted ref field, not the shadowing one: %v %v", err, author.ID)
+	}
+	var authors []testUser
+	if err := BatchPopulate(ctx, []*testPopulateShadow{p}, "author", &authors); err != nil || len(authors) != 1 {
+		t.Fatalf("BatchPopulate: %v %d", err, len(authors))
+	}
+}

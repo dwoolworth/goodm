@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/dwoolworth/goodm/internal"
 )
@@ -43,6 +44,7 @@ func Register(model interface{}, collection string) error {
 		return fmt.Errorf("goodm: model %s has two fields stored as %q; the driver keeps only one", schema.QualifiedName(), dup)
 	}
 	schema.idField = findIDField(t)
+	schema.createdAt, schema.updatedAt, schema.version = findManagedFields(schema.Fields)
 	if schema.idField == nil {
 		if embedsModelWithoutInline(t) {
 			return fmt.Errorf("goodm: model %s embeds goodm.Model without the bson:\",inline\" tag, so its _id would be stored nested; embed it as goodm.Model with the tag bson:\",inline\"", schema.QualifiedName())
@@ -249,6 +251,31 @@ func findIDField(t reflect.Type) []int {
 		}
 	}
 	return nil
+}
+
+// findManagedFields locates the fields goodm maintains by the bson names the
+// documents use, so a promoted Go field of the same name elsewhere in the
+// struct cannot be mistaken for them.
+func findManagedFields(fields []FieldSchema) (createdAt, updatedAt, version []int) {
+	for _, f := range fields {
+		switch {
+		case f.BSONName == "created_at" && f.goType == reflect.TypeOf(time.Time{}):
+			createdAt = f.index
+		case f.BSONName == "updated_at" && f.goType == reflect.TypeOf(time.Time{}):
+			updatedAt = f.index
+		case f.BSONName == "__v" && f.goType != nil && isIntKind(f.goType.Kind()):
+			version = f.index
+		}
+	}
+	return
+}
+
+func isIntKind(k reflect.Kind) bool {
+	switch k {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return true
+	}
+	return false
 }
 
 // duplicateBSONName returns a bson name two visible fields share, or "".

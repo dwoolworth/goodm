@@ -31,7 +31,7 @@ func init() {
 | `UpdatedAt` | `updated_at` | `time.Time` | Set on Create, refreshed on Update |
 | `Version` | `__v` | `int` | Set to 0 on Create, incremented on each Update (optimistic concurrency) |
 
-Always embed with `bson:",inline"` to flatten the fields into the document. goodm follows the driver's default registry here: only an exported embedded struct tagged `inline` is flattened; any other exported embedded struct is a subdocument field named by its tag or its lowercased type name; unexported fields and embeds are ignored entirely. `Register` rejects a model that stores two fields under the same bson name.
+Always embed with `bson:",inline"` to flatten the fields into the document. goodm follows the driver's default registry here: any exported struct or pointer-to-struct field tagged `inline`, embedded or named, is flattened into the document; an exported embedded struct without the tag is a subdocument field named by its tag or its lowercased type name; unexported fields and embeds are ignored entirely; an inline map declares no schema fields. `Register` rejects a model that stores two fields under the same bson name. The managed fields (`_id`, `created_at`, `updated_at`, `__v`) are located by those bson names, not by Go field names.
 
 ## Tag Reference
 

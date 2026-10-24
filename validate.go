@@ -24,14 +24,18 @@ func validateFields(v reflect.Value, fields []FieldSchema, pathPrefix string) []
 
 	for i := range fields {
 		fs := &fields[i]
-		fv := schemaField(v, fs)
-		if !fv.IsValid() {
-			continue
-		}
-
 		fieldPath := fs.BSONName
 		if pathPrefix != "" {
 			fieldPath = pathPrefix + "." + fs.BSONName
+		}
+		fv := schemaField(v, fs)
+		if !fv.IsValid() {
+			// The field sits behind a nil inline pointer: it is absent from
+			// the document, which only a required rule can object to.
+			if fs.Required {
+				errs = append(errs, ValidationError{Field: fieldPath, Message: "field is required"})
+			}
+			continue
 		}
 		errs = append(errs, validateOneField(fv, fs, fieldPath)...)
 	}

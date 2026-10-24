@@ -404,6 +404,16 @@ func canonicalValueAt(v interface{}, top bool) interface{} {
 	case float64:
 		return canonicalFloat(x)
 	}
+	// Any other string-keyed map (a named map type, map[string]string) is
+	// unordered too and must be sorted before it is marshaled.
+	if rv := reflect.ValueOf(v); rv.IsValid() && rv.Kind() == reflect.Map && rv.Type().Key().Kind() == reflect.String {
+		m := make(map[string]interface{}, rv.Len())
+		iter := rv.MapRange()
+		for iter.Next() {
+			m[iter.Key().String()] = iter.Value().Interface()
+		}
+		return canonicalMap(m)
+	}
 	return v
 }
 
