@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"time"
 
@@ -51,7 +52,7 @@ func saveWithRetry(ctx context.Context, coll *mongo.Collection, schema *Schema, 
 		// changes. The re-read state becomes the base for the next round, so
 		// the other writer's changes are not mistaken for ours on a second
 		// conflict.
-		theirs, err := mergeFromDB(ctx, coll, model, base, id, scope)
+		theirs, err := mergeFromDB(ctx, coll, schema, model, base, id, scope)
 		if err != nil {
 			return err
 		}
@@ -99,7 +100,7 @@ func attemptSave(ctx context.Context, coll *mongo.Collection, schema *Schema, mo
 // and applies non-conflicting changes from the caller onto the fresh DB state.
 // Returns a *MergeConflictError if both sides modified the same fields.
 // It returns the re-read state in map form, the base for a further round.
-func mergeFromDB(ctx context.Context, coll *mongo.Collection, model interface{}, base bson.M, id interface{}, scope interface{}) (bson.M, error) {
+func mergeFromDB(ctx context.Context, coll *mongo.Collection, schema *Schema, model interface{}, base bson.M, id interface{}, scope interface{}) (bson.M, error) {
 	// Re-read the current document from the database.
 	fresh := reflect.New(reflect.TypeOf(model).Elem()).Interface()
 	if err := coll.FindOne(ctx, andFilter(scope, bson.D{{Key: "_id", Value: id}})).Decode(fresh); err != nil {
@@ -129,14 +130,22 @@ func mergeFromDB(ctx context.Context, coll *mongo.Collection, model interface{},
 	// Build merged document: start with theirs, overlay our changes.
 	merged := buildMergedDoc(theirs, ours, ourChanges)
 
-	// Write the merged state back into the caller's model struct.
+	// Write the merged state back into the caller's model struct. Decoding
+	// into the existing struct would keep map keys and omitempty values the
+	// merged document no longer has, so decode into a fresh value and copy
+	// it over, keeping the model's merge base.
 	raw, err := bson.Marshal(merged)
 	if err != nil {
 		return nil, fmt.Errorf("goodm: failed to marshal merged document: %w", err)
 	}
-	if err := bson.Unmarshal(raw, model); err != nil {
+	mv := reflect.ValueOf(model).Elem()
+	freshModel := reflect.New(mv.Type())
+	if err := bson.Unmarshal(raw, freshModel.Interface()); err != nil {
 		return nil, fmt.Errorf("goodm: failed to apply merged document: %w", err)
 	}
+	keep := modelBase(schema, model)
+	mv.Set(freshModel.Elem())
+	setModelBase(schema, model, keep)
 
 	return theirs, nil
 }
@@ -202,7 +211,7 @@ func diffFields(base, modified bson.M) []string {
 			continue
 		}
 		baseVal, exists := base[key]
-		if !exists || !reflect.DeepEqual(baseVal, modVal) {
+		if !exists || !bsonValuesEqual(baseVal, modVal) {
 			changed = append(changed, key)
 		}
 	}
@@ -216,6 +225,41 @@ func diffFields(base, modified bson.M) []string {
 		}
 	}
 	return changed
+}
+
+// bsonValuesEqual compares two decoded BSON values structurally, treating
+// two NaN floats as equal (reflect.DeepEqual never would, which made a NaN
+// field look changed on every merge).
+func bsonValuesEqual(a, b interface{}) bool {
+	switch x := a.(type) {
+	case float64:
+		y, ok := b.(float64)
+		return ok && (x == y || (math.IsNaN(x) && math.IsNaN(y)))
+	case bson.M:
+		y, ok := b.(bson.M)
+		if !ok || len(x) != len(y) {
+			return false
+		}
+		for k, xv := range x {
+			yv, ok := y[k]
+			if !ok || !bsonValuesEqual(xv, yv) {
+				return false
+			}
+		}
+		return true
+	case bson.A:
+		y, ok := b.(bson.A)
+		if !ok || len(x) != len(y) {
+			return false
+		}
+		for i := range x {
+			if !bsonValuesEqual(x[i], y[i]) {
+				return false
+			}
+		}
+		return true
+	}
+	return reflect.DeepEqual(a, b)
 }
 
 // fieldIntersection returns field names present in both slices.

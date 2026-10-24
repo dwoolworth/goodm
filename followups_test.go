@@ -1840,7 +1840,7 @@ func TestWithRetry_SecondConflictInOneCall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	theirs, err := mergeFromDB(ctx, coll, &mine, base, m.ID, nil)
+	theirs, err := mergeFromDB(ctx, coll, schema, &mine, base, m.ID, nil)
 	if err != nil {
 		t.Fatalf("first merge round: %v", err)
 	}
@@ -1852,7 +1852,7 @@ func TestWithRetry_SecondConflictInOneCall(t *testing.T) {
 	if err := Update(ctx, &b); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := mergeFromDB(ctx, coll, &mine, theirs, m.ID, nil); err != nil {
+	if _, err := mergeFromDB(ctx, coll, schema, &mine, theirs, m.ID, nil); err != nil {
 		t.Fatalf("second merge round with the advanced base must succeed: %v", err)
 	}
 	if mine.Name != "A" || mine.Count != 9 || mine.Note != "mine" {
@@ -1875,5 +1875,85 @@ func TestFindOneAndUpdate_ReturnOriginalClearsBase(t *testing.T) {
 	}
 	if m.ID != users[1].ID || modelBase(schema, &m) != nil {
 		t.Errorf("ReturnOriginal must leave no base from an unrelated document: id=%v base=%v", m.ID, modelBase(schema, &m) != nil)
+	}
+}
+
+type testMergeClear struct {
+	Model `bson:",inline"`
+	Note  string            `bson:"note"`
+	Opt   string            `bson:"opt,omitempty"`
+	Attrs map[string]string `bson:"attrs"`
+	F     float64           `bson:"f"`
+}
+
+func TestWithRetry_DoesNotResurrectRemovedValues(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testMergeClear{}, "test_merge_clear", "")
+	m := &testMergeClear{Opt: "x", Attrs: map[string]string{"a": "1", "b": "2"}, F: math.NaN()}
+	if err := Create(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	var mine, other testMergeClear
+	if err := FindByID(ctx, m.ID, &mine); err != nil {
+		t.Fatal(err)
+	}
+	if err := FindByID(ctx, m.ID, &other); err != nil {
+		t.Fatal(err)
+	}
+	delete(other.Attrs, "b")
+	other.Opt = ""
+	if err := Update(ctx, &other); err != nil {
+		t.Fatal(err)
+	}
+	mine.Note = "mine"
+	if err := Update(ctx, &mine, WithRetry(2)); err != nil {
+		t.Fatalf("merge with a NaN field and removed values: %v", err)
+	}
+	var fresh testMergeClear
+	if err := FindByID(ctx, m.ID, &fresh); err != nil {
+		t.Fatal(err)
+	}
+	if _, kept := fresh.Attrs["b"]; kept || fresh.Opt != "" || fresh.Note != "mine" {
+		t.Errorf("the other writer's removals must survive the merge: %+v", fresh)
+	}
+	if _, kept := mine.Attrs["b"]; kept || mine.Opt != "" {
+		t.Errorf("the model must reflect the merged state: %+v", mine)
+	}
+}
+
+func TestUpdateFields_BaseAdvancesOnlyByWrittenFields(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testMergeShape{}, "test_merge_shape", "")
+	m := &testMergeShape{Name: "n"}
+	if err := Create(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	var mine testMergeShape
+	if err := FindByID(ctx, m.ID, &mine); err != nil {
+		t.Fatal(err)
+	}
+	mine.Note = "local-unsaved"
+	if err := UpdateFields(ctx, &mine, bson.M{"name": "uf"}); err != nil {
+		t.Fatal(err)
+	}
+	var other testMergeShape
+	if err := FindByID(ctx, m.ID, &other); err != nil {
+		t.Fatal(err)
+	}
+	other.Count = 7
+	if err := Update(ctx, &other); err != nil {
+		t.Fatal(err)
+	}
+	if err := Update(ctx, &mine, WithRetry(2)); err != nil {
+		t.Fatalf("merge after UpdateFields: %v", err)
+	}
+	var fresh testMergeShape
+	if err := FindByID(ctx, m.ID, &fresh); err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Note != "local-unsaved" || fresh.Count != 7 || fresh.Name != "uf" {
+		t.Errorf("the unsaved edit must still count as ours: %+v", fresh)
 	}
 }

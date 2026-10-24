@@ -718,10 +718,35 @@ func UpdateFields(ctx context.Context, model interface{}, fields bson.M, opts ..
 		setUpdatedAt(model, now)
 		setModelVersion(model, oldVersion+1)
 		applyFieldsToModel(model, values)
-		setModelBaseFromModel(schema, model)
+		advanceBaseAfterUpdateFields(schema, model, values, now, oldVersion+1)
 
 		return nil
 	})
+}
+
+// advanceBaseAfterUpdateFields moves the model's merge base forward by the
+// fields UpdateFields wrote, starting from the old base rather than from the
+// model, so edits the caller made in memory but did not save are still seen
+// as changes by a later WithRetry merge. A model with no base keeps none.
+func advanceBaseAfterUpdateFields(schema *Schema, model interface{}, values map[string]reflect.Value, now time.Time, version int) {
+	old := modelBase(schema, model)
+	if old == nil {
+		return
+	}
+	stored := reflect.New(schema.Type)
+	if err := bson.Unmarshal(old, stored.Interface()); err != nil {
+		setModelBase(schema, model, nil)
+		return
+	}
+	applyFieldsToModel(stored.Interface(), values)
+	setUpdatedAt(stored.Interface(), now)
+	setModelVersion(stored.Interface(), version)
+	raw, err := bson.Marshal(stored.Interface())
+	if err != nil {
+		setModelBase(schema, model, nil)
+		return
+	}
+	setModelBase(schema, model, raw)
 }
 
 // prepareUpdateFields checks that every key in fields is a known, mutable,
