@@ -2,6 +2,7 @@ package goodm
 
 import (
 	"fmt"
+	"math"
 	"reflect"
 	"sort"
 	"strings"
@@ -338,43 +339,66 @@ func canonicalBSON(v interface{}) (interface{}, error) {
 }
 
 func canonicalValue(v interface{}) interface{} {
+	return canonicalValueAt(v, true)
+}
+
+// canonicalValueAt canonicalizes v. Keys are sorted only where MongoDB treats
+// order as irrelevant: the top-level filter and documents made of operators
+// ($gt, $in, ...). A subdocument under a field name is an exact-match value,
+// where order is significant, so it keeps its order. Integers stay exact;
+// a float that is an integer within 2^53 becomes an int64 so 5 and 5.0
+// compare equal, while larger values keep their type.
+func canonicalValueAt(v interface{}, top bool) interface{} {
 	switch x := v.(type) {
 	case bson.D:
 		out := make(bson.D, len(x))
+		allOps := len(x) > 0
 		for i, e := range x {
-			out[i] = bson.E{Key: e.Key, Value: canonicalValue(e.Value)}
+			out[i] = bson.E{Key: e.Key, Value: canonicalValueAt(e.Value, false)}
+			if !strings.HasPrefix(e.Key, "$") {
+				allOps = false
+			}
 		}
-		sort.SliceStable(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+		if top || allOps {
+			sort.SliceStable(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+		}
 		return out
 	case bson.M:
 		out := make(bson.D, 0, len(x))
 		for k, val := range x {
-			out = append(out, bson.E{Key: k, Value: canonicalValue(val)})
+			out = append(out, bson.E{Key: k, Value: canonicalValueAt(val, false)})
 		}
 		sort.SliceStable(out, func(i, j int) bool { return out[i].Key < out[j].Key })
 		return out
 	case bson.A:
 		out := make(bson.A, len(x))
 		for i, e := range x {
-			out[i] = canonicalValue(e)
+			out[i] = canonicalValueAt(e, false)
 		}
 		return out
 	case []interface{}:
 		out := make(bson.A, len(x))
 		for i, e := range x {
-			out[i] = canonicalValue(e)
+			out[i] = canonicalValueAt(e, false)
 		}
 		return out
 	case int:
-		return float64(x)
+		return int64(x)
 	case int32:
-		return float64(x)
-	case int64:
-		return float64(x)
+		return int64(x)
 	case float32:
-		return float64(x)
+		return canonicalFloat(float64(x))
+	case float64:
+		return canonicalFloat(x)
 	}
 	return v
+}
+
+func canonicalFloat(f float64) interface{} {
+	if f == math.Trunc(f) && math.Abs(f) < 1<<53 {
+		return int64(f)
+	}
+	return f
 }
 
 // collationsEquivalent compares two collations from Go code with the server's

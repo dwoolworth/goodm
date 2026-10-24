@@ -7,6 +7,7 @@ import (
 	"math"
 	"strings"
 	"testing"
+	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -807,5 +808,200 @@ func TestDiscover_TwoIndexesOnOneField(t *testing.T) {
 	entries := strings.Count(code, "Fields: []string") + strings.Count(code, "goodm.NewCompoundIndex(") + strings.Count(code, "goodm.NewUniqueCompoundIndex(")
 	if tags != 2 || entries != 2 {
 		t.Errorf("expected 2 field tags and 2 Indexes() entries, got %d and %d:\n%s", tags, entries, code)
+	}
+}
+
+// --- fourth-round review findings ---
+
+// TestBase is exported: the driver skips a pointer to an unexported embed.
+type TestBase struct {
+	Note string `bson:"note"`
+}
+
+type testSubWithPtrEmbed struct {
+	*TestBase `bson:",inline"`
+	B         int `bson:"b"`
+}
+
+type testConvModel struct {
+	Model   `bson:",inline"`
+	Count   int64                `bson:"count"`
+	Big     uint64               `bson:"big"`
+	Ratio   float64              `bson:"ratio"`
+	When    time.Time            `bson:"when"`
+	Blob    []byte               `bson:"blob"`
+	Doc     bson.D               `bson:"doc"`
+	Sub     testSubWithPtrEmbed  `bson:"sub"`
+	Ignored string               `bson:"-"`
+	Meta    map[string]time.Time `bson:"meta"`
+}
+
+type testDTO struct {
+	When time.Time `bson:"when"`
+	Blob []byte    `bson:"blob"`
+	Big  uint64    `bson:"big"`
+}
+
+func TestUpdateFields_ConverterEdgeCases(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testConvModel{}, "test_conv", "")
+	m := &testConvModel{Sub: testSubWithPtrEmbed{TestBase: &TestBase{Note: "n"}}}
+	if err := Create(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pointer chains ending in nil must not panic and must store null.
+	var nilInt *int64
+	if err := UpdateFields(ctx, m, bson.M{"count": &nilInt}); err != nil || m.Count != 0 {
+		t.Errorf("nil pointer chain: %v count=%d", err, m.Count)
+	}
+	var nilIface interface{}
+	if err := UpdateFields(ctx, m, bson.M{"count": &nilIface}); err != nil {
+		t.Errorf("pointer to nil interface: %v", err)
+	}
+
+	// A subdocument type with a nil inline pointer embed: fields through the
+	// embed must be set, not dropped, and validation must not panic.
+	if err := UpdateFields(ctx, m, bson.M{"sub": bson.M{"note": "new", "b": 2}}); err != nil {
+		t.Fatalf("inline pointer embed in subdocument: %v", err)
+	}
+	if m.Sub.TestBase == nil || m.Sub.Note != "new" || m.Sub.B != 2 {
+		t.Errorf("inline embed fields not set: %+v", m.Sub)
+	}
+	var fresh testConvModel
+	if err := FindByID(ctx, m.ID, &fresh); err != nil || fresh.Sub.TestBase == nil || fresh.Sub.Note != "new" {
+		t.Errorf("inline embed not persisted: %+v %v", fresh.Sub, err)
+	}
+
+	var ve ValidationErrors
+	// Float boundaries into integer fields.
+	if err := UpdateFields(ctx, m, bson.M{"count": 9.223372036854775807e18}); !errors.As(err, &ve) {
+		t.Errorf("2^63 into int64 must be rejected, got %v", err)
+	}
+	if err := UpdateFields(ctx, m, bson.M{"big": 1.8446744073709551615e19}); !errors.As(err, &ve) {
+		t.Errorf("2^64 into uint64 must be rejected, got %v", err)
+	}
+	if err := UpdateFields(ctx, m, bson.M{"count": -9.223372036854775808e18}); err != nil || m.Count != math.MinInt64 {
+		t.Errorf("-2^63 into int64 is exact and must be accepted: %v", err)
+	}
+	// Lossy int into float is rejected; exact is accepted.
+	if err := UpdateFields(ctx, m, bson.M{"ratio": int64(1<<53 + 1)}); !errors.As(err, &ve) {
+		t.Errorf("2^53+1 into float64 must be rejected, got %v", err)
+	}
+	if err := UpdateFields(ctx, m, bson.M{"ratio": int64(1 << 53)}); err != nil || m.Ratio != 1<<53 {
+		t.Errorf("2^53 into float64: %v", err)
+	}
+
+	// Struct sources keep time.Time and []byte; bson.DateTime converts to time.
+	when := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+	if err := UpdateFields(ctx, m, bson.M{"when": bson.NewDateTimeFromTime(when)}); err != nil || !m.When.Equal(when) {
+		t.Errorf("bson.DateTime into time.Time: %v %v", err, m.When)
+	}
+	if err := UpdateFields(ctx, m, bson.M{"count": bson.NewDateTimeFromTime(when)}); !errors.As(err, &ve) {
+		t.Errorf("bson.DateTime into int64 must be rejected, got %v", err)
+	}
+	type dtoModel struct {
+		Model `bson:",inline"`
+		Sub   testDTO `bson:"sub"`
+	}
+	registerModel(t, &dtoModel{}, "test_dto", "")
+	d := &dtoModel{}
+	if err := Create(ctx, d); err != nil {
+		t.Fatal(err)
+	}
+	type otherDTO struct {
+		When time.Time `bson:"when"`
+		Blob []byte    `bson:"blob"`
+		Big  uint64    `bson:"big"`
+	}
+	if err := UpdateFields(ctx, d, bson.M{"sub": otherDTO{When: when, Blob: []byte("x"), Big: 1 << 40}}); err != nil {
+		t.Fatalf("struct of another type with time, bytes, and a large uint64: %v", err)
+	}
+	if !d.Sub.When.Equal(when) || string(d.Sub.Blob) != "x" || d.Sub.Big != 1<<40 {
+		t.Errorf("struct source values lost: %+v", d.Sub)
+	}
+	if err := UpdateFields(ctx, m, bson.M{"blob": bson.Binary{Subtype: 0, Data: []byte("b")}}); err != nil || string(m.Blob) != "b" {
+		t.Errorf("generic bson.Binary into []byte: %v", err)
+	}
+	if err := UpdateFields(ctx, m, bson.M{"blob": bson.Binary{Subtype: 4, Data: []byte("b")}}); !errors.As(err, &ve) {
+		t.Errorf("UUID binary into []byte must be rejected, got %v", err)
+	}
+
+	// bson.D field accepts any document source; "-" fields are never matched.
+	if err := UpdateFields(ctx, m, bson.M{"doc": bson.M{"k": 1}}); err != nil || len(m.Doc) != 1 || m.Doc[0].Key != "k" {
+		t.Errorf("bson.M into bson.D field: %v %v", err, m.Doc)
+	}
+	if err := UpdateFields(ctx, m, bson.M{"-": "x"}); err == nil {
+		t.Error("a field tagged - must not be addressable")
+	}
+	// map of times via a document source
+	if err := UpdateFields(ctx, m, bson.M{"meta": bson.M{"a": when}}); err != nil || !m.Meta["a"].Equal(when) {
+		t.Errorf("map target: %v %v", err, m.Meta)
+	}
+}
+
+type testNilEmbedModel struct {
+	Model     `bson:",inline"`
+	*TestBase `bson:",inline"`
+	Name      string `bson:"name" goodm:"required"`
+}
+
+func TestCreate_NilInlinePointerEmbedDoesNotPanic(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testNilEmbedModel{}, "test_nil_embed", "")
+	m := &testNilEmbedModel{Name: "n"}
+	if err := Create(ctx, m); err != nil {
+		t.Fatalf("Create with a nil inline pointer embed: %v", err)
+	}
+	m.Name = "n2"
+	if err := Update(ctx, m); err != nil {
+		t.Fatalf("Update with a nil inline pointer embed: %v", err)
+	}
+}
+
+func TestCanonicalBSON_ExactIntegersAndSubdocumentOrder(t *testing.T) {
+	a := bson.D{{Key: "x", Value: bson.D{{Key: "$gt", Value: int64(1<<53 + 1)}}}}
+	b := bson.D{{Key: "x", Value: bson.D{{Key: "$gt", Value: int64(1 << 53)}}}}
+	if filtersEquivalent(a, b) {
+		t.Error("large int64 filters that differ must not compare equal")
+	}
+	c := bson.D{{Key: "x", Value: bson.D{{Key: "$gt", Value: float64(1 << 53)}}}}
+	if filtersEquivalent(b, c) {
+		t.Error("int64 2^53 and float64 2^53 differ in type beyond the exact range and must not compare equal")
+	}
+	if !filtersEquivalent(bson.M{"n": 5}, bson.D{{Key: "n", Value: 5.0}}) {
+		t.Error("5 and 5.0 must compare equal")
+	}
+	// Operator documents may be reordered; exact-match subdocuments may not.
+	if !filtersEquivalent(bson.D{{Key: "a", Value: bson.D{{Key: "$gt", Value: 1}, {Key: "$lt", Value: 5}}}}, bson.M{"a": bson.M{"$lt": 5, "$gt": 1}}) {
+		t.Error("operator document order must not matter")
+	}
+	if filtersEquivalent(bson.D{{Key: "a", Value: bson.D{{Key: "x", Value: 1}, {Key: "y", Value: 2}}}}, bson.D{{Key: "a", Value: bson.D{{Key: "y", Value: 2}, {Key: "x", Value: 1}}}}) {
+		t.Error("exact-match subdocument order must matter")
+	}
+}
+
+func TestDiscover_EmbedModel_KeepsIndexesOnModelFields(t *testing.T) {
+	ctx, db, cleanup := setupTestDB(t)
+	defer cleanup()
+	coll := db.Collection("disc4")
+	if _, err := coll.InsertOne(ctx, bson.D{{Key: "name", Value: "n"}, {Key: "created_at", Value: fixedTime}, {Key: "updated_at", Value: fixedTime}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coll.Indexes().CreateOne(ctx, mongo.IndexModel{Keys: bson.D{{Key: "created_at", Value: 1}}, Options: options.Index().SetExpireAfterSeconds(3600)}); err != nil {
+		t.Fatal(err)
+	}
+	found, err := Discover(ctx, db, DiscoverOptions{Collections: []string{"disc4"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, err := GenerateModel(found[0], GenerateOptions{PackageName: "models", EmbedModel: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(src), `{Fields: []string{"created_at"}, ExpireAfterSeconds: goodm.TTL(3600 * time.Second)},`) {
+		t.Errorf("TTL index on created_at must survive EmbedModel as an Indexes() entry:\n%s", src)
 	}
 }

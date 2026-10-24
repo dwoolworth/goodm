@@ -243,7 +243,7 @@ func parseFields(t reflect.Type, seen map[reflect.Type]bool) []FieldSchema {
 func findIDField(t reflect.Type) []int {
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
-		if !f.IsExported() {
+		if !internal.FieldVisible(f) {
 			continue
 		}
 		if name, _ := ParseBSONTag(f.Tag.Get("bson")); name == "_id" {
@@ -252,7 +252,7 @@ func findIDField(t reflect.Type) []int {
 	}
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
-		if !f.Anonymous || !f.IsExported() || !bsonTagInline(f.Tag.Get("bson")) {
+		if !f.Anonymous || !internal.FieldVisible(f) || !bsonTagInline(f.Tag.Get("bson")) {
 			continue
 		}
 		ft := f.Type

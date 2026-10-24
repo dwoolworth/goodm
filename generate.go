@@ -143,8 +143,18 @@ func GenerateModel(coll DiscoveredCollection, opts GenerateOptions) ([]byte, err
 	needsTime := false
 	needsBSON := false
 
+	// Indexes are rendered from a copy: a field the embedded Model provides is
+	// not emitted, so an index Discover tagged onto it must go to Indexes().
+	indexes := append([]DiscoveredIndex(nil), coll.Indexes...)
 	for _, f := range coll.Fields {
 		if opts.EmbedModel && (f.BSONName == "_id" || f.BSONName == "created_at" || f.BSONName == "updated_at") {
+			for i := range indexes {
+				if indexes[i].Tagged && len(indexes[i].Keys) == 1 {
+					if field, _ := parseIndexField(indexes[i].Keys[0]); field == f.BSONName {
+						indexes[i].Tagged = false
+					}
+				}
+			}
 			continue
 		}
 
@@ -170,7 +180,7 @@ func GenerateModel(coll DiscoveredCollection, opts GenerateOptions) ([]byte, err
 	// single-key indexes with options or a custom name, second indexes on a
 	// field, and single-key indexes on paths that are not generated fields.
 	var indexEntries []string
-	for _, idx := range coll.Indexes {
+	for _, idx := range indexes {
 		if idx.Name == "_id_" || idx.Tagged {
 			continue
 		}

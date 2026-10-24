@@ -22,7 +22,7 @@ func StructFields(t reflect.Type) []reflect.StructField {
 	var fields []reflect.StructField
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
-		if !f.IsExported() {
+		if !FieldVisible(f) {
 			continue
 		}
 		if f.Anonymous && IsInlineTag(f.Tag.Get("bson")) {
@@ -74,4 +74,11 @@ func TypeName(t reflect.Type) string {
 		return pkg + "." + typeName
 	}
 	return name
+}
+
+// FieldVisible reports whether the BSON driver encodes a struct field: every
+// exported field, plus an unexported anonymous struct (not a pointer to one),
+// which the driver still flattens when it is inline.
+func FieldVisible(f reflect.StructField) bool {
+	return f.IsExported() || (f.Anonymous && f.Type.Kind() == reflect.Struct)
 }

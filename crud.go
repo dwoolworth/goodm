@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dwoolworth/goodm/internal"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
@@ -778,7 +779,13 @@ func convertValue(val interface{}, t reflect.Type) (reflect.Value, error) {
 	}
 	rv := reflect.ValueOf(val)
 	for rv.Kind() == reflect.Interface || rv.Kind() == reflect.Pointer {
+		if rv.IsNil() {
+			return reflect.Zero(t), nil // a pointer chain ending in nil is nil
+		}
 		rv = rv.Elem()
+	}
+	if !rv.IsValid() {
+		return reflect.Zero(t), nil
 	}
 
 	if t.Kind() == reflect.Pointer {
@@ -803,6 +810,12 @@ func convertValue(val interface{}, t reflect.Type) (reflect.Value, error) {
 			return reflect.Value{}, fmt.Errorf("not a number")
 		}
 		return convertNumber(rv, t)
+	case classBSOND:
+		pairs, err := documentPairs(rv)
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		return reflect.ValueOf(pairs).Convert(t), nil
 	case classString:
 		if rv.Kind() != reflect.String {
 			return reflect.Value{}, fmt.Errorf("not a string")
@@ -825,11 +838,34 @@ func convertValue(val interface{}, t reflect.Type) (reflect.Value, error) {
 			return rv.Convert(t), nil
 		}
 		return reflect.Value{}, fmt.Errorf("not an ObjectID")
-	case classTime, classDecimal, classBinary:
-		if valueClass(rv.Type()) == valueClass(t) && rv.Type().ConvertibleTo(t) {
+	case classTime:
+		if rv.Type() == dateTimeType {
+			return reflect.ValueOf(rv.Interface().(bson.DateTime).Time()).Convert(t), nil
+		}
+		if valueClass(rv.Type()) == classTime && rv.Type().ConvertibleTo(t) {
 			return rv.Convert(t), nil
 		}
-		return reflect.Value{}, fmt.Errorf("not a %s", t)
+		return reflect.Value{}, fmt.Errorf("not a time.Time")
+	case classBinary:
+		if rv.Type() == bsonBinaryType {
+			bin := rv.Interface().(bson.Binary)
+			if t == bsonBinaryType {
+				return rv, nil
+			}
+			if bin.Subtype != 0 && bin.Subtype != 2 {
+				return reflect.Value{}, fmt.Errorf("binary subtype %d does not convert to %s", bin.Subtype, t)
+			}
+			return reflect.ValueOf(bin.Data).Convert(t), nil
+		}
+		if valueClass(rv.Type()) == classBinary && rv.Type().ConvertibleTo(t) {
+			return rv.Convert(t), nil
+		}
+		return reflect.Value{}, fmt.Errorf("not a byte slice")
+	case classDecimal:
+		if valueClass(rv.Type()) == classDecimal && rv.Type().ConvertibleTo(t) {
+			return rv.Convert(t), nil
+		}
+		return reflect.Value{}, fmt.Errorf("not a Decimal128")
 	case classDocument:
 		return convertDocument(rv, t)
 	case classArray:
@@ -851,28 +887,32 @@ const (
 	classBinary
 	classDocument
 	classArray
+	classBSOND // a bson.D field: an ordered document that accepts any document source
 )
 
 var (
-	timeType     = reflect.TypeOf(time.Time{})
-	objectIDType = reflect.TypeOf(bson.ObjectID{})
-	decimalType  = reflect.TypeOf(bson.Decimal128{})
-	binaryType   = reflect.TypeOf(bson.Binary{})
-	bsonDType    = reflect.TypeOf(bson.D{})
-	bsonEType    = reflect.TypeOf(bson.E{})
+	timeType       = reflect.TypeOf(time.Time{})
+	dateTimeType   = reflect.TypeOf(bson.DateTime(0))
+	objectIDType   = reflect.TypeOf(bson.ObjectID{})
+	decimalType    = reflect.TypeOf(bson.Decimal128{})
+	bsonBinaryType = reflect.TypeOf(bson.Binary{})
+	bsonDType      = reflect.TypeOf(bson.D{})
+	bsonEType      = reflect.TypeOf(bson.E{})
 )
 
 // valueClass groups Go types by the BSON shape they take.
 func valueClass(t reflect.Type) typeClass {
 	switch {
-	case t == timeType:
+	case t == timeType, t == dateTimeType:
 		return classTime
 	case t == objectIDType:
 		return classObjectID
 	case t == decimalType:
 		return classDecimal
-	case t == binaryType || (t.Kind() == reflect.Slice && t.Elem().Kind() == reflect.Uint8):
+	case t == bsonBinaryType || (t.Kind() == reflect.Slice && t.Elem().Kind() == reflect.Uint8):
 		return classBinary
+	case t == bsonDType:
+		return classBSOND
 	}
 	switch t.Kind() {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
@@ -886,8 +926,8 @@ func valueClass(t reflect.Type) typeClass {
 	case reflect.Struct, reflect.Map:
 		return classDocument
 	case reflect.Slice, reflect.Array:
-		if t == bsonDType || t.Elem() == bsonEType {
-			return classDocument
+		if t.Elem() == bsonEType {
+			return classBSOND
 		}
 		return classArray
 	}
@@ -915,7 +955,7 @@ func convertNumber(rv reflect.Value, t reflect.Type) (reflect.Value, error) {
 			if f != math.Trunc(f) || math.IsInf(f, 0) || math.IsNaN(f) {
 				return reflect.Value{}, fmt.Errorf("value %v is not an integer", f)
 			}
-			if f < math.MinInt64 || f > math.MaxInt64 {
+			if f < -0x1p63 || f >= 0x1p63 { // float64(MaxInt64) rounds up to 2^63
 				return reflect.Value{}, fmt.Errorf("value overflows %s", t)
 			}
 			n = int64(f)
@@ -939,7 +979,7 @@ func convertNumber(rv reflect.Value, t reflect.Type) (reflect.Value, error) {
 			if f != math.Trunc(f) || math.IsInf(f, 0) || math.IsNaN(f) || f < 0 {
 				return reflect.Value{}, fmt.Errorf("value %v is not a non-negative integer", f)
 			}
-			if f > math.MaxUint64 {
+			if f >= 0x1p64 {
 				return reflect.Value{}, fmt.Errorf("value overflows %s", t)
 			}
 			n = uint64(f)
@@ -953,8 +993,14 @@ func convertNumber(rv reflect.Value, t reflect.Type) (reflect.Value, error) {
 		switch {
 		case rv.CanInt():
 			f = float64(rv.Int())
+			if f >= 0x1p63 || int64(f) != rv.Int() {
+				return reflect.Value{}, fmt.Errorf("value %d is not exactly representable as %s", rv.Int(), t)
+			}
 		case rv.CanUint():
 			f = float64(rv.Uint())
+			if f >= 0x1p64 || uint64(f) != rv.Uint() {
+				return reflect.Value{}, fmt.Errorf("value %d is not exactly representable as %s", rv.Uint(), t)
+			}
 		default:
 			f = rv.Float()
 		}
@@ -976,6 +1022,7 @@ func convertDocument(rv reflect.Value, t reflect.Type) (reflect.Value, error) {
 	out := reflect.New(t).Elem()
 	switch t.Kind() {
 	case reflect.Struct:
+		allocateInlineEmbeds(out)
 		for _, p := range pairs {
 			f := fieldByBSONName(out, p.Key)
 			if !f.IsValid() || !f.CanSet() {
@@ -1005,7 +1052,34 @@ func convertDocument(rv reflect.Value, t reflect.Type) (reflect.Value, error) {
 	return out, nil
 }
 
-// documentPairs flattens a document-shaped value into key/value pairs.
+// allocateInlineEmbeds gives every nil inline pointer embed of a writable
+// struct a fresh value, so fields declared through it can be set.
+func allocateInlineEmbeds(v reflect.Value) {
+	t := v.Type()
+	for i := 0; i < t.NumField(); i++ {
+		sf := t.Field(i)
+		if !sf.Anonymous || !internal.FieldVisible(sf) || !bsonTagInline(sf.Tag.Get("bson")) {
+			continue
+		}
+		f := v.Field(i)
+		if f.Kind() == reflect.Pointer {
+			if f.IsNil() && f.CanSet() && f.Type().Elem().Kind() == reflect.Struct {
+				f.Set(reflect.New(f.Type().Elem()))
+			}
+			if f.IsNil() {
+				continue
+			}
+			f = f.Elem()
+		}
+		if f.Kind() == reflect.Struct {
+			allocateInlineEmbeds(f)
+		}
+	}
+}
+
+// documentPairs flattens a document-shaped value into key/value pairs. Struct
+// sources are read field by field through reflection (not marshaled), so
+// their values keep their Go types.
 func documentPairs(rv reflect.Value) (bson.D, error) {
 	switch {
 	case rv.Type() == bsonDType || (rv.Kind() == reflect.Slice && rv.Type().Elem() == bsonEType):
@@ -1022,17 +1096,44 @@ func documentPairs(rv reflect.Value) (bson.D, error) {
 		}
 		return out, nil
 	case rv.Kind() == reflect.Struct && valueClass(rv.Type()) == classDocument:
-		raw, err := bson.Marshal(rv.Interface())
-		if err != nil {
-			return nil, err
-		}
-		var out bson.D
-		if err := bson.Unmarshal(raw, &out); err != nil {
-			return nil, err
-		}
-		return out, nil
+		return structPairs(rv), nil
 	}
 	return nil, fmt.Errorf("not a document")
+}
+
+// structPairs lists a struct's exported fields by bson name, flattening
+// inline embeds and skipping fields tagged "-" and nil inline pointers.
+func structPairs(v reflect.Value) bson.D {
+	var out bson.D
+	t := v.Type()
+	for i := 0; i < t.NumField(); i++ {
+		sf := t.Field(i)
+		if !internal.FieldVisible(sf) {
+			continue
+		}
+		f := v.Field(i)
+		if sf.Anonymous && bsonTagInline(sf.Tag.Get("bson")) {
+			if f.Kind() == reflect.Pointer {
+				if f.IsNil() {
+					continue
+				}
+				f = f.Elem()
+			}
+			if f.Kind() == reflect.Struct {
+				out = append(out, structPairs(f)...)
+			}
+			continue
+		}
+		name, _ := ParseBSONTag(sf.Tag.Get("bson"))
+		if name == "-" {
+			continue
+		}
+		if name == "" {
+			name = strings.ToLower(sf.Name)
+		}
+		out = append(out, bson.E{Key: name, Value: f.Interface()})
+	}
+	return out
 }
 
 // convertArray converts a slice or array element by element. A fixed-size
@@ -1186,7 +1287,7 @@ func fieldByBSONName(v reflect.Value, name string) reflect.Value {
 	t := v.Type()
 	for i := 0; i < t.NumField(); i++ {
 		sf := t.Field(i)
-		if !sf.IsExported() {
+		if !internal.FieldVisible(sf) {
 			continue
 		}
 		if sf.Anonymous && bsonTagInline(sf.Tag.Get("bson")) {
@@ -1205,12 +1306,35 @@ func fieldByBSONName(v reflect.Value, name string) reflect.Value {
 			continue
 		}
 		bsonName, _ := ParseBSONTag(sf.Tag.Get("bson"))
+		if bsonName == "-" {
+			continue
+		}
 		if bsonName == "" {
 			bsonName = strings.ToLower(sf.Name)
 		}
 		if bsonName == name {
 			return v.Field(i)
 		}
+	}
+	return reflect.Value{}
+}
+
+// fieldByGoName is FieldByName that tolerates nil embedded pointers: Go's
+// own FieldByName panics when the path to a promoted field crosses one.
+func fieldByGoName(v reflect.Value, name string) reflect.Value {
+	t := v.Type()
+	if sf, ok := t.FieldByName(name); ok {
+		cur := v
+		for _, i := range sf.Index {
+			if cur.Kind() == reflect.Pointer {
+				if cur.IsNil() {
+					return reflect.Value{}
+				}
+				cur = cur.Elem()
+			}
+			cur = cur.Field(i)
+		}
+		return cur
 	}
 	return reflect.Value{}
 }
@@ -1874,8 +1998,8 @@ func validateImmutable(old, new interface{}, schema *Schema) []ValidationError {
 		if !field.Immutable {
 			continue
 		}
-		oldField := oldV.FieldByName(field.Name)
-		newField := newV.FieldByName(field.Name)
+		oldField := fieldByGoName(oldV, field.Name)
+		newField := fieldByGoName(newV, field.Name)
 		if !oldField.IsValid() || !newField.IsValid() {
 			continue
 		}
