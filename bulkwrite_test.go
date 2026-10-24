@@ -576,8 +576,8 @@ func TestSaveMany_InTransaction_FirstFailureAbortsBatch(t *testing.T) {
 	if len(be.Errors) != 2 || !errors.Is(be.Errors[1].Err, ErrDuplicateKey) || be.Errors[1].Code != 11000 {
 		t.Errorf("expected item 1 as a duplicate key with code 11000 and item 0 as not saved, got %+v", be.Errors)
 	}
-	if !errors.Is(be.Errors[0].Err, ErrDuplicateKey) || !strings.Contains(be.Errors[0].Err.Error(), "not saved") {
-		t.Errorf("item 0 must be reported as not saved because of item 1, got %v", be.Errors[0].Err)
+	if errors.Is(be.Errors[0].Err, ErrDuplicateKey) || !strings.Contains(be.Errors[0].Err.Error(), "not saved") {
+		t.Errorf("item 0 must be reported as not saved without matching item 1's error type, got %v", be.Errors[0].Err)
 	}
 	for i, u := range users {
 		if u.Version != 0 {
@@ -695,12 +695,54 @@ func TestSaveMany_CancelledContext_ReportsNotAttempted(t *testing.T) {
 		t.Fatalf("expected both items reported, got %v", err)
 	}
 	for _, e := range be.Errors {
-		if !errors.Is(e.Err, errNotAttempted) && !strings.Contains(e.Err.Error(), "outcome unknown") {
+		if !errors.Is(e.Err, ErrNotAttempted) && !strings.Contains(e.Err.Error(), "outcome unknown") {
 			t.Errorf("item %d must be not attempted or outcome unknown, got %v", e.Index, e.Err)
+		}
+		if !errors.Is(e.Err, context.Canceled) {
+			t.Errorf("item %d must wrap the context error, got %v", e.Index, e.Err)
 		}
 	}
 	var fresh testNoTimestamps
 	if err := FindByID(ctx, "a", &fresh); err != nil || fresh.Name != "A" {
 		t.Errorf("nothing should have been written: %+v %v", fresh, err)
+	}
+}
+
+func TestSaveMany_PlainSession_IsNotATransaction(t *testing.T) {
+	ctx, db, cleanup := setupTestDB(t)
+	defer cleanup()
+	if err := Enforce(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	users := seedUsers(t, ctx, 3)
+	users[0].Age = 50
+	users[1].Age = 51
+	users[2].Email = users[1].Email // duplicate key on item 2
+
+	err := db.Client().UseSession(ctx, func(ctx context.Context) error {
+		err := SaveMany(ctx, users)
+		var be *BulkError
+		if !errors.As(err, &be) {
+			return fmt.Errorf("expected a BulkError, got %v", err)
+		}
+		if len(be.Errors) != 1 || be.Errors[0].Index != 2 || !errors.Is(be.Errors[0].Err, ErrDuplicateKey) {
+			return fmt.Errorf("only item 2 may fail in a plain session, got %+v", be.Errors)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if users[0].Version != 1 || users[1].Version != 1 {
+		t.Errorf("saved items must keep their new version in a plain session: %d %d", users[0].Version, users[1].Version)
+	}
+	var fresh testUser
+	if err := FindByID(ctx, users[0].ID, &fresh); err != nil || fresh.Age != 50 || fresh.Version != 1 {
+		t.Errorf("item 0 must be saved: %+v %v", fresh, err)
+	}
+	// The next Update must not see a false conflict.
+	users[0].Age = 52
+	if err := Update(ctx, users[0]); err != nil {
+		t.Errorf("Update after a plain-session SaveMany: %v", err)
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/session"
 )
 
 // BulkResult contains the outcome of a bulk operation.
@@ -196,9 +197,12 @@ func elemModel(v reflect.Value) interface{} {
 // returns an error is reported for its item as well, after the other hooks
 // have run, and does not undo the save.
 //
-// Inside a transaction the first failure aborts the transaction on the
+// Inside a transaction (goodm's WithTransaction or one started on the
+// session by the driver) the first failure aborts the transaction on the
 // server, so SaveMany stops there, restores every model's version, runs no
-// AfterSave, and reports every item as not saved.
+// AfterSave, and reports every item as not saved. With a session that has no
+// transaction running, items are sent one at a time and failures do not stop
+// the batch.
 //
 // Each document is replaced with its own conditional request, so every
 // replacement's matched count is known exactly and every failure is
@@ -298,6 +302,15 @@ func SaveMany(ctx context.Context, models interface{}, opts ...UpdateOptions) er
 
 		if len(out.unresolved) > 0 {
 			if err := resolveUnmatched(ctx, coll, schema, items, ids, out.unresolved, out.failures, scope); err != nil {
+				if out.inTxn {
+					// A failed read inside the transaction means it will not
+					// commit; nothing in the batch can be reported as saved.
+					for i := range items {
+						setModelVersion(items[i], oldVersions[i])
+						out.failures[i] = fmt.Errorf("goodm: not saved: transaction failed while resolving the batch: %v", err)
+					}
+					return &BulkError{Collection: schema.Collection, Errors: out.itemErrors(), Result: &BulkResult{}, WriteConcernError: out.wcErr}
+				}
 				// The replacements already happened; only the outcome of the
 				// unresolved items is unknown. Report those, keep the rest.
 				for _, i := range out.unresolved {
@@ -336,6 +349,7 @@ type saveOutcome struct {
 	unresolved []int         // items whose replacement matched no document
 	result     *BulkResult
 	wcErr      error // first write concern error, if any
+	inTxn      bool  // the batch ran inside a transaction
 	aborted    bool  // the batch ran in a transaction that a failure aborted
 }
 
@@ -357,9 +371,30 @@ type replaceResult struct {
 	unknown           bool  // the server may have applied the write
 }
 
-// errNotAttempted marks items SaveMany did not send because the context was
-// done or the transaction had already been aborted.
-var errNotAttempted = errors.New("goodm: not attempted")
+// ErrNotAttempted marks items SaveMany did not send because the context was
+// done or the transaction had already been aborted by an earlier item. It
+// wraps the cause, so errors.Is(err, context.Canceled) also works.
+var ErrNotAttempted = errors.New("goodm: not attempted")
+
+// inTransaction reports whether ctx carries a session with a transaction in
+// progress, whether it was started by goodm's WithTransaction or by the
+// driver directly. The driver exposes no query for this, so it is probed with
+// StartTransaction, which is purely local: it fails with ErrTransactInProgress
+// when a transaction is running, and otherwise starts one that is aborted
+// again locally before any operation is sent.
+func inTransaction(ctx context.Context) bool {
+	sess := mongo.SessionFromContext(ctx)
+	if sess == nil {
+		return false
+	}
+	switch err := sess.StartTransaction(); {
+	case errors.Is(err, session.ErrTransactInProgress):
+		return true
+	case err == nil:
+		_ = sess.AbortTransaction(ctx)
+	}
+	return false
+}
 
 // saveManyReplace replaces each document with its own conditional request,
 // so every replacement's matched count is known exactly and every failure is
@@ -373,7 +408,7 @@ func saveManyReplace(ctx context.Context, coll *mongo.Collection, schema *Schema
 	results := make([]replaceResult, n)
 	replace := func(i int) {
 		if err := ctx.Err(); err != nil {
-			results[i] = replaceResult{err: fmt.Errorf("%w: %v", errNotAttempted, err)}
+			results[i] = replaceResult{err: fmt.Errorf("%w: %w", ErrNotAttempted, err)}
 			return
 		}
 		res, err := coll.ReplaceOne(ctx, filters[i], items[i])
@@ -385,24 +420,31 @@ func saveManyReplace(ctx context.Context, coll *mongo.Collection, schema *Schema
 	}
 
 	out := saveOutcome{failures: map[int]error{}, codes: map[int]int{}, result: &BulkResult{}}
-	inTxn := mongo.SessionFromContext(ctx) != nil
+	hasSession := mongo.SessionFromContext(ctx) != nil
+	out.inTxn = hasSession && inTransaction(ctx)
 	switch {
-	case inTxn:
+	case out.inTxn:
+		// One server error aborts the transaction, so stop there. Earlier
+		// items will not commit; they are reported with the cause described
+		// but not wrapped, so only the failing item matches its error type.
 		for i := range items {
 			replace(i)
 			if results[i].err != nil {
 				out.aborted = true
 				for j := i + 1; j < n; j++ {
-					results[j] = replaceResult{err: fmt.Errorf("%w: transaction aborted by item %d", errNotAttempted, i)}
+					results[j] = replaceResult{err: fmt.Errorf("%w: transaction aborted by item %d", ErrNotAttempted, i)}
 				}
 				for j := 0; j < i; j++ {
-					results[j] = replaceResult{err: fmt.Errorf("goodm: not saved: transaction aborted by item %d: %w", i, results[i].err)}
+					results[j] = replaceResult{err: fmt.Errorf("goodm: not saved: transaction aborted by item %d: %v", i, results[i].err)}
 				}
 				break
 			}
 		}
-	case n == 1:
-		replace(0)
+	case hasSession || n == 1:
+		// A session cannot be used from several goroutines.
+		for i := range items {
+			replace(i)
+		}
 	default:
 		var wg sync.WaitGroup
 		work := make(chan int)

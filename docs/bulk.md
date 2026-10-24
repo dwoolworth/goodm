@@ -67,12 +67,12 @@ If any model fails its immutable check, `BeforeSave` hook, or validation, or the
 | `ErrNotFound` | The document was deleted (or is outside the middleware scope). |
 | `*DuplicateKeyError` | The replacement violated a unique index. |
 | error marked "outcome unknown" | The write concern was not met, or the request failed in transport or by context cancellation. The server may have applied it, so the model's version is rolled back and `AfterSave` is skipped; a later save of that model then reports a conflict rather than losing anything. `BulkError.WriteConcernError` is set when a write concern error was involved. |
-| error marked "not attempted" | The context was done before the item was sent. |
+| `ErrNotAttempted` | The context was done before the item was sent (the context error is wrapped too), or an earlier item aborted the transaction. |
 | error marked "saved, but AfterSave failed" | The document was saved and keeps its new version; the hook's error is reported after the other hooks have run. |
 
 Models that succeeded are saved regardless of failures elsewhere in the batch; failed models keep their old version. A replacement that matched nothing is resolved by reading the document from the primary: still present means `ErrVersionConflict`, gone means `ErrNotFound`. Two writers racing from the same version therefore always see exactly one success and one conflict. If that resolution read itself fails, only the items it was resolving are reported as unknown; the items already known to be saved keep their new version.
 
-Inside a transaction the first failing item aborts the transaction on the server, so `SaveMany` stops there, restores every model's version, runs no `AfterSave`, and reports every item in the `*BulkError` (the items before the failure as "not saved", the ones after it as "not attempted").
+Inside a transaction, whether started by `goodm.WithTransaction` or on the session by the driver, the first failing item aborts the transaction on the server, so `SaveMany` stops there, restores every model's version, runs no `AfterSave`, and reports every item in the `*BulkError` (the items before the failure as "not saved", the ones after it as `ErrNotAttempted`). A session with no transaction running only makes the items run one at a time.
 
 Of `UpdateOptions` only `DB` is used. Because replacements run on several goroutines outside a transaction, custom BSON marshalers on the model may run concurrently.
 
@@ -189,9 +189,11 @@ type BulkError struct {
     Result            *BulkResult      // what did succeed
     WriteConcernError error            // set when the write concern was not met for some write
 }
+```
 
 `WriteConcernError` means different things per operation: for `CreateMany` and `Bulk` the whole batch's outcome is unknown, `Result` cannot be trusted, and no after-hooks ran; for `SaveMany` only the items listed with that error are unknown.
 
+```go
 type BulkWriteError struct {
     Index   int    // position in the batch
     Code    int    // server error code, 0 for ODM-level failures
