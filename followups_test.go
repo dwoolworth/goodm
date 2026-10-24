@@ -1493,3 +1493,33 @@ func TestUpdateFields_InlineMapIsNotAddressableByName(t *testing.T) {
 		t.Errorf("inline map entries must be flattened into the pairs: %v", pairs)
 	}
 }
+
+func TestRegister_RejectsInlineOnNonStructFields(t *testing.T) {
+	type bad struct {
+		Model `bson:",inline"`
+		X     int `bson:",inline"`
+	}
+	if err := Register(&bad{}, "bad_inline"); err == nil || !strings.Contains(err.Error(), "inline fields must be") {
+		Unregister(&bad{})
+		t.Fatalf("an inline tag on an int must be rejected at Register, got %v", err)
+	}
+	type sub struct {
+		P *map[string]any `bson:",inline"`
+	}
+	type bad2 struct {
+		Model `bson:",inline"`
+		Sub   sub `bson:"sub"`
+	}
+	if err := Register(&bad2{}, "bad_inline2"); err == nil || !strings.Contains(err.Error(), "Sub.P") {
+		Unregister(&bad2{})
+		t.Fatalf("a pointer to a map tagged inline inside a subdocument must be rejected and named, got %v", err)
+	}
+	type ok struct {
+		Model `bson:",inline"`
+		M     map[string]any `bson:",inline"`
+	}
+	if err := Register(&ok{}, "ok_inline"); err != nil {
+		t.Fatalf("an inline map is valid: %v", err)
+	}
+	Unregister(&ok{})
+}

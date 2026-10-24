@@ -39,6 +39,9 @@ func Register(model interface{}, collection string) error {
 	}
 
 	// Parse struct fields (recursively handles subdocuments)
+	if bad := invalidInlineField(t, nil); bad != "" {
+		return fmt.Errorf("goodm: model %s: field %s is tagged bson:\",inline\" but inline fields must be a struct, a struct pointer, or a map", schema.QualifiedName(), bad)
+	}
 	schema.Fields = parseFields(t, nil)
 	if dup := duplicateBSONName(schema.Fields); dup != "" {
 		return fmt.Errorf("goodm: model %s has two fields stored as %q; the driver keeps only one", schema.QualifiedName(), dup)
@@ -276,6 +279,54 @@ func isIntKind(k reflect.Kind) bool {
 		return true
 	}
 	return false
+}
+
+// invalidInlineField returns the Go name of the first exported field, at any
+// depth, tagged bson:",inline" whose type the driver cannot inline (anything
+// but a struct, a struct pointer, or a map), or "". The driver would reject
+// the model on its first write; reporting it at Register is kinder.
+func invalidInlineField(t reflect.Type, seen map[reflect.Type]bool) string {
+	if t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t.Kind() != reflect.Struct || isLeafType(t) || seen[t] {
+		return ""
+	}
+	if seen == nil {
+		seen = map[reflect.Type]bool{}
+	}
+	seen[t] = true
+	defer delete(seen, t)
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		ft := f.Type
+		if ft.Kind() == reflect.Pointer {
+			ft = ft.Elem()
+		}
+		if bsonTagInline(f.Tag.Get("bson")) {
+			// The driver inlines a struct, a pointer to a struct, or a map
+			// (but not a pointer to a map).
+			inlineOK := ft.Kind() == reflect.Struct || (f.Type.Kind() == reflect.Map)
+			if !inlineOK {
+				return f.Name
+			}
+		}
+		if ft.Kind() == reflect.Slice || ft.Kind() == reflect.Array {
+			ft = ft.Elem()
+			if ft.Kind() == reflect.Pointer {
+				ft = ft.Elem()
+			}
+		}
+		if ft.Kind() == reflect.Struct {
+			if bad := invalidInlineField(ft, seen); bad != "" {
+				return f.Name + "." + bad
+			}
+		}
+	}
+	return ""
 }
 
 // duplicateBSONName returns a bson path two visible fields share, at any
