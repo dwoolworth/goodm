@@ -1766,3 +1766,114 @@ func TestGenerateModel_WithoutEmbedImportsGoodm(t *testing.T) {
 		t.Errorf("generated code must import goodm for Register:\n%s", src)
 	}
 }
+
+type testMergeShape struct {
+	Model `bson:",inline"`
+	Name  string            `bson:"name"`
+	Note  string            `bson:"note"`
+	Count int64             `bson:"count"`
+	Attrs map[string]string `bson:"attrs"`
+}
+
+func TestWithRetry_ToleratesStoredShapeDifferences(t *testing.T) {
+	ctx, db, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testMergeShape{}, "test_merge_shape", "")
+	// A document written by another application: no "note", an extra
+	// "legacy" field, and an int32 where the struct has int64.
+	id := bson.NewObjectID()
+	if _, err := db.Collection("test_merge_shape").InsertOne(ctx, bson.D{
+		{Key: "_id", Value: id}, {Key: "name", Value: "n"}, {Key: "count", Value: int32(3)},
+		{Key: "legacy", Value: true}, {Key: "attrs", Value: bson.D{{Key: "a", Value: "1"}, {Key: "b", Value: "2"}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for round := 0; round < 10; round++ {
+		var mine, theirs testMergeShape
+		if err := FindByID(ctx, id, &mine); err != nil {
+			t.Fatal(err)
+		}
+		if err := FindByID(ctx, id, &theirs); err != nil {
+			t.Fatal(err)
+		}
+		theirs.Name = fmt.Sprintf("other-%d", round)
+		if err := Update(ctx, &theirs); err != nil {
+			t.Fatal(err)
+		}
+		mine.Note = fmt.Sprintf("mine-%d", round)
+		if err := Update(ctx, &mine, WithRetry(2)); err != nil {
+			t.Fatalf("round %d: shape differences must not block the merge: %v", round, err)
+		}
+		var fresh testMergeShape
+		if err := FindByID(ctx, id, &fresh); err != nil || fresh.Name != theirs.Name || fresh.Note != mine.Note {
+			t.Fatalf("round %d: both changes must land: %+v %v", round, fresh, err)
+		}
+	}
+}
+
+func TestWithRetry_SecondConflictInOneCall(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testMergeShape{}, "test_merge_shape", "")
+	m := &testMergeShape{Name: "n"}
+	if err := Create(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	var mine testMergeShape
+	if err := FindByID(ctx, m.ID, &mine); err != nil {
+		t.Fatal(err)
+	}
+	// Drive the retry loop's two rounds by hand so a second writer can land
+	// between the first merge and the retry.
+	var a testMergeShape
+	if err := FindByID(ctx, m.ID, &a); err != nil {
+		t.Fatal(err)
+	}
+	a.Name = "A"
+	if err := Update(ctx, &a); err != nil {
+		t.Fatal(err)
+	}
+	mine.Note = "mine"
+	coll := DB().Collection("test_merge_shape")
+	schema, _ := SchemaOf(&testMergeShape{})
+	base, err := normalizeBase(schema, modelBase(schema, &mine))
+	if err != nil {
+		t.Fatal(err)
+	}
+	theirs, err := mergeFromDB(ctx, coll, &mine, base, m.ID, nil)
+	if err != nil {
+		t.Fatalf("first merge round: %v", err)
+	}
+	var b testMergeShape
+	if err := FindByID(ctx, m.ID, &b); err != nil {
+		t.Fatal(err)
+	}
+	b.Count = 9
+	if err := Update(ctx, &b); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mergeFromDB(ctx, coll, &mine, theirs, m.ID, nil); err != nil {
+		t.Fatalf("second merge round with the advanced base must succeed: %v", err)
+	}
+	if mine.Name != "A" || mine.Count != 9 || mine.Note != "mine" {
+		t.Errorf("merged model must carry all three changes: %+v", mine)
+	}
+}
+
+func TestFindOneAndUpdate_ReturnOriginalClearsBase(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	users := seedUsers(t, ctx, 2)
+	var m testUser
+	if err := FindByID(ctx, users[0].ID, &m); err != nil {
+		t.Fatal(err)
+	}
+	schema, _ := SchemaOf(&testUser{})
+	err := FindOneAndUpdate(ctx, bson.D{{Key: "_id", Value: users[1].ID}}, bson.M{"$set": bson.M{"age": 1}}, &m, FindOneAndUpdateOptions{ReturnOriginal: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.ID != users[1].ID || modelBase(schema, &m) != nil {
+		t.Errorf("ReturnOriginal must leave no base from an unrelated document: id=%v base=%v", m.ID, modelBase(schema, &m) != nil)
+	}
+}

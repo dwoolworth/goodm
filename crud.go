@@ -1605,10 +1605,10 @@ func FindOneAndUpdate(ctx context.Context, filter interface{}, update interface{
 			}
 			return translateWriteError(err, schema, "find one and update failed")
 		}
-		if !opt.ReturnOriginal {
-			if raw, err := res.Raw(); err == nil {
-				setModelBase(schema, result, raw)
-			}
+		if opt.ReturnOriginal {
+			setModelBase(schema, result, nil) // pre-update content is not a merge base
+		} else if raw, err := res.Raw(); err == nil {
+			setModelBase(schema, result, raw)
 		}
 		return nil
 	})
@@ -1673,10 +1673,10 @@ func FindOneAndReplace(ctx context.Context, filter interface{}, replacement inte
 			}
 			return translateWriteError(err, schema, "find one and replace failed")
 		}
-		if !opt.ReturnOriginal {
-			if raw, err := res.Raw(); err == nil {
-				setModelBase(schema, result, raw)
-			}
+		if opt.ReturnOriginal {
+			setModelBase(schema, result, nil)
+		} else if raw, err := res.Raw(); err == nil {
+			setModelBase(schema, result, raw)
 		}
 		return nil
 	})

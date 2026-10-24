@@ -1,6 +1,7 @@
 package goodm
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -22,7 +23,9 @@ func saveWithRetry(ctx context.Context, coll *mongo.Collection, schema *Schema, 
 	var base bson.M
 	if opt.MaxRetries > 0 {
 		if raw := modelBase(schema, model); raw != nil {
-			if err := bson.Unmarshal(raw, &base); err != nil {
+			var err error
+			base, err = normalizeBase(schema, raw)
+			if err != nil {
 				return fmt.Errorf("goodm: failed to decode merge base: %w", err)
 			}
 		}
@@ -44,11 +47,28 @@ func saveWithRetry(ctx context.Context, coll *mongo.Collection, schema *Schema, 
 			return ErrVersionConflict
 		}
 
-		// 3-way merge: re-read DB state, detect conflicts, apply disjoint changes.
-		if err := mergeFromDB(ctx, coll, model, base, id, scope); err != nil {
+		// 3-way merge: re-read DB state, detect conflicts, apply disjoint
+		// changes. The re-read state becomes the base for the next round, so
+		// the other writer's changes are not mistaken for ours on a second
+		// conflict.
+		theirs, err := mergeFromDB(ctx, coll, model, base, id, scope)
+		if err != nil {
 			return err
 		}
+		base = theirs
 	}
+}
+
+// normalizeBase decodes a stored document into the model type and back into
+// the same map form diffFields compares, so differences between the stored
+// document and the struct (missing or extra fields, integer widths, key
+// order) are not mistaken for changes.
+func normalizeBase(schema *Schema, raw bson.Raw) (bson.M, error) {
+	doc := reflect.New(schema.Type).Interface()
+	if err := bson.Unmarshal(raw, doc); err != nil {
+		return nil, err
+	}
+	return toBsonMap(doc)
 }
 
 // attemptSave performs a single versioned replace. Returns ErrVersionConflict
@@ -78,23 +98,24 @@ func attemptSave(ctx context.Context, coll *mongo.Collection, schema *Schema, mo
 // mergeFromDB re-reads the document, computes a 3-way diff (base vs ours vs theirs),
 // and applies non-conflicting changes from the caller onto the fresh DB state.
 // Returns a *MergeConflictError if both sides modified the same fields.
-func mergeFromDB(ctx context.Context, coll *mongo.Collection, model interface{}, base bson.M, id interface{}, scope interface{}) error {
+// It returns the re-read state in map form, the base for a further round.
+func mergeFromDB(ctx context.Context, coll *mongo.Collection, model interface{}, base bson.M, id interface{}, scope interface{}) (bson.M, error) {
 	// Re-read the current document from the database.
 	fresh := reflect.New(reflect.TypeOf(model).Elem()).Interface()
 	if err := coll.FindOne(ctx, andFilter(scope, bson.D{{Key: "_id", Value: id}})).Decode(fresh); err != nil {
 		if errors.Is(err, mongo.ErrNoDocuments) {
-			return ErrNotFound
+			return nil, ErrNotFound
 		}
-		return fmt.Errorf("goodm: failed to re-read document for merge: %w", err)
+		return nil, fmt.Errorf("goodm: failed to re-read document for merge: %w", err)
 	}
 
 	ours, err := toBsonMap(model)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	theirs, err := toBsonMap(fresh)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	ourChanges := diffFields(base, ours)
@@ -102,7 +123,7 @@ func mergeFromDB(ctx context.Context, coll *mongo.Collection, model interface{},
 
 	conflicts := fieldIntersection(ourChanges, theirChanges)
 	if len(conflicts) > 0 {
-		return &MergeConflictError{Fields: conflicts}
+		return nil, &MergeConflictError{Fields: conflicts}
 	}
 
 	// Build merged document: start with theirs, overlay our changes.
@@ -111,13 +132,13 @@ func mergeFromDB(ctx context.Context, coll *mongo.Collection, model interface{},
 	// Write the merged state back into the caller's model struct.
 	raw, err := bson.Marshal(merged)
 	if err != nil {
-		return fmt.Errorf("goodm: failed to marshal merged document: %w", err)
+		return nil, fmt.Errorf("goodm: failed to marshal merged document: %w", err)
 	}
 	if err := bson.Unmarshal(raw, model); err != nil {
-		return fmt.Errorf("goodm: failed to apply merged document: %w", err)
+		return nil, fmt.Errorf("goodm: failed to apply merged document: %w", err)
 	}
 
-	return nil
+	return theirs, nil
 }
 
 // buildMergedDoc creates a merged document by starting with theirs and applying
@@ -156,13 +177,17 @@ func snapshotModel(model interface{}) (bson.M, error) {
 }
 
 // toBsonMap marshals any value to a bson.M via round-trip through raw BSON.
+// Nested documents decode as bson.M too, so two documents compare equal
+// regardless of key order (a Go map field marshals in random order).
 func toBsonMap(v interface{}) (bson.M, error) {
 	raw, err := bson.Marshal(v)
 	if err != nil {
 		return nil, fmt.Errorf("goodm: bson marshal failed: %w", err)
 	}
+	dec := bson.NewDecoder(bson.NewDocumentReader(bytes.NewReader(raw)))
+	dec.DefaultDocumentM()
 	var m bson.M
-	if err := bson.Unmarshal(raw, &m); err != nil {
+	if err := dec.Decode(&m); err != nil {
 		return nil, fmt.Errorf("goodm: bson unmarshal failed: %w", err)
 	}
 	return m, nil
