@@ -1384,3 +1384,112 @@ func TestPopulate_UsesSchemaPathForShadowedGoName(t *testing.T) {
 		t.Fatalf("BatchPopulate: %v %d", err, len(authors))
 	}
 }
+
+// --- seventh-round review findings ---
+
+type RvNilEmbedX struct {
+	Tags []string `bson:"tags"`
+	Sub  *struct {
+		X int `bson:"x"`
+	} `bson:"sub"`
+	Arr  [2]int `bson:"arr"`
+	Flag bool   `bson:"flag"`
+}
+
+type testNilEmbedPaths struct {
+	Model        `bson:",inline"`
+	*RvNilEmbedX `bson:",inline"`
+	Name         string `bson:"name"`
+}
+
+func TestUpdateFields_PathsBehindNilEmbedAreBounded(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testNilEmbedPaths{}, "test_nil_paths", "")
+	m := &testNilEmbedPaths{Name: "n"}
+	if err := Create(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	var ve ValidationErrors
+	if err := UpdateFields(ctx, m, bson.M{"tags.5": "x"}); !errors.As(err, &ve) {
+		t.Errorf("a slice index behind a nil embed must be rejected, got %v", err)
+	}
+	if err := UpdateFields(ctx, m, bson.M{"sub.x": 3}); !errors.As(err, &ve) {
+		t.Errorf("a path through a nil pointer behind a nil embed must be rejected, got %v", err)
+	}
+	if err := UpdateFields(ctx, m, bson.M{"arr.1": 1}); !errors.As(err, &ve) {
+		t.Errorf("an index into an array that is absent from the document must be rejected, got %v", err)
+	}
+	if err := UpdateFields(ctx, m, bson.M{"arr": [2]int{0, 7}, "flag": true, "tags": []string{"a"}}); err != nil {
+		t.Fatalf("whole values behind a nil embed: %v", err)
+	}
+	if m.RvNilEmbedX == nil || m.Arr[1] != 7 || !m.Flag || len(m.Tags) != 1 {
+		t.Errorf("values must be reflected after allocating the embed: %+v", m.RvNilEmbedX)
+	}
+	// Now that the array exists in the document, an in-bounds index is fine.
+	if err := UpdateFields(ctx, m, bson.M{"arr.0": 5}); err != nil || m.Arr[0] != 5 {
+		t.Errorf("in-bounds index on an existing array: %v", err)
+	}
+	var fresh testNilEmbedPaths
+	if err := FindByID(ctx, m.ID, &fresh); err != nil || fresh.RvNilEmbedX == nil || fresh.Arr != [2]int{5, 7} {
+		t.Errorf("document must read back: %+v %v", fresh, err)
+	}
+}
+
+func TestRegister_RejectsDuplicateBSONNamesInSubdocuments(t *testing.T) {
+	type Inner struct {
+		Name int `bson:"name"`
+	}
+	type Sub struct {
+		In   Inner  `bson:",inline"`
+		Name string `bson:"name"`
+	}
+	type model struct {
+		Model `bson:",inline"`
+		Sub   Sub `bson:"sub"`
+	}
+	err := Register(&model{}, "dup_sub")
+	if err == nil {
+		Unregister(&model{})
+		t.Fatal("duplicate bson names inside a subdocument type must be rejected")
+	}
+	if !strings.Contains(err.Error(), "sub.name") {
+		t.Errorf("error should name the path: %v", err)
+	}
+}
+
+func TestUpdateFields_InlineMapIsNotAddressableByName(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	type SubWithExt struct {
+		A   int            `bson:"a"`
+		Ext map[string]any `bson:",inline"`
+	}
+	type model struct {
+		Model `bson:",inline"`
+		Sub   SubWithExt `bson:"sub"`
+	}
+	registerModel(t, &model{}, "test_inline_map", "")
+	m := &model{}
+	if err := Create(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	if err := UpdateFields(ctx, m, bson.M{"sub": bson.M{"a": 1, "ext": bson.M{"role": "admin"}}}); err != nil {
+		t.Fatal(err)
+	}
+	var raw bson.Raw
+	if err := DB().Collection("test_inline_map").FindOne(ctx, bson.D{{Key: "_id", Value: m.ID}}).Decode(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.LookupErr("sub", "role"); err == nil {
+		t.Error("an undeclared key must not reach the document through the inline map's Go name")
+	}
+	if _, err := raw.LookupErr("sub", "ext"); err == nil {
+		t.Error("the inline map's Go name is not a document key")
+	}
+	// A struct source with an inline map flattens its entries.
+	pairs := structPairs(reflect.ValueOf(SubWithExt{A: 1, Ext: map[string]any{"k": "v"}}))
+	if len(pairs) != 2 {
+		t.Errorf("inline map entries must be flattened into the pairs: %v", pairs)
+	}
+}

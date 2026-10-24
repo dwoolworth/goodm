@@ -278,15 +278,25 @@ func isIntKind(k reflect.Kind) bool {
 	return false
 }
 
-// duplicateBSONName returns a bson name two visible fields share, or "".
-// The driver stores only one of them, so such a model is ambiguous.
+// duplicateBSONName returns a bson path two visible fields share, at any
+// depth, or "". The driver stores only one of them, so such a model is
+// ambiguous.
 func duplicateBSONName(fields []FieldSchema) string {
+	return duplicateBSONNameAt(fields, "")
+}
+
+func duplicateBSONNameAt(fields []FieldSchema, prefix string) string {
 	seen := map[string]bool{}
 	for _, f := range fields {
 		if seen[f.BSONName] {
-			return f.BSONName
+			return prefix + f.BSONName
 		}
 		seen[f.BSONName] = true
+		if len(f.SubFields) > 0 {
+			if dup := duplicateBSONNameAt(f.SubFields, prefix+f.BSONName+"."); dup != "" {
+				return dup
+			}
+		}
 	}
 	return ""
 }

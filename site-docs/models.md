@@ -292,7 +292,7 @@ type Setting struct {
 }
 ```
 
-Timestamps and versioning are applied when the struct has `CreatedAt`, `UpdatedAt`, and `Version` fields (as `goodm.Model` provides) and skipped otherwise.
+Timestamps and versioning are applied to the fields stored as `created_at` and `updated_at` (which must be `time.Time`) and `__v` (a signed integer), as `goodm.Model` declares them, and skipped when the struct has none; the Go field names do not matter.
 
 ## Inspecting Schemas
 

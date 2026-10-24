@@ -779,35 +779,37 @@ func walkPath(root reflect.Value, path string) (reflect.Value, bool) {
 	return target, target.IsValid() && target.CanSet()
 }
 
-// typePathExists reports whether a dotted path can be resolved on a type:
-// struct segments by bson name through inline embeds, numeric segments on
-// slices (any index) and arrays (within bounds).
+// typePathExists reports whether a dotted path can be resolved on a type
+// whose value is entirely zero (it sits behind a nil inline embed), meaning
+// none of its fields exist in the stored document either. The path may only
+// pass through struct values and inline embeds: a numeric segment on an
+// absent array makes the server create an object in its place, and a nil
+// pointer cannot be descended into. The last segment may name anything.
 func typePathExists(t reflect.Type, segs []string) bool {
-	for _, seg := range segs {
+	for i, seg := range segs {
+		last := i == len(segs)-1
 		if t.Kind() == reflect.Pointer {
+			if i > 0 {
+				return false // a nil pointer on the path
+			}
 			t = t.Elem()
 		}
-		switch t.Kind() {
-		case reflect.Struct:
-			var found *reflect.StructField
-			for _, f := range internal.StructFields(t) {
-				if bsonFieldName(f) == seg {
-					f := f
-					found = &f
-					break
-				}
+		if t.Kind() != reflect.Struct {
+			return false // arrays, slices, maps, scalars: absent, nothing to descend into
+		}
+		var found *reflect.StructField
+		for _, f := range internal.StructFields(t) {
+			if bsonFieldName(f) == seg {
+				f := f
+				found = &f
+				break
 			}
-			if found == nil {
-				return false
-			}
-			t = found.Type
-		case reflect.Slice, reflect.Array:
-			n, err := strconv.Atoi(seg)
-			if err != nil || n < 0 || (t.Kind() == reflect.Array && n >= t.Len()) {
-				return false
-			}
-			t = t.Elem()
-		default:
+		}
+		if found == nil {
+			return false
+		}
+		t = found.Type
+		if !last && t.Kind() == reflect.Pointer {
 			return false
 		}
 	}
@@ -1187,6 +1189,14 @@ func structPairs(v reflect.Value) bson.D {
 			out = append(out, structPairs(f)...)
 			continue
 		}
+		if bsonTagInline(sf.Tag.Get("bson")) && f.Kind() == reflect.Map && f.Type().Key().Kind() == reflect.String {
+			// An inline map's entries are stored beside the struct's fields.
+			iter := f.MapRange()
+			for iter.Next() {
+				out = append(out, bson.E{Key: iter.Key().String(), Value: iter.Value().Interface()})
+			}
+			continue
+		}
 		name := bsonFieldName(sf)
 		if name == "-" {
 			continue
@@ -1369,8 +1379,8 @@ func fieldByBSONName(v reflect.Value, name string, alloc bool) reflect.Value {
 	t := v.Type()
 	for i := 0; i < t.NumField(); i++ {
 		sf := t.Field(i)
-		if !sf.IsExported() || internal.IsInlineStruct(sf) {
-			continue
+		if !sf.IsExported() || bsonTagInline(sf.Tag.Get("bson")) {
+			continue // inline structs are searched below; inline maps have no name of their own
 		}
 		if bsonFieldName(sf) == name {
 			return v.Field(i)
