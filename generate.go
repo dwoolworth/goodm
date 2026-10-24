@@ -147,7 +147,7 @@ func GenerateModel(coll DiscoveredCollection, opts GenerateOptions) ([]byte, err
 	// not emitted, so an index Discover tagged onto it must go to Indexes().
 	indexes := append([]DiscoveredIndex(nil), coll.Indexes...)
 	for _, f := range coll.Fields {
-		if opts.EmbedModel && (f.BSONName == "_id" || f.BSONName == "created_at" || f.BSONName == "updated_at") {
+		if opts.EmbedModel && (f.BSONName == "_id" || f.BSONName == "created_at" || f.BSONName == "updated_at" || f.BSONName == "__v") {
 			for i := range indexes {
 				if indexes[i].Tagged && len(indexes[i].Keys) == 1 {
 					if field, _ := parseIndexField(indexes[i].Keys[0]); field == f.BSONName {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -1003,5 +1004,202 @@ func TestDiscover_EmbedModel_KeepsIndexesOnModelFields(t *testing.T) {
 	}
 	if !strings.Contains(string(src), `{Fields: []string{"created_at"}, ExpireAfterSeconds: goodm.TTL(3600 * time.Second)},`) {
 		t.Errorf("TTL index on created_at must survive EmbedModel as an Indexes() entry:\n%s", src)
+	}
+}
+
+// --- fifth-round review findings ---
+
+type rvBase struct {
+	ID bson.ObjectID `bson:"_id,omitempty"`
+}
+
+func TestRegister_UnexportedInlineEmbedIsNotVisible(t *testing.T) {
+	type hidden struct {
+		rvBase `bson:",inline"` // the driver skips unexported embeds entirely
+		Name   string           `bson:"name"`
+	}
+	if err := Register(&hidden{}, "hidden"); err == nil {
+		Unregister(&hidden{})
+		t.Fatal("an _id reachable only through an unexported embed must not be accepted")
+	}
+	type withAudit struct {
+		Model     `bson:",inline"`
+		TestAudit `bson:"audit"`
+		rvHidden  struct { //nolint:unused // deliberately invisible to the driver
+			X string `bson:"x" goodm:"required"`
+		}
+		Name string `bson:"name"`
+	}
+	m := &withAudit{}
+	m.rvHidden.X = "set" // keep the field referenced; the driver must still ignore it
+	if err := Register(m, "with_audit"); err != nil {
+		t.Fatal(err)
+	}
+	defer Unregister(m)
+	schema, _ := SchemaOf(m)
+	if schema.GetField("rvhidden") != nil {
+		t.Error("an unexported embed must not produce a phantom subdocument field")
+	}
+	if schema.GetField("audit") == nil {
+		t.Error("an exported embed tagged with a name must be a subdocument field under that name")
+	}
+}
+
+func TestRegister_RejectsDuplicateBSONNames(t *testing.T) {
+	type inner struct {
+		Name string `bson:"name"`
+	}
+	type dup struct {
+		Model `bson:",inline"`
+		Name  string `bson:"name"`
+		Inner inner  `bson:",inline"`
+	}
+	type Inner2 struct {
+		Name string `bson:"name"`
+	}
+	type dup2 struct {
+		Model  `bson:",inline"`
+		Name   string `bson:"name"`
+		Inner2 `bson:",inline"`
+	}
+	if err := Register(&dup2{}, "dup2"); err == nil || !strings.Contains(err.Error(), "two fields stored as") {
+		Unregister(&dup2{})
+		t.Fatalf("two fields under one bson name must be rejected, got %v", err)
+	}
+	_ = dup{}
+}
+
+type Shadow struct {
+	Name string `bson:"inner_name" goodm:"required,default=dflt,enum=dflt|other"`
+}
+
+type testShadowed struct {
+	Model  `bson:",inline"`
+	Name   string `bson:"name"`
+	Shadow `bson:",inline"`
+}
+
+func TestValidation_UsesIndexPathNotGoName(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testShadowed{}, "test_shadowed", "")
+
+	m := &testShadowed{Name: "top"}
+	if err := Create(ctx, m); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if m.Name != "top" || m.Shadow.Name != "dflt" {
+		t.Errorf("default must land on the embed's field, not the top-level one: top=%q inner=%q", m.Name, m.Shadow.Name)
+	}
+	m.Shadow.Name = ""
+	var ve ValidationErrors
+	if err := Update(ctx, m); !errors.As(err, &ve) || !hasFieldError(ve, "inner_name") {
+		t.Errorf("required on inner_name must check the embed's field, got %v", err)
+	}
+	m.Shadow.Name = "other"
+	if err := UpdateFields(ctx, m, bson.M{"inner_name": "dflt", "name": "x"}); err != nil || m.Shadow.Name != "dflt" || m.Name != "x" {
+		t.Errorf("UpdateFields must address each field by bson name: %v %+v", err, m)
+	}
+}
+
+func TestEnforce_PartialFilterWithAndOfMaps_IsStable(t *testing.T) {
+	ctx, db, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testAndFilter{}, "test_and_filter", "")
+	if err := Enforce(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	schema, _ := SchemaOf(&testAndFilter{})
+	for i := 0; i < 30; i++ {
+		if err := Enforce(ctx, db, EnforceOptions{IndexMismatchPolicy: IndexMismatchError}); err != nil {
+			t.Fatalf("run %d: %v", i, err)
+		}
+		plan, err := PlanMigration(ctx, db, []*Schema{schema})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, a := range plan.Actions {
+			if a.Type == ActionRebuildIndex {
+				t.Fatalf("run %d: spurious rebuild: %s", i, a.Description)
+			}
+		}
+	}
+}
+
+type testAndFilter struct {
+	Model `bson:",inline"`
+	A     int  `bson:"a"`
+	B     bool `bson:"b"`
+	Addr  struct {
+		C int `bson:"c"`
+		Z int `bson:"z"`
+	} `bson:"addr"`
+}
+
+func (m *testAndFilter) Indexes() []CompoundIndex {
+	return []CompoundIndex{
+		{Fields: []string{"a"}, Name: "and_filter", PartialFilter: bson.M{"$and": bson.A{bson.M{"a": bson.M{"$gt": 1}, "b": bson.M{"$exists": true}}}}},
+		{Fields: []string{"b"}, Name: "or_filter", PartialFilter: bson.M{"$or": bson.A{bson.M{"a": 1, "b": true}, bson.M{"b": false, "a": 2}}}},
+		{Fields: []string{"a", "b"}, Name: "exact_sub", PartialFilter: bson.M{"addr": bson.M{"c": 1, "z": 2}}},
+	}
+}
+
+func TestDiscover_EmbedModel_SkipsVersionField(t *testing.T) {
+	ctx, db, cleanup := setupTestDB(t)
+	defer cleanup()
+	u := seedUsers(t, ctx, 1)[0]
+	found, err := Discover(ctx, db, DiscoverOptions{Collections: []string{"test_users"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, err := GenerateModel(found[0], GenerateOptions{PackageName: "models", EmbedModel: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(src), `bson:"__v"`) {
+		t.Errorf("__v must not be emitted beside the embedded Model:\n%s", src)
+	}
+	_ = u
+}
+
+type testF32Int struct {
+	Model `bson:",inline"`
+	F     float32     `bson:"f"`
+	Bin   bson.Binary `bson:"bin"`
+	Ratio float64     `bson:"ratio"`
+}
+
+func TestUpdateFields_Float32ExactnessBinaryAndNaN(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testF32Int{}, "test_f32int", "")
+	m := &testF32Int{}
+	if err := Create(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	var ve ValidationErrors
+	if err := UpdateFields(ctx, m, bson.M{"f": 16777217}); !errors.As(err, &ve) {
+		t.Errorf("16777217 into float32 must be rejected, got %v", err)
+	}
+	if err := UpdateFields(ctx, m, bson.M{"f": 16777216}); err != nil || m.F != 16777216 {
+		t.Errorf("16777216 into float32: %v", err)
+	}
+	if err := UpdateFields(ctx, m, bson.M{"f": 0.1}); err != nil || m.F != float32(0.1) {
+		t.Errorf("float64 into float32 rounds: %v", err)
+	}
+	if err := UpdateFields(ctx, m, bson.M{"ratio": math.NaN()}); !errors.As(err, &ve) {
+		t.Errorf("NaN must be rejected, got %v", err)
+	}
+	if err := UpdateFields(ctx, m, bson.M{"bin": []byte("x")}); err != nil || string(m.Bin.Data) != "x" || m.Bin.Subtype != 0 {
+		t.Errorf("[]byte into bson.Binary: %v %+v", err, m.Bin)
+	}
+	// omitempty on a struct source is honored.
+	type src struct {
+		C int `bson:"c,omitempty"`
+		Z int `bson:"z"`
+	}
+	pairs := structPairs(reflect.ValueOf(src{Z: 2}))
+	if len(pairs) != 1 || pairs[0].Key != "z" {
+		t.Errorf("omitempty zero field must be skipped: %v", pairs)
 	}
 }

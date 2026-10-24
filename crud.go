@@ -797,6 +797,9 @@ func convertValue(val interface{}, t reflect.Type) (reflect.Value, error) {
 		ptr.Elem().Set(inner)
 		return ptr, nil
 	}
+	if (rv.Kind() == reflect.Float32 || rv.Kind() == reflect.Float64) && math.IsNaN(rv.Float()) {
+		return reflect.Value{}, fmt.Errorf("NaN is not a value")
+	}
 	if rv.Type().AssignableTo(t) {
 		return rv, nil
 	}
@@ -847,6 +850,9 @@ func convertValue(val interface{}, t reflect.Type) (reflect.Value, error) {
 		}
 		return reflect.Value{}, fmt.Errorf("not a time.Time")
 	case classBinary:
+		if t == bsonBinaryType && rv.Kind() == reflect.Slice && rv.Type().Elem().Kind() == reflect.Uint8 {
+			return reflect.ValueOf(bson.Binary{Data: rv.Bytes()}), nil
+		}
 		if rv.Type() == bsonBinaryType {
 			bin := rv.Interface().(bson.Binary)
 			if t == bsonBinaryType {
@@ -898,6 +904,7 @@ var (
 	bsonBinaryType = reflect.TypeOf(bson.Binary{})
 	bsonDType      = reflect.TypeOf(bson.D{})
 	bsonEType      = reflect.TypeOf(bson.E{})
+	bsonRawType    = reflect.TypeOf(bson.Raw{})
 )
 
 // valueClass groups Go types by the BSON shape they take.
@@ -913,6 +920,8 @@ func valueClass(t reflect.Type) typeClass {
 		return classBinary
 	case t == bsonDType:
 		return classBSOND
+	case t == bsonRawType:
+		return classDocument
 	}
 	switch t.Kind() {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
@@ -925,10 +934,12 @@ func valueClass(t reflect.Type) typeClass {
 		return classBool
 	case reflect.Struct, reflect.Map:
 		return classDocument
-	case reflect.Slice, reflect.Array:
+	case reflect.Slice:
 		if t.Elem() == bsonEType {
 			return classBSOND
 		}
+		return classArray
+	case reflect.Array:
 		return classArray
 	}
 	return classOther
@@ -1003,9 +1014,15 @@ func convertNumber(rv reflect.Value, t reflect.Type) (reflect.Value, error) {
 			}
 		default:
 			f = rv.Float()
+			if math.IsNaN(f) {
+				return reflect.Value{}, fmt.Errorf("NaN is not a value")
+			}
 		}
 		if out.OverflowFloat(f) {
 			return reflect.Value{}, fmt.Errorf("value %v overflows %s", f, t)
+		}
+		if t.Kind() == reflect.Float32 && (rv.CanInt() || rv.CanUint()) && float64(float32(f)) != f {
+			return reflect.Value{}, fmt.Errorf("value %v is not exactly representable as %s", f, t)
 		}
 		out.SetFloat(f)
 	}
@@ -1022,7 +1039,6 @@ func convertDocument(rv reflect.Value, t reflect.Type) (reflect.Value, error) {
 	out := reflect.New(t).Elem()
 	switch t.Kind() {
 	case reflect.Struct:
-		allocateInlineEmbeds(out)
 		for _, p := range pairs {
 			f := fieldByBSONName(out, p.Key)
 			if !f.IsValid() || !f.CanSet() {
@@ -1052,31 +1068,6 @@ func convertDocument(rv reflect.Value, t reflect.Type) (reflect.Value, error) {
 	return out, nil
 }
 
-// allocateInlineEmbeds gives every nil inline pointer embed of a writable
-// struct a fresh value, so fields declared through it can be set.
-func allocateInlineEmbeds(v reflect.Value) {
-	t := v.Type()
-	for i := 0; i < t.NumField(); i++ {
-		sf := t.Field(i)
-		if !sf.Anonymous || !internal.FieldVisible(sf) || !bsonTagInline(sf.Tag.Get("bson")) {
-			continue
-		}
-		f := v.Field(i)
-		if f.Kind() == reflect.Pointer {
-			if f.IsNil() && f.CanSet() && f.Type().Elem().Kind() == reflect.Struct {
-				f.Set(reflect.New(f.Type().Elem()))
-			}
-			if f.IsNil() {
-				continue
-			}
-			f = f.Elem()
-		}
-		if f.Kind() == reflect.Struct {
-			allocateInlineEmbeds(f)
-		}
-	}
-}
-
 // documentPairs flattens a document-shaped value into key/value pairs. Struct
 // sources are read field by field through reflection (not marshaled), so
 // their values keep their Go types.
@@ -1095,20 +1086,27 @@ func documentPairs(rv reflect.Value) (bson.D, error) {
 			out = append(out, bson.E{Key: iter.Key().String(), Value: iter.Value().Interface()})
 		}
 		return out, nil
+	case rv.Type() == bsonRawType:
+		var out bson.D
+		if err := bson.Unmarshal(rv.Interface().(bson.Raw), &out); err != nil {
+			return nil, err
+		}
+		return out, nil
 	case rv.Kind() == reflect.Struct && valueClass(rv.Type()) == classDocument:
 		return structPairs(rv), nil
 	}
 	return nil, fmt.Errorf("not a document")
 }
 
-// structPairs lists a struct's exported fields by bson name, flattening
-// inline embeds and skipping fields tagged "-" and nil inline pointers.
+// structPairs lists a struct's fields by bson name as the driver would
+// encode them: exported fields only, inline embeds flattened, fields tagged
+// "-" skipped, and omitempty fields skipped when zero.
 func structPairs(v reflect.Value) bson.D {
 	var out bson.D
 	t := v.Type()
 	for i := 0; i < t.NumField(); i++ {
 		sf := t.Field(i)
-		if !internal.FieldVisible(sf) {
+		if !sf.IsExported() {
 			continue
 		}
 		f := v.Field(i)
@@ -1124,12 +1122,12 @@ func structPairs(v reflect.Value) bson.D {
 			}
 			continue
 		}
-		name, _ := ParseBSONTag(sf.Tag.Get("bson"))
+		name := bsonFieldName(sf)
 		if name == "-" {
 			continue
 		}
-		if name == "" {
-			name = strings.ToLower(sf.Name)
+		if internal.HasOmitEmpty(sf.Tag.Get("bson")) && f.IsZero() {
+			continue
 		}
 		out = append(out, bson.E{Key: name, Value: f.Interface()})
 	}
@@ -1281,62 +1279,92 @@ func stepInto(v reflect.Value, seg string) (reflect.Value, bool) {
 	return v, false
 }
 
-// fieldByBSONName finds the struct field whose bson name matches, descending
-// into embedded structs.
+// fieldByBSONName finds the struct field the driver stores under name: a
+// direct field first, then fields promoted through exported inline embeds,
+// which is the driver's own precedence. A nil pointer embed is allocated
+// only when it declares the name.
 func fieldByBSONName(v reflect.Value, name string) reflect.Value {
 	t := v.Type()
 	for i := 0; i < t.NumField(); i++ {
 		sf := t.Field(i)
-		if !internal.FieldVisible(sf) {
+		if !sf.IsExported() || (sf.Anonymous && bsonTagInline(sf.Tag.Get("bson"))) {
 			continue
 		}
-		if sf.Anonymous && bsonTagInline(sf.Tag.Get("bson")) {
-			inner := v.Field(i)
-			if inner.Kind() == reflect.Pointer {
-				if inner.IsNil() {
+		if bsonFieldName(sf) == name {
+			return v.Field(i)
+		}
+	}
+	for i := 0; i < t.NumField(); i++ {
+		sf := t.Field(i)
+		if !sf.IsExported() || !sf.Anonymous || !bsonTagInline(sf.Tag.Get("bson")) {
+			continue
+		}
+		inner := v.Field(i)
+		if inner.Kind() == reflect.Pointer {
+			if inner.IsNil() {
+				if !inner.CanSet() || inner.Type().Elem().Kind() != reflect.Struct || !typeHasBSONName(inner.Type().Elem(), name) {
 					continue
 				}
-				inner = inner.Elem()
+				inner.Set(reflect.New(inner.Type().Elem()))
 			}
-			if inner.Kind() == reflect.Struct {
-				if f := fieldByBSONName(inner, name); f.IsValid() {
-					return f
-				}
+			inner = inner.Elem()
+		}
+		if inner.Kind() == reflect.Struct {
+			if f := fieldByBSONName(inner, name); f.IsValid() {
+				return f
 			}
-			continue
-		}
-		bsonName, _ := ParseBSONTag(sf.Tag.Get("bson"))
-		if bsonName == "-" {
-			continue
-		}
-		if bsonName == "" {
-			bsonName = strings.ToLower(sf.Name)
-		}
-		if bsonName == name {
-			return v.Field(i)
 		}
 	}
 	return reflect.Value{}
 }
 
-// fieldByGoName is FieldByName that tolerates nil embedded pointers: Go's
-// own FieldByName panics when the path to a promoted field crosses one.
-func fieldByGoName(v reflect.Value, name string) reflect.Value {
-	t := v.Type()
-	if sf, ok := t.FieldByName(name); ok {
-		cur := v
-		for _, i := range sf.Index {
-			if cur.Kind() == reflect.Pointer {
-				if cur.IsNil() {
-					return reflect.Value{}
-				}
-				cur = cur.Elem()
-			}
-			cur = cur.Field(i)
+// typeHasBSONName reports whether a struct type stores a field under name,
+// directly or through inline embeds.
+func typeHasBSONName(t reflect.Type, name string) bool {
+	for _, f := range internal.StructFields(t) {
+		if bsonFieldName(f) == name {
+			return true
 		}
-		return cur
 	}
-	return reflect.Value{}
+	return false
+}
+
+// bsonFieldName is the name the driver stores a field under: its tag, or the
+// lowercased Go name; "-" for fields the driver skips.
+func bsonFieldName(sf reflect.StructField) string {
+	name, _ := ParseBSONTag(sf.Tag.Get("bson"))
+	if name == "" {
+		return strings.ToLower(sf.Name)
+	}
+	return name
+}
+
+// fieldByIndex follows a FieldSchema's index path from a struct value,
+// tolerating nil pointer embeds along the way (returns an invalid Value).
+func fieldByIndex(v reflect.Value, index []int) reflect.Value {
+	cur := v
+	for _, i := range index {
+		if cur.Kind() == reflect.Pointer {
+			if cur.IsNil() {
+				return reflect.Value{}
+			}
+			cur = cur.Elem()
+		}
+		if cur.Kind() != reflect.Struct || i >= cur.NumField() {
+			return reflect.Value{}
+		}
+		cur = cur.Field(i)
+	}
+	return cur
+}
+
+// schemaField returns the value of fs within v, by index path when the
+// schema recorded one and by Go name otherwise.
+func schemaField(v reflect.Value, fs *FieldSchema) reflect.Value {
+	if len(fs.index) > 0 {
+		return fieldByIndex(v, fs.index)
+	}
+	return v.FieldByName(fs.Name)
 }
 
 // UpdateOne performs a partial update on a single document matching filter.
@@ -1998,8 +2026,8 @@ func validateImmutable(old, new interface{}, schema *Schema) []ValidationError {
 		if !field.Immutable {
 			continue
 		}
-		oldField := fieldByGoName(oldV, field.Name)
-		newField := fieldByGoName(newV, field.Name)
+		oldField := schemaField(oldV, &field)
+		newField := schemaField(newV, &field)
 		if !oldField.IsValid() || !newField.IsValid() {
 			continue
 		}

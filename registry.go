@@ -39,6 +39,9 @@ func Register(model interface{}, collection string) error {
 
 	// Parse struct fields (recursively handles subdocuments)
 	schema.Fields = parseFields(t, nil)
+	if dup := duplicateBSONName(schema.Fields); dup != "" {
+		return fmt.Errorf("goodm: model %s has two fields stored as %q; the driver keeps only one", schema.QualifiedName(), dup)
+	}
 	schema.idField = findIDField(t)
 	if schema.idField == nil {
 		if embedsModelWithoutInline(t) {
@@ -207,6 +210,7 @@ func parseFields(t reflect.Type, seen map[reflect.Type]bool) []FieldSchema {
 		fs.BSONName = bsonName
 		fs.Type = internal.TypeName(f.Type)
 		fs.goType = f.Type
+		fs.index = f.Index
 
 		// Determine underlying type (deref pointers, unwrap slices)
 		fieldType := f.Type
@@ -235,38 +239,29 @@ func parseFields(t reflect.Type, seen map[reflect.Type]bool) []FieldSchema {
 	return result
 }
 
-// findIDField locates the struct field tagged bson:"_id". Direct fields are
-// checked first, then embedded structs that the driver flattens: anonymous,
-// exported, and tagged bson:",inline". An embedded struct without the inline
-// tag is stored as a nested document, so an _id inside it is not the
-// document's _id and is deliberately not found. Returns nil if there is none.
+// findIDField locates the field tagged bson:"_id" among the fields the driver
+// stores at the top level (see internal.StructFields) and returns its index
+// path. Returns nil if there is none.
 func findIDField(t reflect.Type) []int {
-	for i := 0; i < t.NumField(); i++ {
-		f := t.Field(i)
-		if !internal.FieldVisible(f) {
-			continue
-		}
+	for _, f := range internal.StructFields(t) {
 		if name, _ := ParseBSONTag(f.Tag.Get("bson")); name == "_id" {
-			return []int{i}
-		}
-	}
-	for i := 0; i < t.NumField(); i++ {
-		f := t.Field(i)
-		if !f.Anonymous || !internal.FieldVisible(f) || !bsonTagInline(f.Tag.Get("bson")) {
-			continue
-		}
-		ft := f.Type
-		if ft.Kind() == reflect.Pointer {
-			ft = ft.Elem()
-		}
-		if ft.Kind() != reflect.Struct {
-			continue
-		}
-		if inner := findIDField(ft); inner != nil {
-			return append([]int{i}, inner...)
+			return f.Index
 		}
 	}
 	return nil
+}
+
+// duplicateBSONName returns a bson name two visible fields share, or "".
+// The driver stores only one of them, so such a model is ambiguous.
+func duplicateBSONName(fields []FieldSchema) string {
+	seen := map[string]bool{}
+	for _, f := range fields {
+		if seen[f.BSONName] {
+			return f.BSONName
+		}
+		seen[f.BSONName] = true
+	}
+	return ""
 }
 
 // embedsModelWithoutInline reports whether t embeds goodm.Model without the

@@ -24,7 +24,7 @@ func validateFields(v reflect.Value, fields []FieldSchema, pathPrefix string) []
 
 	for i := range fields {
 		fs := &fields[i]
-		fv := fieldByGoName(v, fs.Name)
+		fv := schemaField(v, fs)
 		if !fv.IsValid() {
 			continue
 		}

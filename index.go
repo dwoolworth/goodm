@@ -156,9 +156,23 @@ func (ci CompoundIndex) definition() IndexDefinition {
 		Unique:             ci.Unique,
 		Sparse:             ci.Sparse,
 		ExpireAfterSeconds: ci.ExpireAfterSeconds,
-		PartialFilter:      ci.PartialFilter,
+		PartialFilter:      normalizePartialFilter(ci.PartialFilter),
 		Collation:          ci.Collation,
 	}
+}
+
+// normalizePartialFilter converts a partial filter into its canonical ordered
+// form before it is created or compared, so a filter written with unordered
+// maps is stored by the server in a deterministic order and later matches.
+func normalizePartialFilter(f interface{}) interface{} {
+	if f == nil {
+		return nil
+	}
+	c, err := canonicalBSON(f)
+	if err != nil {
+		return f
+	}
+	return c
 }
 
 // Keys returns the index key document described by Fields, resolving the
@@ -325,7 +339,9 @@ func filtersEquivalent(a, b interface{}) bool {
 // which documents have sorted keys and all numbers are float64, so two ways
 // of writing the same filter (bson.M vs bson.D, int vs int64) compare equal.
 func canonicalBSON(v interface{}) (interface{}, error) {
-	raw, err := bson.Marshal(bson.D{{Key: "v", Value: v}})
+	// Sort unordered maps before marshaling: once a bson.M has been encoded
+	// its random order is indistinguishable from a deliberate bson.D order.
+	raw, err := bson.Marshal(bson.D{{Key: "v", Value: canonicalValueAt(v, true)}})
 	if err != nil {
 		return nil, err
 	}
@@ -354,7 +370,7 @@ func canonicalValueAt(v interface{}, top bool) interface{} {
 		out := make(bson.D, len(x))
 		allOps := len(x) > 0
 		for i, e := range x {
-			out[i] = bson.E{Key: e.Key, Value: canonicalValueAt(e.Value, false)}
+			out[i] = bson.E{Key: e.Key, Value: canonicalValueAt(e.Value, isFilterListOperator(e.Key))}
 			if !strings.HasPrefix(e.Key, "$") {
 				allOps = false
 			}
@@ -364,22 +380,19 @@ func canonicalValueAt(v interface{}, top bool) interface{} {
 		}
 		return out
 	case bson.M:
-		out := make(bson.D, 0, len(x))
-		for k, val := range x {
-			out = append(out, bson.E{Key: k, Value: canonicalValueAt(val, false)})
-		}
-		sort.SliceStable(out, func(i, j int) bool { return out[i].Key < out[j].Key })
-		return out
+		return canonicalMap(x)
+	case map[string]interface{}:
+		return canonicalMap(x)
 	case bson.A:
 		out := make(bson.A, len(x))
 		for i, e := range x {
-			out[i] = canonicalValueAt(e, false)
+			out[i] = canonicalValueAt(e, top)
 		}
 		return out
 	case []interface{}:
 		out := make(bson.A, len(x))
 		for i, e := range x {
-			out[i] = canonicalValueAt(e, false)
+			out[i] = canonicalValueAt(e, top)
 		}
 		return out
 	case int:
@@ -392,6 +405,22 @@ func canonicalValueAt(v interface{}, top bool) interface{} {
 		return canonicalFloat(x)
 	}
 	return v
+}
+
+// canonicalMap converts an unordered map into a key-sorted bson.D.
+func canonicalMap(m map[string]interface{}) bson.D {
+	out := make(bson.D, 0, len(m))
+	for k, val := range m {
+		out = append(out, bson.E{Key: k, Value: canonicalValueAt(val, isFilterListOperator(k))})
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out
+}
+
+// isFilterListOperator reports whether an operator's array holds filter
+// documents (whose key order is irrelevant) rather than values.
+func isFilterListOperator(key string) bool {
+	return key == "$and" || key == "$or" || key == "$nor"
 }
 
 func canonicalFloat(f float64) interface{} {

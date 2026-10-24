@@ -39,6 +39,7 @@ type FieldSchema struct {
 	IsSlice   bool          // true if field is []struct or []*struct
 
 	goType reflect.Type // the Go type of the field, used to convert values set via UpdateFields
+	index  []int        // reflect index path from the enclosing struct, through inline embeds
 }
 
 // GoType returns the Go type of the field.
