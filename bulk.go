@@ -398,7 +398,6 @@ type replaceResult struct {
 	err               error // server rejection, write concern, or transport error
 	code              int   // server error code, if any
 	wc                error // write concern error, if any
-	unknown           bool  // the server may have applied the write
 	server            bool  // the server produced the error, so inside a transaction it has aborted it
 }
 
@@ -408,13 +407,27 @@ type replaceResult struct {
 // context error is wrapped too, so errors.Is(err, context.Canceled) works.
 var ErrNotAttempted = errors.New("goodm: not attempted")
 
-// isServerError reports whether the server produced err (a command or write
-// error), as opposed to a failure raised on the client such as a marshal
-// error or a done context. Inside a transaction only a server error has
-// aborted the transaction.
+// isServerError reports whether err came back through the driver's server
+// error types (a command or write error), as opposed to a failure raised
+// before anything was sent, such as a marshal error or a context that was
+// already done. The driver also wraps network errors and in-flight timeouts
+// as command errors, so inside a transaction those count as aborting too:
+// the transaction may or may not survive them, and treating it as aborted
+// errs toward a later conflict rather than a lost write.
 func isServerError(err error) bool {
 	var se mongo.ServerError
 	return errors.As(err, &se)
+}
+
+// isTransportError reports whether err is a network failure or an in-flight
+// context error, after which the server may or may not have applied the
+// write.
+func isTransportError(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var le mongo.LabeledError
+	return errors.As(err, &le) && le.HasErrorLabel("NetworkError")
 }
 
 // inTransaction reports whether ctx carries a session with a transaction in
@@ -546,22 +559,21 @@ func saveManyReplace(ctx context.Context, coll *mongo.Collection, schema *Schema
 func classifyReplaceError(err error, schema *Schema) replaceResult {
 	// Decide from the driver's error, before translation, whether the server
 	// produced it. Inside a transaction a server error has aborted the
-	// transaction; a server-selection failure is wrapped the same way by the
-	// driver and is treated as aborting too, which errs toward reporting a
-	// conflict later rather than a lost write.
+	// transaction; network, timeout, and server-selection failures are
+	// wrapped the same way by the driver and are treated as aborting too,
+	// which errs toward reporting a conflict later rather than a lost write.
 	r := replaceResult{server: isServerError(err)}
 	var we mongo.WriteException
 	if !errors.As(err, &we) {
 		var ce mongo.CommandError
-		if errors.As(err, &ce) {
-			// A command error (write conflict, no such transaction) is known
-			// not to have applied.
+		if errors.As(err, &ce) && !isTransportError(err) {
+			// A command error from the server (write conflict, no such
+			// transaction) is known not to have applied.
 			r.err = fmt.Errorf("goodm: replace failed: %w", err)
 			r.code = int(ce.Code)
 			return r
 		}
 		r.err = fmt.Errorf("goodm: outcome unknown: %w", err)
-		r.unknown = true
 		return r
 	}
 	if we.WriteConcernError != nil {
@@ -574,10 +586,8 @@ func classifyReplaceError(err error, schema *Schema) replaceResult {
 		r.code = item.Code
 	} else if r.wc != nil {
 		r.err = fmt.Errorf("goodm: outcome unknown: %w", r.wc)
-		r.unknown = true
 	} else {
 		r.err = fmt.Errorf("goodm: outcome unknown: %w", err)
-		r.unknown = true
 	}
 	return r
 }

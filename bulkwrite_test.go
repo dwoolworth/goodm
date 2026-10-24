@@ -952,3 +952,26 @@ func TestSaveMany_ValidatorFailureInTransaction_IsAServerError(t *testing.T) {
 		t.Errorf("nothing may have been committed: %+v %v", fresh, err)
 	}
 }
+
+func TestClassifyReplaceError_TransportIsUnknown(t *testing.T) {
+	// A network error arrives as a CommandError with the NetworkError label.
+	netErr := mongo.CommandError{Code: 0, Message: "connection reset", Labels: []string{"NetworkError"}}
+	r := classifyReplaceError(netErr, nil)
+	if !strings.Contains(r.err.Error(), "outcome unknown") || !r.server {
+		t.Errorf("network error: %v server=%v", r.err, r.server)
+	}
+	dl := mongo.CommandError{Code: 0, Message: "incomplete read", Labels: []string{"NetworkError"}, Wrapped: context.DeadlineExceeded}
+	r = classifyReplaceError(dl, nil)
+	if !strings.Contains(r.err.Error(), "outcome unknown") || !errors.Is(r.err, context.DeadlineExceeded) {
+		t.Errorf("in-flight deadline: %v", r.err)
+	}
+	wc := mongo.CommandError{Code: 112, Message: "WriteConflict", Labels: []string{"TransientTransactionError"}}
+	r = classifyReplaceError(wc, nil)
+	if strings.Contains(r.err.Error(), "outcome unknown") || r.code != 112 {
+		t.Errorf("write conflict is a known failure with its code: %v code=%d", r.err, r.code)
+	}
+	r = classifyReplaceError(errors.New("marshal boom"), nil)
+	if r.server || !strings.Contains(r.err.Error(), "outcome unknown") {
+		t.Errorf("client-side error: %v server=%v", r.err, r.server)
+	}
+}
