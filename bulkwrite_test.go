@@ -906,3 +906,49 @@ func TestCreateMany_InTransaction_FailureReportsNothingInserted(t *testing.T) {
 		t.Error("nothing may have been committed")
 	}
 }
+
+func TestSaveMany_ValidatorFailureInTransaction_IsAServerError(t *testing.T) {
+	ctx, db, cleanup := setupTestDB(t)
+	defer cleanup()
+	// A $jsonSchema validator makes the server reject a write with code 121,
+	// which is not a duplicate key: it must still count as a server error.
+	cmd := bson.D{{Key: "collMod", Value: "test_users"}, {Key: "validator", Value: bson.D{
+		{Key: "$jsonSchema", Value: bson.D{{Key: "properties", Value: bson.D{{Key: "role", Value: bson.D{{Key: "enum", Value: bson.A{"user"}}}}}}}},
+	}}}
+	users := seedUsers(t, ctx, 3)
+	if err := db.RunCommand(ctx, cmd).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	users[0].Role, users[0].Age = "user", 1
+	users[1].Role, users[1].Age = "user", 2
+	users[2].Role = "admin" // allowed by goodm's enum, rejected by the server's validator; it is the last item
+	calls := 0
+	var be *BulkError
+	err := WithTransaction(ctx, func(ctx context.Context) error {
+		calls++
+		err := SaveMany(ctx, users)
+		if !errors.As(err, &be) {
+			t.Fatalf("expected a BulkError, got %v", err)
+		}
+		return err
+	})
+	if err == nil {
+		t.Fatal("transaction must fail")
+	}
+	if calls != 1 {
+		t.Errorf("callback must run once, not retry: %d", calls)
+	}
+	if len(be.Errors) != 3 || be.Errors[2].Code != 121 {
+		t.Errorf("every item must be reported and item 2 must carry code 121: %+v", be.Errors)
+	}
+	for i, u := range users {
+		if u.Version != 0 {
+			t.Errorf("item %d version must be restored, got %d", i, u.Version)
+		}
+	}
+	var fresh testUser
+	if err := FindByID(ctx, users[0].ID, &fresh); err != nil || fresh.Age == 1 {
+		t.Errorf("nothing may have been committed: %+v %v", fresh, err)
+	}
+}

@@ -399,6 +399,7 @@ type replaceResult struct {
 	code              int   // server error code, if any
 	wc                error // write concern error, if any
 	unknown           bool  // the server may have applied the write
+	server            bool  // the server produced the error, so inside a transaction it has aborted it
 }
 
 // ErrNotAttempted marks items SaveMany or CreateMany did not send: the
@@ -475,12 +476,15 @@ func saveManyReplace(ctx context.Context, coll *mongo.Collection, schema *Schema
 		// state would let later writes in the transaction commit on their own.
 		for i := range items {
 			replace(i)
-			if results[i].err != nil && isServerError(results[i].err) {
+			if results[i].err != nil && results[i].server {
 				out.aborted = true
 				for j := i + 1; j < n; j++ {
 					results[j] = replaceResult{err: fmt.Errorf("%w: transaction aborted by item %d", ErrNotAttempted, i)}
 				}
 				for j := 0; j < i; j++ {
+					if results[j].err != nil {
+						continue // keep the item's own failure
+					}
 					results[j] = replaceResult{err: fmt.Errorf("goodm: not saved: transaction aborted by item %d: %v", i, results[i].err)}
 				}
 				break
@@ -540,9 +544,22 @@ func saveManyReplace(ctx context.Context, coll *mongo.Collection, schema *Schema
 // no write error. Anything else (transport, context) means the server may or
 // may not have applied the write, so it is reported as outcome unknown.
 func classifyReplaceError(err error, schema *Schema) replaceResult {
-	var r replaceResult
+	// Decide from the driver's error, before translation, whether the server
+	// produced it. Inside a transaction a server error has aborted the
+	// transaction; a server-selection failure is wrapped the same way by the
+	// driver and is treated as aborting too, which errs toward reporting a
+	// conflict later rather than a lost write.
+	r := replaceResult{server: isServerError(err)}
 	var we mongo.WriteException
 	if !errors.As(err, &we) {
+		var ce mongo.CommandError
+		if errors.As(err, &ce) {
+			// A command error (write conflict, no such transaction) is known
+			// not to have applied.
+			r.err = fmt.Errorf("goodm: replace failed: %w", err)
+			r.code = int(ce.Code)
+			return r
+		}
 		r.err = fmt.Errorf("goodm: outcome unknown: %w", err)
 		r.unknown = true
 		return r

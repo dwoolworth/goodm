@@ -281,7 +281,8 @@ func translateBulkItem(we mongo.WriteError, schema *Schema) BulkWriteError {
 	if isDuplicateKeyCode(we.Code) {
 		item.Err = newDuplicateKeyError(we, schema, we.Message)
 	} else {
-		item.Err = fmt.Errorf("goodm: write error %d: %s", we.Code, we.Message)
+		// Wrap the driver error so its code and labels stay reachable.
+		item.Err = fmt.Errorf("goodm: write error: %w", we)
 	}
 	return item
 }
