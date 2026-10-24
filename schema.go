@@ -26,10 +26,13 @@ type FieldSchema struct {
 	Required  bool          // field must be non-zero
 	Unique    bool          // unique index on this field
 	Index     bool          // single-field index
+	IndexKind string        // index key kind: "" or "1" (ascending), "-1", "hashed", "text", "2dsphere"
+	Sparse    bool          // index skips documents missing the field
+	TTL       *int32        // expireAfterSeconds for a TTL index on this field
 	Default   string        // raw default value
 	Enum      []string      // allowed values
-	Min       *int          // minimum value/length
-	Max       *int          // maximum value/length
+	Min       *float64      // minimum value (numbers) or length (strings)
+	Max       *float64      // maximum value (numbers) or length (strings)
 	Ref       string        // referenced collection
 	Immutable bool          // cannot be changed after creation
 	SubFields []FieldSchema // inner fields for struct/[]struct subdocuments
@@ -47,11 +50,24 @@ func isLeafType(t reflect.Type) bool {
 // Schema is the parsed representation of a model struct.
 type Schema struct {
 	ModelName       string            // Go struct name
+	PkgPath         string            // import path of the package defining the struct
+	Type            reflect.Type      // the model's struct type
 	Collection      string            // MongoDB collection name
 	Fields          []FieldSchema     // parsed fields
 	CompoundIndexes []CompoundIndex   // compound indexes from Indexes() method
 	Hooks           []string          // hook interface names the model implements
 	CollOptions     CollectionOptions // per-schema read/write concern and read preference
+
+	idField []int // reflect field index path of the _id field, nil if none
+}
+
+// QualifiedName returns the package path and struct name, e.g.
+// "github.com/acme/app/models.User". It is unique across the registry.
+func (s *Schema) QualifiedName() string {
+	if s.PkgPath == "" {
+		return s.ModelName
+	}
+	return s.PkgPath + "." + s.ModelName
 }
 
 // HasField returns true if the schema contains a field with the given BSON name.

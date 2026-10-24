@@ -56,22 +56,39 @@ func TestGetModelID(t *testing.T) {
 	u := &testUser{}
 	u.ID = id
 
-	got, err := getModelID(u)
+	registerTestModels()
+	defer unregisterTestModels()
+	schema, _ := Get("testUser")
+
+	got, err := modelID(schema, u)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if got != id {
-		t.Fatalf("expected %s, got %s", id.Hex(), got.Hex())
+		t.Fatalf("expected %s, got %v", id.Hex(), got)
 	}
 }
 
-func TestSetModelID(t *testing.T) {
-	u := &testUser{}
-	id := bson.NewObjectID()
-	setModelID(u, id)
+func TestAssignObjectID(t *testing.T) {
+	registerTestModels()
+	defer unregisterTestModels()
+	schema, _ := Get("testUser")
 
+	u := &testUser{}
+	if err := assignObjectID(schema, u); err != nil {
+		t.Fatalf("assignObjectID: %v", err)
+	}
+	if u.ID.IsZero() {
+		t.Fatal("expected a generated ObjectID")
+	}
+
+	// An existing ID is kept.
+	id := u.ID
+	if err := assignObjectID(schema, u); err != nil {
+		t.Fatalf("assignObjectID: %v", err)
+	}
 	if u.ID != id {
-		t.Fatalf("expected %s, got %s", id.Hex(), u.ID.Hex())
+		t.Fatalf("expected %s to be preserved, got %s", id.Hex(), u.ID.Hex())
 	}
 }
 
@@ -228,44 +245,44 @@ func TestBuildReplacement_WithUnset(t *testing.T) {
 	}
 }
 
-func TestValidateUpdateFieldNames(t *testing.T) {
+func TestValidateUpdateFields(t *testing.T) {
 	registerTestModels()
 	defer unregisterTestModels()
 
 	schema, _ := Get("testUser")
 
 	// Valid field
-	if err := validateUpdateFieldNames(schema, bson.M{"age": 25}); err != nil {
+	if err := validateUpdateFields(schema, bson.M{"age": 25}); err != nil {
 		t.Fatalf("unexpected error for valid field: %v", err)
 	}
 
 	// Multiple valid fields
-	if err := validateUpdateFieldNames(schema, bson.M{"age": 25, "role": "admin"}); err != nil {
+	if err := validateUpdateFields(schema, bson.M{"age": 25, "role": "admin"}); err != nil {
 		t.Fatalf("unexpected error for multiple valid fields: %v", err)
 	}
 
 	// Unknown field
-	if err := validateUpdateFieldNames(schema, bson.M{"nonexistent": 1}); err == nil {
+	if err := validateUpdateFields(schema, bson.M{"nonexistent": 1}); err == nil {
 		t.Fatal("expected error for unknown field")
 	}
 
 	// Managed field _id
-	if err := validateUpdateFieldNames(schema, bson.M{"_id": "bad"}); err == nil {
+	if err := validateUpdateFields(schema, bson.M{"_id": "bad"}); err == nil {
 		t.Fatal("expected error for managed field _id")
 	}
 
 	// Managed field __v
-	if err := validateUpdateFieldNames(schema, bson.M{"__v": 99}); err == nil {
+	if err := validateUpdateFields(schema, bson.M{"__v": 99}); err == nil {
 		t.Fatal("expected error for managed field __v")
 	}
 
 	// Managed field updated_at
-	if err := validateUpdateFieldNames(schema, bson.M{"updated_at": "bad"}); err == nil {
+	if err := validateUpdateFields(schema, bson.M{"updated_at": "bad"}); err == nil {
 		t.Fatal("expected error for managed field updated_at")
 	}
 
 	// Empty map is fine
-	if err := validateUpdateFieldNames(schema, bson.M{}); err != nil {
+	if err := validateUpdateFields(schema, bson.M{}); err != nil {
 		t.Fatalf("unexpected error for empty map: %v", err)
 	}
 }

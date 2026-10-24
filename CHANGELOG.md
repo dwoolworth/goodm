@@ -2,6 +2,50 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.0] - 2026-10-24
+
+This release closes the main MongoDB feature gaps found in a review of 0.6.1 and fixes several correctness bugs. It contains breaking changes; see the end of this entry.
+
+### Added
+- **Index types and options.** Field tags: `index=-1`, `index=hashed`, `index=text`, `index=2dsphere`, `sparse`, and `ttl=<duration|seconds>`. `CompoundIndex` gained `Sparse`, `Name`, `ExpireAfterSeconds` (with the `TTL(time.Duration)` helper), `PartialFilter`, and `Collation`, and its `Fields` entries accept `-field`, `field:text`, `field:hashed`, and `field:2dsphere` markers. Index tags inside subdocuments now create dotted-path indexes. `Enforce` detects mismatches in sparseness, TTL, partial filter, and collation as well as keys and uniqueness.
+- `Schema.IndexDefinitions()` and the `IndexDefinition` type: the single resolved list of indexes a schema expects. `Enforce`, `Migrate`, and `goodm inspect` all work from it.
+- `Migrate` now plans an `ActionRebuildIndex` for indexes whose options differ from the schema and executes it through the same in-place unique conversion as `Enforce`. `MigrationAction.Definition` carries the expected index.
+- `ErrDuplicateKey` and `*DuplicateKeyError` (with `Collection`, `Index`, and `Fields`) for unique index violations from `Create`, `CreateMany`, `Update`, `UpdateFields`, `UpdateOne`, `UpdateMany`, `FindOneAndUpdate`, `SaveMany`, and `Bulk`.
+- Query layer: `FindByID` (accepts hex strings for ObjectID models), `Count`, `Exists`, `Distinct`, `FindOneAndUpdate`, `FindOneAndReplace`, and `FindOneAndDelete`. `FindOptions` gained `Projection`, `Hint`, `Collation`, and `BatchSize`. `UpdateOptions` gained `Upsert` (with the `Upsert()` shorthand), `ArrayFilters`, `Hint`, and `Collation` for the raw operations; `DeleteOptions` gained `Hint` and `Collation`.
+- `NewBulk`: a builder for heterogeneous `BulkWrite` batches (`InsertOne`, `UpdateOne`, `UpdateMany`, `ReplaceOne`, `DeleteOne`, `DeleteMany`, `Unordered`) with per-operation failure reporting.
+- `SaveMany`: the `Update` lifecycle for a slice of models in one round trip, with per-document version filters and per-index classification of conflicts (`ErrVersionConflict`), missing documents (`ErrNotFound`), and duplicate keys.
+- `*BulkError` with per-item `BulkWriteError` entries and a `Result`; returned by `CreateMany`, `SaveMany`, and `Bulk.Execute`. `errors.Is`/`errors.As` see every item's error.
+- `CreateOptions.Unordered` for `CreateMany`; `AfterCreate` now runs only for models that were actually inserted.
+- `BulkResult.UpsertedCount` and `UpsertedIDs`.
+- Pipeline: `PipelineOptions.AllowDiskUse`, `Collation`, `Hint`, `BatchSize`; stages `UnwindPreserve`, `LookupPipeline`, `Set`, `Unset`, `ReplaceRoot`, `Facet`, `Sample`. `Execute` and `Cursor` run middleware under the new `OpAggregate`.
+- Middleware may now modify `OpInfo.Filter` and the new `OpInfo.Pipeline`; the operation reads them after the chain runs. New op types `OpSaveMany`, `OpAggregate`, `OpBulkWrite`.
+- Registry: `SchemaOf(model)` resolves by type, `Unregister(model)`, `Schema.Type`, `Schema.PkgPath`, `Schema.QualifiedName()`.
+- Custom `_id` types: the ID field is found by its `bson:"_id"` tag (falling back to a field named `ID`) and may be any type. ObjectIDs are still generated automatically; other types must be set before `Create` or in `BeforeCreate`, and a zero value is rejected.
+- `TransactionOptions.Transaction` for driver-level transaction options.
+- `goodm discover` records index key directions and kinds, so generated `Indexes()` methods preserve descending and special keys.
+
+### Fixed
+- `min`/`max` were skipped for zero values, so `min=1` accepted `0`, and floats were truncated to integers before comparison, so `max=10` accepted `10.9` and `min=0` accepted `-0.5`. Bounds now apply to every present value and compare numerically; only a nil pointer is treated as absent.
+- Middleware could not change the filter: operations closed over their original argument. The soft-delete and tenant-scoping patterns in the docs now work.
+- Schemas were keyed by bare struct name, so a second `User` type in another package failed to register and an unregistered type with a registered name silently used the wrong collection. The registry is keyed by `reflect.Type`.
+- `UpdateFields` skipped validation of the values it set, allowed immutable fields to change, rejected dotted paths into subdocuments, and mutated the caller's map.
+- `Migrate` reconstructed index keys by parsing index names and compared by name only; it now shares index definitions and mismatch detection with `Enforce`.
+- `Populate` and `BatchPopulate` ignored the referenced model's collection options (read preference and concerns).
+- A nested `WithTransaction` started a second session; it now joins the transaction already in the context.
+- The hooks documentation listed the immutable check after `BeforeSave`; it runs before.
+- The `FindOne` family compares driver errors with `errors.Is` instead of `==`.
+
+### Changed
+- **Breaking:** `GetAll()` returns `[]*Schema` sorted by collection and qualified name instead of `map[string]*Schema`; `PlanMigration` takes `[]*Schema`.
+- **Breaking:** `Get(name)` returns `false` when more than one registered type has that name. Use `SchemaOf`.
+- **Breaking:** `FieldSchema.Min` and `Max` are `*float64`.
+- **Breaking:** `CreateMany` returns a `*BulkError` for write failures instead of a wrapped driver error, and unique violations everywhere are `*DuplicateKeyError` (the driver error remains reachable through `errors.As`).
+- **Breaking:** `Pipeline.Execute` and `Pipeline.Cursor` now run middleware.
+- **Breaking:** validation of `min`/`max` no longer skips zero values (see Fixed). Optional bounded fields should be pointers.
+- **Breaking:** `UpdateFields` now returns `ValidationErrors` for values that violate the schema or target immutable fields.
+- `IndexSpec` gained `ExpireAfterSeconds`, `PartialFilter`, and `Collation`; text indexes report their keys as `field: "text"`.
+- Minimum Go version is 1.21.
+
 ## [0.6.1] - 2026-09-25
 
 ### Fixed

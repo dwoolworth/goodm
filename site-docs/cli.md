@@ -87,25 +87,25 @@ goodm migrate --db myapp --drop-extras
 **What it does:**
 
 1. Reads all registered model schemas
-2. Compares expected indexes vs actual indexes in the database
+2. Compares expected indexes against the database by name and by options (keys, uniqueness, sparseness, TTL, partial filter, collation)
 3. Shows a migration plan:
    - `+` indexes to create
+   - `~` indexes to rebuild because their options differ from the schema
    - `-` indexes to drop (if `--drop-extras`)
    - Warning for field drift (fields in DB not in schema)
-4. Executes the plan (unless `--dry-run`)
+4. Executes the plan (unless `--dry-run`). Rebuilds use the same path as `Enforce` with `IndexMismatchRebuild`, so a non-unique index that must become unique is converted in place on MongoDB 6.0+.
 
 **Example output:**
 
 ```
 Collection: users
   + email_1 (unique)
-  + role_1
+  + tenant_1_created_at_-1
+  ~ Rebuild index: expires_at_1 (expires after 60s (schema requires 86400s))
   - old_field_1 (drop)
   ⚠ field "legacy_data" exists in DB but not in schema
 
-Summary: 2 to create, 1 to drop, 1 warning
-Executing migration...
-Done: 2 created, 1 dropped, 0 errors
+Summary: 2 to create, 1 to rebuild, 1 to drop, 1 warning
 ```
 
 ### goodm inspect

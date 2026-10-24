@@ -6,12 +6,12 @@ import (
 )
 
 type testDefaults struct {
-	Model   `bson:",inline"`
-	Name    string  `bson:"name"    goodm:"default=anonymous"`
-	Age     int     `bson:"age"     goodm:"default=18"`
-	Score   float64 `bson:"score"   goodm:"default=9.5"`
-	Active  bool    `bson:"active"  goodm:"default=true"`
-	NoDefault string `bson:"no_default"`
+	Model     `bson:",inline"`
+	Name      string  `bson:"name"    goodm:"default=anonymous"`
+	Age       int     `bson:"age"     goodm:"default=18"`
+	Score     float64 `bson:"score"   goodm:"default=9.5"`
+	Active    bool    `bson:"active"  goodm:"default=true"`
+	NoDefault string  `bson:"no_default"`
 }
 
 func TestApplyDefaults_String(t *testing.T) {
@@ -184,7 +184,7 @@ func TestApplyDefaults_SubdocumentSlice(t *testing.T) {
 
 	c := &Container{
 		Items: []Item{
-			{Name: "A"},           // Status empty — should get default
+			{Name: "A"},                 // Status empty — should get default
 			{Name: "B", Status: "done"}, // Status set — should not overwrite
 		},
 	}

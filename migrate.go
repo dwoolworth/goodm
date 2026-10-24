@@ -3,11 +3,8 @@ package goodm
 import (
 	"context"
 	"fmt"
-	"strings"
 
-	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 // MigrateOptions controls migration behavior.
@@ -20,9 +17,10 @@ type MigrateOptions struct {
 type ActionType int
 
 const (
-	ActionCreateIndex ActionType = iota
-	ActionDropIndex
-	ActionFieldDrift // field in DB not in schema
+	ActionCreateIndex  ActionType = iota
+	ActionDropIndex               // index exists in the database but not in any schema
+	ActionFieldDrift              // field in DB not in schema
+	ActionRebuildIndex            // index exists under the schema's name but its options differ
 )
 
 // MigrationAction describes a single change to apply.
@@ -31,6 +29,9 @@ type MigrationAction struct {
 	Collection  string
 	Description string
 	IndexName   string
+
+	// Definition is the index the schema expects, for create and rebuild actions.
+	Definition *IndexDefinition
 }
 
 // MigrationPlan holds all planned actions.
@@ -46,39 +47,48 @@ type MigrationResult struct {
 	Errors   []error
 }
 
-// PlanMigration compares registered schemas against the live database and builds a migration plan.
-func PlanMigration(ctx context.Context, db *mongo.Database, schemas map[string]*Schema) (MigrationPlan, error) {
+// PlanMigration compares schemas against the live database and builds a
+// migration plan. Indexes are compared by name and by options, so an index
+// that exists but no longer matches its schema (different keys, uniqueness,
+// sparseness, TTL, partial filter, or collation) is planned as a rebuild.
+func PlanMigration(ctx context.Context, db *mongo.Database, schemas []*Schema) (MigrationPlan, error) {
 	var plan MigrationPlan
 
 	for _, schema := range schemas {
 		coll := db.Collection(schema.Collection)
 
-		// Build expected index set
-		expected := buildExpectedIndexes(schema)
-
-		// Read actual indexes
 		existing, err := ListExistingIndexes(ctx, coll)
 		if err != nil {
 			return plan, fmt.Errorf("migration: failed to list indexes on %s: %w", schema.Collection, err)
 		}
-
-		// Filter out _id_ system index
 		delete(existing, "_id_")
-		delete(expected, "_id_")
 
-		// expected - actual = indexes to create
-		for name := range expected {
-			if _, ok := existing[name]; !ok {
+		expected := make(map[string]bool)
+		for _, def := range schema.IndexDefinitions() {
+			def := def
+			expected[def.Name] = true
+			spec, ok := existing[def.Name]
+			if !ok {
 				plan.Actions = append(plan.Actions, MigrationAction{
 					Type:        ActionCreateIndex,
 					Collection:  schema.Collection,
-					Description: fmt.Sprintf("Create index: %s", name),
-					IndexName:   name,
+					Description: fmt.Sprintf("Create index: %s%s", def.Name, describeIndexOptions(def)),
+					IndexName:   def.Name,
+					Definition:  &def,
+				})
+				continue
+			}
+			if mismatch := describeIndexMismatch(spec, def); mismatch != "" {
+				plan.Actions = append(plan.Actions, MigrationAction{
+					Type:        ActionRebuildIndex,
+					Collection:  schema.Collection,
+					Description: fmt.Sprintf("Rebuild index: %s (%s)", def.Name, mismatch),
+					IndexName:   def.Name,
+					Definition:  &def,
 				})
 			}
 		}
 
-		// actual - expected = indexes to drop
 		for name := range existing {
 			if !expected[name] {
 				plan.Actions = append(plan.Actions, MigrationAction{
@@ -90,7 +100,6 @@ func PlanMigration(ctx context.Context, db *mongo.Database, schemas map[string]*
 			}
 		}
 
-		// Detect field drift
 		drifts := DetectDrift(ctx, db, schema, DefaultDriftSampleSize)
 		for _, d := range drifts {
 			plan.Actions = append(plan.Actions, MigrationAction{
@@ -104,17 +113,70 @@ func PlanMigration(ctx context.Context, db *mongo.Database, schemas map[string]*
 	return plan, nil
 }
 
-// ExecuteMigration applies the planned actions to the database.
+// describeIndexOptions renders the notable options of a definition for plan output.
+func describeIndexOptions(def IndexDefinition) string {
+	var parts []string
+	if def.Unique {
+		parts = append(parts, "unique")
+	}
+	if def.Sparse {
+		parts = append(parts, "sparse")
+	}
+	if def.ExpireAfterSeconds != nil {
+		parts = append(parts, fmt.Sprintf("ttl %ds", *def.ExpireAfterSeconds))
+	}
+	if def.PartialFilter != nil {
+		parts = append(parts, "partial")
+	}
+	if def.Collation != nil {
+		parts = append(parts, "collation "+def.Collation.Locale)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	out := " ("
+	for i, p := range parts {
+		if i > 0 {
+			out += ", "
+		}
+		out += p
+	}
+	return out + ")"
+}
+
+// ExecuteMigration applies the planned actions to the database. Rebuilds use
+// the same path as Enforce with IndexMismatchRebuild, so a non-unique index
+// that must become unique is converted in place where the server supports it.
 func ExecuteMigration(ctx context.Context, db *mongo.Database, plan MigrationPlan, opts MigrateOptions) (MigrationResult, error) {
 	var result MigrationResult
+	probe := &prepareUniqueProbe{db: db}
 
 	for _, action := range plan.Actions {
 		coll := db.Collection(action.Collection)
 
 		switch action.Type {
 		case ActionCreateIndex:
-			model := buildIndexModel(action.IndexName)
-			if _, err := coll.Indexes().CreateOne(ctx, model); err != nil {
+			if action.Definition == nil {
+				result.Errors = append(result.Errors, fmt.Errorf("%s: no index definition", action.Description))
+				continue
+			}
+			if err := createIndex(ctx, coll, action.Collection, *action.Definition); err != nil {
+				result.Errors = append(result.Errors, fmt.Errorf("%s: %w", action.Description, err))
+			} else {
+				result.Executed++
+			}
+
+		case ActionRebuildIndex:
+			if action.Definition == nil {
+				result.Errors = append(result.Errors, fmt.Errorf("%s: no index definition", action.Description))
+				continue
+			}
+			existing, err := ListExistingIndexes(ctx, coll)
+			if err != nil {
+				result.Errors = append(result.Errors, fmt.Errorf("%s: %w", action.Description, err))
+				continue
+			}
+			if err := enforceIndex(ctx, coll, action.Collection, existing, *action.Definition, IndexMismatchRebuild, probe); err != nil {
 				result.Errors = append(result.Errors, fmt.Errorf("%s: %w", action.Description, err))
 			} else {
 				result.Executed++
@@ -140,11 +202,10 @@ func ExecuteMigration(ctx context.Context, db *mongo.Database, plan MigrationPla
 	return result, nil
 }
 
-// Migrate is a convenience function that plans and executes a migration.
+// Migrate is a convenience function that plans and executes a migration for
+// all registered schemas.
 func Migrate(ctx context.Context, db *mongo.Database, opts MigrateOptions) (MigrationResult, error) {
-	schemas := GetAll()
-
-	plan, err := PlanMigration(ctx, db, schemas)
+	plan, err := PlanMigration(ctx, db, GetAll())
 	if err != nil {
 		return MigrationResult{}, err
 	}
@@ -157,80 +218,4 @@ func Migrate(ctx context.Context, db *mongo.Database, opts MigrateOptions) (Migr
 	}
 
 	return ExecuteMigration(ctx, db, plan, opts)
-}
-
-// buildExpectedIndexes constructs the set of index names a schema expects to exist.
-func buildExpectedIndexes(schema *Schema) map[string]bool {
-	expected := make(map[string]bool)
-
-	// Single-field indexes from tags
-	for _, field := range schema.Fields {
-		if field.Unique || field.Index {
-			expected[field.BSONName+"_1"] = true
-		}
-	}
-
-	// Compound indexes
-	for _, ci := range schema.CompoundIndexes {
-		name := compoundIndexName(ci)
-		expected[name] = true
-	}
-
-	return expected
-}
-
-// buildIndexModel reconstructs a mongo.IndexModel from an index name like "field_1" or "a_1_b_1".
-func buildIndexModel(indexName string) mongo.IndexModel {
-	parts := strings.Split(indexName, "_")
-	keys := bson.D{}
-
-	// Parse pairs: field name, direction. Names can contain underscores,
-	// so we look for "1" or "-1" as direction markers.
-	i := 0
-	for i < len(parts) {
-		// Collect field name parts until we hit a direction
-		var nameParts []string
-		for i < len(parts) {
-			if parts[i] == "1" || parts[i] == "-1" {
-				break
-			}
-			nameParts = append(nameParts, parts[i])
-			i++
-		}
-		fieldName := strings.Join(nameParts, "_")
-		direction := 1
-		if i < len(parts) {
-			if parts[i] == "-1" {
-				direction = -1
-			}
-			i++ // consume direction
-		}
-		if fieldName != "" {
-			keys = append(keys, bson.E{Key: fieldName, Value: direction})
-		}
-	}
-
-	model := mongo.IndexModel{Keys: keys}
-
-	// Check if the original index name suggests uniqueness
-	// (we can't determine this from the name alone, so we check the schema)
-	// The caller may need to set unique separately if needed.
-	// For now, check if this looks like a unique field from the registry.
-	schemas := GetAll()
-	for _, schema := range schemas {
-		for _, field := range schema.Fields {
-			if field.Unique && indexName == field.BSONName+"_1" {
-				model.Options = options.Index().SetUnique(true)
-				return model
-			}
-		}
-		for _, ci := range schema.CompoundIndexes {
-			if ci.Unique && compoundIndexName(ci) == indexName {
-				model.Options = options.Index().SetUnique(true)
-				return model
-			}
-		}
-	}
-
-	return model
 }

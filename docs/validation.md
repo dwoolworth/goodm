@@ -22,11 +22,12 @@ Status string `bson:"status" goodm:"enum=draft|published|archived"`
 
 ### Min / Max
 
-Numeric fields tagged `min=N` or `max=N` are bounded. Only validated when non-zero.
+Fields tagged `min=N` or `max=N` are bounded: numbers (ints and floats) by value, strings, slices, and maps by length. Bounds may be fractional. The zero value is checked like any other, so `min=1` rejects `0` and `min=0` rejects `-0.5`; only a nil pointer counts as absent.
 
 ```go
-Age   int `bson:"age"   goodm:"min=13,max=120"`
-Price int `bson:"price" goodm:"min=0"`
+Age    int     `bson:"age"    goodm:"min=13,max=120"`
+Price  float64 `bson:"price"  goodm:"min=0"`
+Rating *int    `bson:"rating" goodm:"min=1,max=5"` // optional: nil is skipped
 ```
 
 ### Immutable
@@ -95,15 +96,19 @@ Nil pointer subdocuments are skipped during inner validation (the field-level `r
 | `Create` | Yes | No (no prior state) |
 | `CreateMany` | Yes (per model) | No |
 | `Update` | Yes | Yes (fetches existing doc) |
+| `SaveMany` | Yes (per model) | Yes (one fetch for the batch) |
+| `UpdateFields` | Yes (the values being set) | Yes (immutable fields are rejected) |
+| `FindOneAndUpdate` | No | No |
 | `UpdateOne` | No | No |
 | `UpdateMany` | No | No |
+| `Bulk` | No | No |
 
 ## Manual Validation
 
 You can validate a model without performing a database operation:
 
 ```go
-schema, _ := goodm.Get("User")
+schema, _ := goodm.SchemaOf(&User{})
 errs := goodm.Validate(user, schema)
 if len(errs) > 0 {
     // handle validation errors

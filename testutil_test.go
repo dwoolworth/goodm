@@ -167,13 +167,11 @@ func registerTestModels() {
 }
 
 func unregisterTestModels() {
-	registryMu.Lock()
-	delete(registry, "testUser")
-	delete(registry, "testProfile")
-	delete(registry, "testTag")
-	delete(registry, "testPost")
-	delete(registry, "testHookUser")
-	delete(registry, "testConfiguredModel")
-	delete(registry, "testOrder")
-	registryMu.Unlock()
+	Unregister(&testUser{})
+	Unregister(&testProfile{})
+	Unregister(&testTag{})
+	Unregister(&testPost{})
+	Unregister(&testHookUser{})
+	Unregister(&testConfiguredModel{})
+	Unregister(&testOrder{})
 }

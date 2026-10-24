@@ -53,7 +53,7 @@ func printSchema(schema *goodm.Schema) {
 
 	for i, field := range schema.Fields {
 		connector := "├──"
-		if i == len(schema.Fields)-1 && len(schema.CompoundIndexes) == 0 {
+		if i == len(schema.Fields)-1 && len(schema.IndexDefinitions()) == 0 {
 			connector = "└──"
 		}
 
@@ -89,26 +89,41 @@ func printSchema(schema *goodm.Schema) {
 }
 
 func printIndexes(schema *goodm.Schema) {
-	if len(schema.CompoundIndexes) == 0 && !hasIndexedFields(schema) {
+	defs := schema.IndexDefinitions()
+	if len(defs) == 0 {
 		return
 	}
 	fmt.Println()
 	fmt.Println("  Indexes:")
-	for _, field := range schema.Fields {
-		if field.Unique {
-			fmt.Printf("    ✓ %s_1 (unique)\n", field.BSONName)
-		} else if field.Index {
-			fmt.Printf("    ✓ %s_1\n", field.BSONName)
-		}
+	for _, def := range defs {
+		fmt.Printf("    ✓ %s%s\n", def.Name, describeIndex(def))
 	}
-	for _, ci := range schema.CompoundIndexes {
-		name := compoundName(ci)
-		label := "(compound)"
-		if ci.Unique {
-			label = "(compound, unique)"
-		}
-		fmt.Printf("    ✓ %s %s\n", name, label)
+}
+
+func describeIndex(def goodm.IndexDefinition) string {
+	var parts []string
+	if len(def.Keys) > 1 {
+		parts = append(parts, "compound")
 	}
+	if def.Unique {
+		parts = append(parts, "unique")
+	}
+	if def.Sparse {
+		parts = append(parts, "sparse")
+	}
+	if def.ExpireAfterSeconds != nil {
+		parts = append(parts, fmt.Sprintf("ttl %ds", *def.ExpireAfterSeconds))
+	}
+	if def.PartialFilter != nil {
+		parts = append(parts, "partial")
+	}
+	if def.Collation != nil {
+		parts = append(parts, "collation "+def.Collation.Locale)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " (" + strings.Join(parts, ", ") + ")"
 }
 
 func formatFieldAttrs(f goodm.FieldSchema) string {
@@ -131,30 +146,19 @@ func formatFieldAttrs(f goodm.FieldSchema) string {
 	if f.Default != "" {
 		parts = append(parts, fmt.Sprintf("default: %s", f.Default))
 	}
+	if f.Sparse {
+		parts = append(parts, "sparse")
+	}
+	if f.TTL != nil {
+		parts = append(parts, fmt.Sprintf("ttl: %ds", *f.TTL))
+	}
 	if f.Min != nil {
-		parts = append(parts, fmt.Sprintf("min: %d", *f.Min))
+		parts = append(parts, fmt.Sprintf("min: %g", *f.Min))
 	}
 	if f.Max != nil {
-		parts = append(parts, fmt.Sprintf("max: %d", *f.Max))
+		parts = append(parts, fmt.Sprintf("max: %g", *f.Max))
 	}
 	return strings.Join(parts, ", ")
-}
-
-func hasIndexedFields(schema *goodm.Schema) bool {
-	for _, f := range schema.Fields {
-		if f.Unique || f.Index {
-			return true
-		}
-	}
-	return false
-}
-
-func compoundName(ci goodm.CompoundIndex) string {
-	parts := make([]string, 0, len(ci.Fields)*2)
-	for _, f := range ci.Fields {
-		parts = append(parts, f, "1")
-	}
-	return strings.Join(parts, "_")
 }
 
 type refInfo struct {

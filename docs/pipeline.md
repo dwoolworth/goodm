@@ -8,11 +8,19 @@ goodm provides a fluent builder for MongoDB aggregation pipelines. Chain stages 
 pipe := goodm.NewPipeline(&User{})
 ```
 
-The model parameter determines the collection. Pass options to override the database:
+The model parameter determines the collection. Options override the database and pass aggregation settings through:
 
 ```go
-pipe := goodm.NewPipeline(&User{}, goodm.PipelineOptions{DB: otherDB})
+pipe := goodm.NewPipeline(&User{}, goodm.PipelineOptions{
+    DB:           otherDB,
+    AllowDiskUse: true,      // let big $group/$sort stages spill to disk
+    Collation:    &options.Collation{Locale: "en", Strength: 2},
+    Hint:         "role_1",
+    BatchSize:    500,
+})
 ```
+
+`Execute` and `Cursor` run [middleware](middleware.md) under `OpAggregate`; middleware may prepend or replace stages via `op.Pipeline`.
 
 ## Stages
 
@@ -71,6 +79,9 @@ Deconstruct an array field (auto-prefixed with `$`):
 ```go
 pipe.Unwind("tags")
 // Produces: {$unwind: "$tags"}
+
+pipe.UnwindPreserve("tags")
+// Produces: {$unwind: {path: "$tags", preserveNullAndEmptyArrays: true}}
 ```
 
 ### Lookup
@@ -81,6 +92,33 @@ Left outer join:
 pipe.Lookup("orders", "user_id", "_id", "user_orders")
 // Joins the "orders" collection where orders.user_id == users._id
 // Results stored in "user_orders" array
+```
+
+With a sub-pipeline and `let` variables for conditions beyond field equality:
+
+```go
+pipe.LookupPipeline("orders",
+    bson.D{{Key: "uid", Value: "$_id"}},
+    []bson.D{
+        {{Key: "$match", Value: bson.D{{Key: "$expr", Value: bson.D{{Key: "$and", Value: bson.A{
+            bson.D{{Key: "$eq", Value: bson.A{"$user_id", "$$uid"}}},
+            bson.D{{Key: "$gt", Value: bson.A{"$total", 100}}},
+        }}}}}}},
+    },
+    "big_orders")
+```
+
+### Set / Unset / ReplaceRoot / Facet / Sample
+
+```go
+pipe.Set(bson.D{{Key: "year", Value: bson.D{{Key: "$year", Value: "$created_at"}}}})
+pipe.Unset("password", "internal")
+pipe.ReplaceRoot("$profile")
+pipe.Facet(map[string][]bson.D{
+    "byRole": {{{Key: "$sortByCount", Value: "$role"}}},
+    "total":  {{{Key: "$count", Value: "n"}}},
+})
+pipe.Sample(10)
 ```
 
 ### AddFields

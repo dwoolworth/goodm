@@ -4,7 +4,7 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/dwoolworth/goodm.svg)](https://pkg.go.dev/github.com/dwoolworth/goodm)
 [![Go Report Card](https://goreportcard.com/badge/github.com/dwoolworth/goodm)](https://goreportcard.com/report/github.com/dwoolworth/goodm)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Go Version](https://img.shields.io/badge/Go-1.19+-00ADD8?logo=go&logoColor=white)](https://go.dev/)
+[![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8?logo=go&logoColor=white)](https://go.dev/)
 [![MongoDB](https://img.shields.io/badge/MongoDB-4.0+-47A248?logo=mongodb&logoColor=white)](https://www.mongodb.com/)
 
 **[Documentation](https://goodm.io)** | **[API Reference](https://pkg.go.dev/github.com/dwoolworth/goodm)**
@@ -50,6 +50,8 @@ goodm fills that gap. Your Go struct *is* the schema. Tags declare constraints, 
 | Validation (required, enum, min/max) | Yes | No | No | No |
 | Immutable fields | Yes | No | No | No |
 | Optimistic concurrency (versioning) | Yes | No | No | No |
+| Lifecycle-aware bulk save (`SaveMany`) | Yes | No | No | No |
+| Index options (TTL, sparse, partial, collation, text) | Yes | Manual | Partial | No |
 | Population (ref resolution) | Yes | No | No | No |
 | Aggregation builder | Fluent API | Manual | No | No |
 | Middleware (global + per-model) | Yes | No | No | No |
@@ -122,15 +124,17 @@ func main() {
 
 | Feature | Description |
 |---------|-------------|
-| **Schema Tags** | `unique`, `index`, `required`, `immutable`, `default`, `enum`, `min`, `max`, `ref` |
-| **CRUD** | `Create`, `FindOne`, `Find`, `FindCursor`, `Update`, `Delete` with full lifecycle |
-| **Raw Operations** | `UpdateOne`, `DeleteOne`, `UpdateMany`, `DeleteMany` for direct MongoDB access |
+| **Schema Tags** | `unique`, `index[=kind]`, `sparse`, `ttl`, `required`, `immutable`, `default`, `enum`, `min`, `max`, `ref` |
+| **Indexes** | Compound, descending, hashed, text, 2dsphere, TTL, sparse, partial, collation; synced by `Enforce` and `migrate` |
+| **CRUD** | `Create`, `FindOne`, `FindByID`, `Find`, `FindCursor`, `Count`, `Exists`, `Distinct`, `Update`, `UpdateFields`, `Delete` |
+| **Atomic** | `FindOneAndUpdate`, `FindOneAndReplace`, `FindOneAndDelete` with upsert |
+| **Raw Operations** | `UpdateOne`, `DeleteOne`, `UpdateMany`, `DeleteMany`, `NewBulk` for direct MongoDB access |
 | **Hooks** | `BeforeCreate`, `AfterCreate`, `BeforeSave`, `AfterSave`, `BeforeDelete`, `AfterDelete` |
 | **Validation** | Automatic on Create/Update: required, enum, min/max, immutable enforcement |
-| **Middleware** | Global and per-model middleware chains wrapping all operations |
+| **Middleware** | Global and per-model chains wrapping all operations; may rewrite filters and pipelines |
 | **Population** | Resolve `ref=` fields by fetching referenced documents |
 | **Aggregation** | Fluent pipeline builder with `Match`, `Group`, `Sort`, `Lookup`, and more |
-| **Bulk** | `CreateMany` with hooks/validation, `UpdateMany`/`DeleteMany` passthrough |
+| **Bulk** | `CreateMany` and `SaveMany` with hooks/validation, `NewBulk` builder, `UpdateMany`/`DeleteMany` passthrough |
 | **Transactions** | `WithTransaction` wraps operations in a MongoDB session transaction |
 | **CLI** | `goodm discover` (introspect DB), `goodm migrate` (sync indexes), `goodm inspect` (view schemas) |
 
@@ -168,15 +172,18 @@ type Product struct {
 
 | Tag | Effect |
 |-----|--------|
-| `unique` | Creates a unique index |
-| `index` | Creates a non-unique index |
+| `unique` | Creates a unique index; violations return `ErrDuplicateKey` |
+| `index` / `index=-1`, `hashed`, `text`, `2dsphere` | Creates an index of the given kind |
+| `sparse` | Index skips documents missing the field |
+| `ttl=24h` | TTL index expiring documents after the duration |
 | `required` | Field must be non-zero on Create/Update |
 | `immutable` | Field cannot change after creation |
-| `default=X` | Default value annotation |
+| `default=X` | Default value applied on Create |
 | `enum=a\|b\|c` | Value must be one of the listed options |
-| `min=N` | Minimum numeric value |
-| `max=N` | Maximum numeric value |
+| `min=N` / `max=N` | Numeric bounds, or length bounds for strings and slices |
 | `ref=collection` | References a document in another collection |
+
+Compound indexes and index options (partial filters, collation, custom names) come from an `Indexes()` method; see [Models & Tags](docs/models.md).
 
 ## Middleware
 
@@ -211,6 +218,22 @@ goodm.NewPipeline(&User{}).
     Execute(ctx, &results)
 ```
 
+## Bulk Writes
+
+```go
+// Save many loaded models in one round trip, each with its own version check
+err := goodm.SaveMany(ctx, tasks)
+
+// Mixed raw writes in one BulkWrite
+res, err := goodm.NewBulk(&User{}).
+    InsertOne(&User{Email: "carol@example.com", Name: "Carol"}).
+    UpdateOne(bson.D{{Key: "email", Value: "dave@example.com"}},
+        bson.M{"$set": bson.M{"name": "Dave"}}, goodm.Upsert()).
+    DeleteMany(bson.D{{Key: "role", Value: "guest"}}).
+    Unordered().
+    Execute(ctx)
+```
+
 ## Transactions
 
 ```go
@@ -226,8 +249,8 @@ Requires a MongoDB replica set. All goodm operations inside the callback partici
 
 ## Requirements
 
-- Go 1.19+
-- MongoDB 4.0+ (6.0+ recommended)
+- Go 1.21+
+- MongoDB 4.0+ (6.0+ recommended; tested against 6.0, 7.0, and 8.0)
 - Replica set required for transactions
 
 ## Contributing

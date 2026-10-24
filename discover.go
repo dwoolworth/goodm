@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -29,7 +30,7 @@ type DiscoveredField struct {
 // DiscoveredIndex describes an index found on a collection.
 type DiscoveredIndex struct {
 	Name   string
-	Keys   []string // field names in order
+	Keys   []string // field names in order, in CompoundIndex syntax ("-field" for descending, "field:text" etc.)
 	Unique bool
 }
 
@@ -100,7 +101,7 @@ func discoverCollection(ctx context.Context, coll *mongo.Collection, opts Discov
 	// Merge index info into fields
 	for i := range dc.Fields {
 		for _, idx := range dc.Indexes {
-			if len(idx.Keys) == 1 && idx.Keys[0] == dc.Fields[i].BSONName {
+			if len(idx.Keys) == 1 && strings.TrimPrefix(idx.Keys[0], "-") == dc.Fields[i].BSONName {
 				if idx.Unique {
 					dc.Fields[i].IsUnique = true
 				} else {
@@ -188,7 +189,7 @@ func detectIndexes(ctx context.Context, coll *mongo.Collection) ([]DiscoveredInd
 		var keys []string
 		if keyDoc, ok := raw["key"].(bson.D); ok {
 			for _, k := range keyDoc {
-				keys = append(keys, k.Key)
+				keys = append(keys, discoveredKey(k))
 			}
 		}
 
@@ -205,6 +206,27 @@ func detectIndexes(ctx context.Context, coll *mongo.Collection) ([]DiscoveredInd
 	}
 
 	return indexes, nil
+}
+
+// discoveredKey renders an index key in the syntax CompoundIndex.Fields uses.
+func discoveredKey(k bson.E) string {
+	switch v := k.Value.(type) {
+	case string:
+		return k.Key + ":" + v
+	case int32:
+		if v < 0 {
+			return "-" + k.Key
+		}
+	case int64:
+		if v < 0 {
+			return "-" + k.Key
+		}
+	case float64:
+		if v < 0 {
+			return "-" + k.Key
+		}
+	}
+	return k.Key
 }
 
 // inferGoType maps a BSON runtime value to a Go type string.

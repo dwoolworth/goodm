@@ -244,21 +244,23 @@ func TestValidate_SubdocumentSliceMin(t *testing.T) {
 			City:   "NYC",
 		},
 		Items: []testOrderItem{
-			{Name: "Widget", Quantity: 0}, // zero skipped for min check (IsZero)
+			{Name: "Widget", Quantity: 0}, // zero is NOT skipped: min=1 rejects 0
 			{Name: "Gadget", Quantity: -1},
 		},
 	}
 	errs := Validate(order, schema)
 
-	found := false
-	for _, e := range errs {
-		if e.Field == "items[1].quantity" {
-			found = true
-			break
+	for _, want := range []string{"items[0].quantity", "items[1].quantity"} {
+		found := false
+		for _, e := range errs {
+			if e.Field == want {
+				found = true
+				break
+			}
 		}
-	}
-	if !found {
-		t.Fatalf("expected validation error on 'items[1].quantity', got %v", errs)
+		if !found {
+			t.Fatalf("expected validation error on %q, got %v", want, errs)
+		}
 	}
 }
 
@@ -377,6 +379,6 @@ func TestValidate_DeeplyNested(t *testing.T) {
 	}
 }
 
-func intPtr(n int) *int {
+func intPtr(n float64) *float64 {
 	return &n
 }

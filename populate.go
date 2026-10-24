@@ -66,7 +66,7 @@ func Populate(ctx context.Context, model interface{}, refs Refs, opts ...Populat
 			return fmt.Errorf("goodm: field %q not found in model struct", field.Name)
 		}
 
-		coll := db.Collection(field.Ref)
+		coll := collectionByName(db, field.Ref)
 
 		// Array ref: []bson.ObjectID → fetch all via $in
 		if refIDs, ok := fv.Interface().([]bson.ObjectID); ok {
@@ -88,6 +88,16 @@ func Populate(ctx context.Context, model interface{}, refs Refs, opts ...Populat
 	}
 
 	return nil
+}
+
+// collectionByName opens a collection by name, applying the collection options
+// of the model registered for it (if any) so populated reads honor the
+// referenced model's read preference and concern.
+func collectionByName(db *mongo.Database, name string) *mongo.Collection {
+	if schema, ok := schemaForCollection(name); ok {
+		return getCollection(db, schema)
+	}
+	return db.Collection(name)
 }
 
 // populateArrayRef fetches all documents whose IDs are in refIDs using a single $in query.
@@ -202,7 +212,7 @@ func BatchPopulate(ctx context.Context, models interface{}, field string, result
 		return err
 	}
 
-	coll := db.Collection(fs.Ref)
+	coll := collectionByName(db, fs.Ref)
 	cursor, err := coll.Find(ctx, bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}})
 	if err != nil {
 		return fmt.Errorf("goodm: batch populate %q failed: %w", field, err)
