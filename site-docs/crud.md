@@ -156,6 +156,10 @@ err := goodm.Update(ctx, user)
 
 If an immutable field has changed, Update returns a `ValidationErrors` with the offending field.
 
+## Update with WithRetry
+
+`goodm.Update(ctx, m, goodm.WithRetry(n))` retries a version conflict with a 3-way field-level merge: the document is re-read, and the fields you changed are applied on top of it as long as the other writer did not change the same fields (otherwise a `*MergeConflictError` names them). "The fields you changed" are those that differ from the document as it was last loaded or saved through goodm, which `goodm.Model` remembers from `FindOne`, `FindByID`, `Find`, `FindOneAndUpdate`, `FindOneAndReplace`, `Create`, `Update`, `UpdateFields`, and `SaveMany`. A model built by hand, loaded through `FindCursor`, or without an embedded `goodm.Model` has no base, and a conflict returns `ErrVersionConflict` without merging.
+
 ## UpdateFields
 
 ```go

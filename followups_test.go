@@ -1597,3 +1597,172 @@ func TestDiscover_DatesAreTimeTime(t *testing.T) {
 		}
 	}
 }
+
+// --- 0.7.1: WithRetry merge base ---
+
+func TestWithRetry_MergesDisjointChangesFromLoadedBase(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	seed := seedUsers(t, ctx, 1)[0]
+
+	var mine testUser
+	if err := FindByID(ctx, seed.ID, &mine); err != nil {
+		t.Fatal(err)
+	}
+	// Another writer changes a different field.
+	var theirs testUser
+	if err := FindByID(ctx, seed.ID, &theirs); err != nil {
+		t.Fatal(err)
+	}
+	theirs.Role = "admin"
+	if err := Update(ctx, &theirs); err != nil {
+		t.Fatal(err)
+	}
+
+	mine.Age = 42
+	if err := Update(ctx, &mine, WithRetry(2)); err != nil {
+		t.Fatalf("disjoint changes must merge: %v", err)
+	}
+	var fresh testUser
+	if err := FindByID(ctx, seed.ID, &fresh); err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Age != 42 || fresh.Role != "admin" || fresh.Version != 2 {
+		t.Fatalf("merged document must carry both changes: %+v", fresh)
+	}
+	if mine.Age != 42 || mine.Role != "admin" || mine.Version != 2 {
+		t.Errorf("model must reflect the merge: %+v", mine)
+	}
+
+	// The base moved with the save: a second retry round still works.
+	if err := FindByID(ctx, seed.ID, &theirs); err != nil {
+		t.Fatal(err)
+	}
+	theirs.Name = "Renamed-not-allowed" // immutable, so use a mutable field
+	theirs.Name = fresh.Name
+	theirs.Role = "user"
+	if err := Update(ctx, &theirs); err != nil {
+		t.Fatal(err)
+	}
+	mine.Age = 43
+	if err := Update(ctx, &mine, WithRetry(2)); err != nil {
+		t.Fatalf("second merge round: %v", err)
+	}
+	if err := FindByID(ctx, seed.ID, &fresh); err != nil || fresh.Age != 43 || fresh.Role != "user" {
+		t.Fatalf("second merge result: %+v %v", fresh, err)
+	}
+
+	// Same-field changes conflict.
+	if err := FindByID(ctx, seed.ID, &theirs); err != nil {
+		t.Fatal(err)
+	}
+	theirs.Age = 100
+	if err := Update(ctx, &theirs); err != nil {
+		t.Fatal(err)
+	}
+	mine.Age = 44
+	var mce *MergeConflictError
+	if err := Update(ctx, &mine, WithRetry(2)); !errors.As(err, &mce) || len(mce.Fields) != 1 || mce.Fields[0] != "age" {
+		t.Fatalf("same-field change must be a MergeConflictError on age, got %v", err)
+	}
+	if err := FindByID(ctx, seed.ID, &fresh); err != nil || fresh.Age != 100 {
+		t.Fatalf("the other writer's value must stand: %+v %v", fresh, err)
+	}
+}
+
+func TestWithRetry_WithoutBase_IsAConflict(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	seed := seedUsers(t, ctx, 1)[0]
+	other := *seed
+	other.Role = "admin"
+	if err := Update(ctx, &other); err != nil {
+		t.Fatal(err)
+	}
+
+	// A model assembled by hand has no loaded base to diff against.
+	hand := &testUser{Email: seed.Email, Name: seed.Name, Age: 5}
+	hand.ID = seed.ID
+	hand.CreatedAt = seed.CreatedAt
+	if err := Update(ctx, hand, WithRetry(3)); !errors.Is(err, ErrVersionConflict) {
+		t.Fatalf("no base must mean no merge: %v", err)
+	}
+	var fresh testUser
+	if err := FindByID(ctx, seed.ID, &fresh); err != nil || fresh.Role != "admin" || fresh.Age != seed.Age {
+		t.Fatalf("nothing may have been overwritten: %+v %v", fresh, err)
+	}
+}
+
+func TestBase_RecordedByFindAndMovesWithCopies(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	seedUsers(t, ctx, 3)
+	var users []testUser
+	if err := Find(ctx, bson.D{}, &users); err != nil {
+		t.Fatal(err)
+	}
+	schema, _ := SchemaOf(&testUser{})
+	for i := range users {
+		if modelBase(schema, &users[i]) == nil {
+			t.Fatalf("Find must record a base for element %d", i)
+		}
+	}
+	var ptrs []*testUser
+	if err := Find(ctx, bson.D{}, &ptrs); err != nil || len(ptrs) != 3 || modelBase(schema, ptrs[0]) == nil {
+		t.Fatalf("Find into pointer slice: %v", err)
+	}
+	cp := users[0]
+	if modelBase(schema, &cp) == nil {
+		t.Error("a struct copy must keep the base")
+	}
+	fresh := &testUser{Email: "x@test.com", Name: "X"}
+	if err := Create(ctx, fresh); err != nil {
+		t.Fatal(err)
+	}
+	if modelBase(schema, fresh) == nil {
+		t.Error("Create must record a base")
+	}
+}
+
+func TestUpdateFields_EnumOnElementPath(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testEnumSlice{}, "test_enum_slice", "")
+	m := &testEnumSlice{Tags: []string{"a", "b"}}
+	if err := Create(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	var ve ValidationErrors
+	if err := UpdateFields(ctx, m, bson.M{"tags.1": "zzz"}); !errors.As(err, &ve) {
+		t.Fatalf("enum must apply to an element path, got %v", err)
+	}
+	if err := UpdateFields(ctx, m, bson.M{"tags.1": "c"}); err != nil || m.Tags[1] != "c" {
+		t.Fatalf("valid element: %v", err)
+	}
+}
+
+func TestValidate_EnumSkipsNilPointerElements(t *testing.T) {
+	type model struct {
+		Model `bson:",inline"`
+		Ptrs  []*string `bson:"ptrs" goodm:"enum=a|b"`
+	}
+	schema := &Schema{Fields: parseFields(modelType(&model{}), nil)}
+	a := "a"
+	if errs := Validate(&model{Ptrs: []*string{&a, nil}}, schema); len(errs) != 0 {
+		t.Errorf("nil elements must be skipped: %v", errs)
+	}
+	z := "z"
+	if errs := Validate(&model{Ptrs: []*string{&a, &z}}, schema); !hasFieldError(errs, "ptrs[1]") {
+		t.Errorf("offending pointer element must be reported: %v", errs)
+	}
+}
+
+func TestGenerateModel_WithoutEmbedImportsGoodm(t *testing.T) {
+	src, err := GenerateModel(DiscoveredCollection{Name: "things", Fields: []DiscoveredField{{BSONName: "name", GoType: "string"}}}, GenerateOptions{PackageName: "models", EmbedModel: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(src), `"github.com/dwoolworth/goodm"`) {
+		t.Errorf("generated code must import goodm for Register:\n%s", src)
+	}
+}

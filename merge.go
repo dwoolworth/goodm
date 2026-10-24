@@ -16,12 +16,15 @@ import (
 // field-level merge when a version conflict occurs. Without retries it still
 // refreshes the model's version on conflict to prevent cascading failures.
 func saveWithRetry(ctx context.Context, coll *mongo.Collection, schema *Schema, model interface{}, opt UpdateOptions, id interface{}, scope interface{}) error {
+	// The merge base is the document as last loaded or saved through goodm,
+	// not the model as it is now: the model already carries the caller's
+	// changes, and diffing it against itself would find none.
 	var base bson.M
 	if opt.MaxRetries > 0 {
-		var err error
-		base, err = snapshotModel(model)
-		if err != nil {
-			return err
+		if raw := modelBase(schema, model); raw != nil {
+			if err := bson.Unmarshal(raw, &base); err != nil {
+				return fmt.Errorf("goodm: failed to decode merge base: %w", err)
+			}
 		}
 	}
 
@@ -147,8 +150,7 @@ func refreshModelVersion(ctx context.Context, coll *mongo.Collection, model inte
 	}
 }
 
-// snapshotModel marshals a model to bson.M, capturing the "base" state before
-// any modifications. Used as the reference point for 3-way merge.
+// snapshotModel marshals a model to bson.M.
 func snapshotModel(model interface{}) (bson.M, error) {
 	return toBsonMap(model)
 }

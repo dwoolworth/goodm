@@ -68,6 +68,7 @@ type Schema struct {
 	createdAt []int // index path of the time.Time field stored as created_at, if any
 	updatedAt []int // index path of the time.Time field stored as updated_at, if any
 	version   []int // index path of the integer field stored as __v, if any
+	modelPath []int // index path of the embedded goodm.Model, nil if the struct has none
 }
 
 // QualifiedName returns the package path and struct name, e.g.

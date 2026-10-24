@@ -14,7 +14,7 @@ Name string `bson:"name" goodm:"required"`
 
 ### Enum
 
-Fields tagged `enum=a|b|c` must contain one of the listed values (pipe-separated). Only validated when the field is non-zero. On a slice or array field every element must be one of the values; an offending element is reported as `tags[2]`.
+Fields tagged `enum=a|b|c` must contain one of the listed values (pipe-separated). Only validated when the field is non-zero. On a slice or array field every element must be one of the values, including empty strings inside a non-empty slice; a nil pointer element is skipped like an unset scalar, and an offending element is reported as `tags[2]`.
 
 ```go
 Status string `bson:"status" goodm:"enum=draft|published|archived"`

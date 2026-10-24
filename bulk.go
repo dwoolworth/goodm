@@ -358,6 +358,7 @@ func SaveMany(ctx context.Context, models interface{}, opts ...UpdateOptions) er
 			if _, failed := out.failures[i]; failed {
 				continue
 			}
+			setModelBaseFromModel(schema, model)
 			if hook, ok := model.(AfterSave); ok {
 				if err := hook.AfterSave(ctx); err != nil {
 					out.failures[i] = fmt.Errorf("goodm: saved, but AfterSave failed: %w", err)

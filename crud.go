@@ -89,6 +89,13 @@ func UnsetFields(fields ...string) UpdateOptions {
 // state — but only if no other writer modified the same fields. If both sides
 // changed the same field, a *MergeConflictError is returned.
 //
+// The caller's changes are those that differ from the document as it was last
+// loaded or saved through goodm (FindOne, FindByID, Find, FindOneAndUpdate,
+// FindOneAndReplace, Create, Update, UpdateFields, SaveMany), which goodm.Model
+// remembers. A model built by hand, loaded through FindCursor, or without an
+// embedded goodm.Model has no such base; a conflict then returns
+// ErrVersionConflict without merging.
+//
 // Example:
 //
 //	goodm.Update(ctx, &task, goodm.WithRetry(3))
@@ -159,6 +166,7 @@ func Create(ctx context.Context, model interface{}, opts ...CreateOptions) error
 		if _, err := coll.InsertOne(ctx, model); err != nil {
 			return translateWriteError(err, schema, "insert failed")
 		}
+		setModelBaseFromModel(schema, model)
 
 		// AfterCreate hook
 		if hook, ok := model.(AfterCreate); ok {
@@ -221,11 +229,15 @@ func FindOne(ctx context.Context, filter interface{}, result interface{}, opts .
 		}
 
 		coll := getCollection(db, schema)
-		if err := coll.FindOne(ctx, info.Filter, findOneOptions(opt)).Decode(result); err != nil {
+		res := coll.FindOne(ctx, info.Filter, findOneOptions(opt))
+		if err := res.Decode(result); err != nil {
 			if errors.Is(err, mongo.ErrNoDocuments) {
 				return ErrNotFound
 			}
 			return fmt.Errorf("goodm: find one failed: %w", err)
+		}
+		if raw, err := res.Raw(); err == nil {
+			setModelBase(schema, result, raw)
 		}
 
 		return nil
@@ -282,12 +294,37 @@ func Find(ctx context.Context, filter interface{}, results interface{}, opts ...
 		}
 		defer func() { _ = cursor.Close(ctx) }()
 
-		if err := cursor.All(ctx, results); err != nil {
+		return decodeAll(ctx, cursor, schema, rv.Elem())
+	})
+}
+
+// decodeAll decodes every document of a cursor into the slice value (of
+// element type T or *T), recording each document's raw form as the model's
+// merge base.
+func decodeAll(ctx context.Context, cursor *mongo.Cursor, schema *Schema, slice reflect.Value) error {
+	elemType := slice.Type().Elem()
+	isPtr := elemType.Kind() == reflect.Pointer
+	if isPtr {
+		elemType = elemType.Elem()
+	}
+	out := reflect.MakeSlice(slice.Type(), 0, 0)
+	for cursor.Next(ctx) {
+		elem := reflect.New(elemType)
+		if err := cursor.Decode(elem.Interface()); err != nil {
 			return fmt.Errorf("goodm: cursor decode failed: %w", err)
 		}
-
-		return nil
-	})
+		setModelBase(schema, elem.Interface(), copyRaw(cursor.Current))
+		if isPtr {
+			out = reflect.Append(out, elem)
+		} else {
+			out = reflect.Append(out, elem.Elem())
+		}
+	}
+	if err := cursor.Err(); err != nil {
+		return fmt.Errorf("goodm: cursor failed: %w", err)
+	}
+	slice.Set(out)
+	return nil
 }
 
 // FindCursor returns a raw *mongo.Cursor for streaming large result sets.
@@ -507,6 +544,7 @@ func Update(ctx context.Context, model interface{}, opts ...UpdateOptions) error
 		if err := saveWithRetry(ctx, coll, schema, model, opt, id, scope); err != nil {
 			return err
 		}
+		setModelBaseFromModel(schema, model)
 
 		// AfterSave hook
 		if hook, ok := model.(AfterSave); ok {
@@ -680,6 +718,7 @@ func UpdateFields(ctx context.Context, model interface{}, fields bson.M, opts ..
 		setUpdatedAt(model, now)
 		setModelVersion(model, oldVersion+1)
 		applyFieldsToModel(model, values)
+		setModelBaseFromModel(schema, model)
 
 		return nil
 	})
@@ -724,6 +763,11 @@ func prepareUpdateFields(schema *Schema, model interface{}, fields bson.M) (valu
 		}
 		if isElement {
 			errs = append(errs, validateSliceElement(v, fs, name)...)
+			if len(fs.Enum) > 0 && !v.IsZero() {
+				if e := validateEnum(v, fs.Enum, name); e != nil {
+					errs = append(errs, *e)
+				}
+			}
 		} else {
 			errs = append(errs, validateOneField(v, fs, name)...)
 		}
@@ -1242,7 +1286,9 @@ func convertArray(rv reflect.Value, t reflect.Type) (reflect.Value, error) {
 }
 
 // validateSliceElement validates one element of a slice field: a subdocument
-// element is validated by its inner fields; scalar elements have no rules.
+// element is validated by its inner fields. Scalar elements are subject only
+// to enum, which the caller applies; min and max are length rules for the
+// whole slice.
 func validateSliceElement(v reflect.Value, fs *FieldSchema, path string) []ValidationError {
 	if len(fs.SubFields) == 0 {
 		return nil
@@ -1552,12 +1598,17 @@ func FindOneAndUpdate(ctx context.Context, filter interface{}, update interface{
 
 		coll := getCollection(db, schema)
 		managed := withManagedUpdate(update, time.Now(), opt.Upsert)
-		err = coll.FindOneAndUpdate(ctx, info.Filter, managed, fo).Decode(result)
-		if err != nil {
+		res := coll.FindOneAndUpdate(ctx, info.Filter, managed, fo)
+		if err := res.Decode(result); err != nil {
 			if errors.Is(err, mongo.ErrNoDocuments) {
 				return ErrNotFound
 			}
 			return translateWriteError(err, schema, "find one and update failed")
+		}
+		if !opt.ReturnOriginal {
+			if raw, err := res.Raw(); err == nil {
+				setModelBase(schema, result, raw)
+			}
 		}
 		return nil
 	})
@@ -1615,12 +1666,17 @@ func FindOneAndReplace(ctx context.Context, filter interface{}, replacement inte
 		}
 
 		coll := getCollection(db, schema)
-		err = coll.FindOneAndReplace(ctx, info.Filter, replacement, fo).Decode(result)
-		if err != nil {
+		res := coll.FindOneAndReplace(ctx, info.Filter, replacement, fo)
+		if err := res.Decode(result); err != nil {
 			if errors.Is(err, mongo.ErrNoDocuments) {
 				return ErrNotFound
 			}
 			return translateWriteError(err, schema, "find one and replace failed")
+		}
+		if !opt.ReturnOriginal {
+			if raw, err := res.Raw(); err == nil {
+				setModelBase(schema, result, raw)
+			}
 		}
 		return nil
 	})
@@ -2100,6 +2156,76 @@ func setTimestamps(model interface{}, now time.Time) {
 		}
 	}
 	setUpdatedAt(model, now)
+}
+
+// embeddedModel returns the model's embedded goodm.Model, allocating a nil
+// pointer embed, or nil if the struct has none.
+func embeddedModel(schema *Schema, model interface{}) *Model {
+	if schema == nil || schema.modelPath == nil {
+		return nil
+	}
+	v := reflect.ValueOf(model)
+	if v.Kind() != reflect.Pointer || v.IsNil() {
+		return nil
+	}
+	cur := v.Elem()
+	for _, i := range schema.modelPath {
+		if cur.Kind() == reflect.Pointer {
+			if cur.IsNil() {
+				if !cur.CanSet() {
+					return nil
+				}
+				cur.Set(reflect.New(cur.Type().Elem()))
+			}
+			cur = cur.Elem()
+		}
+		cur = cur.Field(i)
+	}
+	if cur.Kind() == reflect.Pointer {
+		if cur.IsNil() {
+			if !cur.CanSet() {
+				return nil
+			}
+			cur.Set(reflect.New(cur.Type().Elem()))
+		}
+		return cur.Interface().(*Model)
+	}
+	if !cur.CanAddr() {
+		return nil
+	}
+	return cur.Addr().Interface().(*Model)
+}
+
+// setModelBase records raw as the model's last known stored state.
+func setModelBase(schema *Schema, model interface{}, raw bson.Raw) {
+	if m := embeddedModel(schema, model); m != nil {
+		m.setBase(raw)
+	}
+}
+
+// setModelBaseFromModel records the model's current state as its last known
+// stored state, after a successful write.
+func setModelBaseFromModel(schema *Schema, model interface{}) {
+	m := embeddedModel(schema, model)
+	if m == nil {
+		return
+	}
+	if raw, err := bson.Marshal(model); err == nil {
+		m.setBase(raw)
+	}
+}
+
+// modelBase returns the model's last known stored state, or nil.
+func modelBase(schema *Schema, model interface{}) bson.Raw {
+	if m := embeddedModel(schema, model); m != nil {
+		return m.baseSnapshot()
+	}
+	return nil
+}
+
+// copyRaw returns an owned copy of a cursor's current document.
+func copyRaw(raw bson.Raw) bson.Raw {
+	return append(bson.Raw(nil), raw...)
 }
 
 // getUpdatedAt returns a model's updated_at, or the zero time if it has none.

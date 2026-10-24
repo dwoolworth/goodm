@@ -48,6 +48,7 @@ func Register(model interface{}, collection string) error {
 	}
 	schema.idField = findIDField(t)
 	schema.createdAt, schema.updatedAt, schema.version = findManagedFields(schema.Fields)
+	schema.modelPath = findModelEmbed(t, nil)
 	if schema.idField == nil {
 		if embedsModelWithoutInline(t) {
 			return fmt.Errorf("goodm: model %s embeds goodm.Model without the bson:\",inline\" tag, so its _id would be stored nested; embed it as goodm.Model with the tag bson:\",inline\"", schema.QualifiedName())
@@ -251,6 +252,30 @@ func findIDField(t reflect.Type) []int {
 	for _, f := range internal.StructFields(t) {
 		if name, _ := ParseBSONTag(f.Tag.Get("bson")); name == "_id" {
 			return f.Index
+		}
+	}
+	return nil
+}
+
+// findModelEmbed returns the index path of an inline-embedded goodm.Model
+// (by value or pointer), searching through other inline embeds, or nil.
+func findModelEmbed(t reflect.Type, prefix []int) []int {
+	modelType := reflect.TypeOf(Model{})
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if !internal.IsInlineStruct(f) {
+			continue
+		}
+		path := append(append([]int{}, prefix...), i)
+		ft := f.Type
+		if ft.Kind() == reflect.Pointer {
+			ft = ft.Elem()
+		}
+		if ft == modelType {
+			return path
+		}
+		if inner := findModelEmbed(ft, path); inner != nil {
+			return inner
 		}
 	}
 	return nil
