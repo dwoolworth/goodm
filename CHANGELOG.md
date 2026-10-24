@@ -2,9 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.1] - 2026-10-24
+
+### Fixed
+- `enum` on a slice or array field compared the whole slice's string form against the allowed values, so every non-empty value was rejected; each element is now checked and an offending one is reported as `field[i]`.
+- `Update` and `SaveMany` left a failed model's `UpdatedAt` at the attempted time while restoring its version; `UpdatedAt` is restored too.
+- `goodm discover` typed date fields as `interface{}` because BSON dates decode as `bson.DateTime`; they are now `time.Time`.
+- A snapshot session passed to `WithTransaction` is documented to return an error.
+
+### Changed
+- The two internal filter-scoping helpers added by #8 and #9 are merged into one.
+
 ## [0.7.0] - 2026-10-24
 
 This release closes the main MongoDB feature gaps found in a review of 0.6.1 and fixes several correctness bugs. It contains breaking changes; see the end of this entry.
+
+Tested against MongoDB 6.0.28, 7.0.45, and 8.0.34 running as single-node replica sets, with Go 1.21, 1.22, and 1.23 in CI and Go 1.26 locally; the suite runs with the race detector on every combination.
 
 ### Added
 - **Index types and options.** Field tags: `index=-1`, `index=hashed`, `index=text`, `index=2dsphere`, `sparse`, and `ttl=<duration|seconds>`. `CompoundIndex` gained `Sparse`, `Name`, `ExpireAfterSeconds` (with the `TTL(time.Duration)` helper), `PartialFilter`, and `Collation`, and its `Fields` entries accept `-field`, `field:text`, `field:hashed`, and `field:2dsphere` markers. Index tags inside subdocuments now create dotted-path indexes (see Changed). `Enforce` detects mismatches in sparseness, TTL, partial filter, and collation as well as keys and uniqueness; the fields of a compound text index are compared as a set.

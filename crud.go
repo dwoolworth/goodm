@@ -2102,6 +2102,14 @@ func setTimestamps(model interface{}, now time.Time) {
 	setUpdatedAt(model, now)
 }
 
+// getUpdatedAt returns a model's updated_at, or the zero time if it has none.
+func getUpdatedAt(model interface{}) time.Time {
+	if f := managedField(model, "updated_at", "UpdatedAt"); f.IsValid() && f.Type() == reflect.TypeOf(time.Time{}) {
+		return f.Interface().(time.Time)
+	}
+	return time.Time{}
+}
+
 // setUpdatedAt sets only updated_at on a model.
 func setUpdatedAt(model interface{}, now time.Time) {
 	if f := managedField(model, "updated_at", "UpdatedAt"); f.IsValid() && f.CanSet() && f.Type() == reflect.TypeOf(time.Time{}) {

@@ -1523,3 +1523,77 @@ func TestRegister_RejectsInlineOnNonStructFields(t *testing.T) {
 	}
 	Unregister(&ok{})
 }
+
+// --- 0.7.1 follow-ups ---
+
+type testEnumSlice struct {
+	Model `bson:",inline"`
+	Tags  []string `bson:"tags" goodm:"enum=a|b|c"`
+}
+
+func TestValidate_EnumOnSliceChecksEachElement(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testEnumSlice{}, "test_enum_slice", "")
+	if err := Create(ctx, &testEnumSlice{Tags: []string{"a", "c"}}); err != nil {
+		t.Fatalf("valid elements must pass: %v", err)
+	}
+	var ve ValidationErrors
+	err := Create(ctx, &testEnumSlice{Tags: []string{"a", "zzz"}})
+	if !errors.As(err, &ve) || !hasFieldError(ve, "tags[1]") {
+		t.Fatalf("an offending element must be reported by index, got %v", err)
+	}
+	if err := Create(ctx, &testEnumSlice{}); err != nil {
+		t.Fatalf("an empty slice is unset and passes: %v", err)
+	}
+}
+
+func TestUpdatedAt_RestoredOnFailedSave(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	users := seedUsers(t, ctx, 2)
+	before0, before1 := users[0].UpdatedAt, users[1].UpdatedAt
+
+	other := *users[0]
+	other.Age = 99
+	if err := Update(ctx, &other); err != nil {
+		t.Fatal(err)
+	}
+	users[0].Age = 1
+	if err := Update(ctx, users[0]); !errors.Is(err, ErrVersionConflict) {
+		t.Fatalf("expected a conflict, got %v", err)
+	}
+	if !users[0].UpdatedAt.Equal(before0) {
+		t.Errorf("Update must restore UpdatedAt on failure: %v != %v", users[0].UpdatedAt, before0)
+	}
+
+	stale := *users[1]
+	if err := Update(ctx, &stale); err != nil {
+		t.Fatal(err)
+	}
+	users[1].Age = 2
+	err := SaveMany(ctx, []*testUser{users[1]})
+	if !errors.Is(err, ErrVersionConflict) {
+		t.Fatalf("expected a conflict, got %v", err)
+	}
+	if !users[1].UpdatedAt.Equal(before1) {
+		t.Errorf("SaveMany must restore UpdatedAt on a failed item: %v != %v", users[1].UpdatedAt, before1)
+	}
+}
+
+func TestDiscover_DatesAreTimeTime(t *testing.T) {
+	ctx, db, cleanup := setupTestDB(t)
+	defer cleanup()
+	if _, err := db.Collection("disc5").InsertOne(ctx, bson.D{{Key: "when", Value: fixedTime}}); err != nil {
+		t.Fatal(err)
+	}
+	found, err := Discover(ctx, db, DiscoverOptions{Collections: []string{"disc5"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range found[0].Fields {
+		if f.BSONName == "when" && f.GoType != "time.Time" {
+			t.Errorf("date field typed %q, want time.Time", f.GoType)
+		}
+	}
+}

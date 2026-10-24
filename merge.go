@@ -52,6 +52,7 @@ func saveWithRetry(ctx context.Context, coll *mongo.Collection, schema *Schema, 
 // if the version filter did not match, or ErrNotFound if the document is gone.
 func attemptSave(ctx context.Context, coll *mongo.Collection, schema *Schema, model interface{}, unsetFields []string, id interface{}, scope interface{}) error {
 	oldVersion, _ := getModelVersion(model)
+	oldUpdated := getUpdatedAt(model)
 	setModelVersion(model, oldVersion+1)
 	setUpdatedAt(model, time.Now())
 
@@ -59,10 +60,12 @@ func attemptSave(ctx context.Context, coll *mongo.Collection, schema *Schema, mo
 	matched, err := replaceWithUnset(ctx, coll, schema, filter, model, unsetFields)
 	if err != nil {
 		setModelVersion(model, oldVersion)
+		setUpdatedAt(model, oldUpdated)
 		return err
 	}
 	if matched == 0 {
 		setModelVersion(model, oldVersion)
+		setUpdatedAt(model, oldUpdated)
 		return checkUpdateConflict(ctx, coll, scope, id)
 	}
 

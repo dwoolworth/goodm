@@ -311,12 +311,14 @@ func SaveMany(ctx context.Context, models interface{}, opts ...UpdateOptions) er
 
 		now := time.Now()
 		oldVersions := make([]int, n)
+		oldUpdated := make([]time.Time, n)
 		filters := make([]interface{}, n)
 		for i, model := range items {
 			oldVersions[i], _ = getModelVersion(model)
+			oldUpdated[i] = getUpdatedAt(model)
 			setModelVersion(model, oldVersions[i]+1)
 			setUpdatedAt(model, now)
-			filters[i] = scopedFilter(scope, buildVersionFilter(ids[i], oldVersions[i]))
+			filters[i] = andFilter(scope, buildVersionFilter(ids[i], oldVersions[i]))
 		}
 
 		out := saveManyReplace(ctx, coll, schema, items, filters)
@@ -324,6 +326,7 @@ func SaveMany(ctx context.Context, models interface{}, opts ...UpdateOptions) er
 			// The transaction is dead: nothing in this batch will commit.
 			for i := range items {
 				setModelVersion(items[i], oldVersions[i])
+				setUpdatedAt(items[i], oldUpdated[i])
 			}
 			return &BulkError{Collection: schema.Collection, Errors: out.itemErrors(), Result: &BulkResult{}, WriteConcernError: out.wcErr}
 		}
@@ -337,6 +340,7 @@ func SaveMany(ctx context.Context, models interface{}, opts ...UpdateOptions) er
 					// transient-transaction label) stay visible.
 					for i := range items {
 						setModelVersion(items[i], oldVersions[i])
+						setUpdatedAt(items[i], oldUpdated[i])
 						out.failures[i] = fmt.Errorf("goodm: not saved: transaction aborted while resolving the batch: %w", err)
 					}
 					return &BulkError{Collection: schema.Collection, Errors: out.itemErrors(), Result: &BulkResult{}, WriteConcernError: out.wcErr}
@@ -349,7 +353,7 @@ func SaveMany(ctx context.Context, models interface{}, opts ...UpdateOptions) er
 			}
 		}
 
-		rollbackVersions(items, oldVersions, out.failures)
+		rollbackVersions(items, oldVersions, oldUpdated, out.failures)
 		for i, model := range items {
 			if _, failed := out.failures[i]; failed {
 				continue
@@ -613,7 +617,7 @@ func resolveUnmatched(ctx context.Context, coll *mongo.Collection, schema *Schem
 	}
 	primary := coll.Database().Collection(coll.Name(), options.Collection().SetReadPreference(readpref.Primary()))
 	cursor, err := primary.Find(ctx,
-		scopedFilter(scope, bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: lookup}}}}),
+		andFilter(scope, bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: lookup}}}}),
 		options.Find().SetProjection(bson.D{{Key: "_id", Value: 1}, {Key: "__v", Value: 1}}))
 	if err != nil {
 		return fmt.Errorf("goodm: failed to resolve unmatched documents: %w", err)
@@ -649,30 +653,20 @@ func resolveUnmatched(ctx context.Context, coll *mongo.Collection, schema *Schem
 	return nil
 }
 
-// rollbackVersions restores the pre-save version on failed items. Items whose
-// failure is a version conflict keep the version resolveUnmatched refreshed
-// from the database.
-func rollbackVersions(items []interface{}, oldVersions []int, failures map[int]error) {
+// rollbackVersions restores the pre-save version and UpdatedAt on failed
+// items. Items whose failure is a version conflict keep the version
+// resolveUnmatched refreshed from the database but get their UpdatedAt back.
+func rollbackVersions(items []interface{}, oldVersions []int, oldUpdated []time.Time, failures map[int]error) {
 	for i, model := range items {
-		if failure, failed := failures[i]; failed && !errors.Is(failure, ErrVersionConflict) {
+		failure, failed := failures[i]
+		if !failed {
+			continue
+		}
+		if !errors.Is(failure, ErrVersionConflict) {
 			setModelVersion(model, oldVersions[i])
 		}
+		setUpdatedAt(model, oldUpdated[i])
 	}
-}
-
-// scopedFilter ANDs a middleware-supplied scope into a filter. A nil or
-// empty scope leaves the filter unchanged.
-func scopedFilter(scope interface{}, filter bson.D) interface{} {
-	if scope == nil {
-		return filter
-	}
-	if d, ok := scope.(bson.D); ok && len(d) == 0 {
-		return filter
-	}
-	if m, ok := scope.(bson.M); ok && len(m) == 0 {
-		return filter
-	}
-	return bson.D{{Key: "$and", Value: bson.A{scope, filter}}}
 }
 
 // checkImmutableFieldsBatch loads the stored documents for all items in one
@@ -683,7 +677,7 @@ func checkImmutableFieldsBatch(ctx context.Context, coll *mongo.Collection, sche
 	if !hasImmutableFields(schema) {
 		return nil
 	}
-	cursor, err := coll.Find(ctx, scopedFilter(scope, bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}}))
+	cursor, err := coll.Find(ctx, andFilter(scope, bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}}))
 	if err != nil {
 		return fmt.Errorf("goodm: failed to fetch existing documents: %w", err)
 	}
