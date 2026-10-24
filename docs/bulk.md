@@ -1,6 +1,6 @@
 # Bulk Operations
 
-goodm has two tiers of batch operations, mirroring the single-document API. `CreateMany` and `SaveMany` run the full model lifecycle per item and then write once. `UpdateMany`, `DeleteMany`, and the `Bulk` builder are raw passthroughs for speed.
+goodm has two tiers of batch operations, mirroring the single-document API. `CreateMany` and `SaveMany` run the full model lifecycle per item (`CreateMany` then inserts in one request; `SaveMany` replaces each document with its own, concurrently). `UpdateMany`, `DeleteMany`, and the `Bulk` builder are raw passthroughs for speed.
 
 ## CreateMany
 
@@ -27,7 +27,7 @@ err := goodm.CreateMany(ctx, users)
 // Error: "goodm: item 1: validation error on email: field is required"
 ```
 
-Write failures such as duplicate keys come back as a `*BulkError`. The insert is ordered by default, so it stops at the first failure. Set `Unordered` to insert everything that can be inserted:
+Write failures such as duplicate keys come back as a `*BulkError`. The insert is ordered by default, so it stops at the first failure. Set `Unordered` to insert everything that can be inserted. An `AfterCreate` hook that returns an error is reported for its item in the same `*BulkError` after the other hooks have run; the document stays inserted.
 
 ```go
 err := goodm.CreateMany(ctx, users, goodm.CreateOptions{Unordered: true})
@@ -59,18 +59,22 @@ for i := range tasks {
 err := goodm.SaveMany(ctx, tasks)
 ```
 
-If any model fails its immutable check, hook, or validation, or the slice contains the same `_id` twice, `SaveMany` returns before writing anything. After the write, per-item problems are reported in a `*BulkError`:
+If any model fails its immutable check, `BeforeSave` hook, or validation, or the slice contains the same `_id` twice, `SaveMany` returns before writing anything. After the write, per-item problems are reported in a `*BulkError`:
 
 | Item error | Meaning |
 |-----------|---------|
 | `ErrVersionConflict` | Another writer changed the document first. The model's in-memory version is refreshed from the database, as `Update` does. |
-| `ErrNotFound` | The document was deleted. |
+| `ErrNotFound` | The document was deleted (or is outside the middleware scope). |
 | `*DuplicateKeyError` | The replacement violated a unique index. |
+| error marked "outcome unknown" | The write concern was not met, or the request failed in transport or by context cancellation. The server may have applied it, so the model's version is rolled back and `AfterSave` is skipped; a later save of that model then reports a conflict rather than losing anything. `BulkError.WriteConcernError` is set when a write concern error was involved. |
+| error marked "not attempted" | The context was done before the item was sent. |
+| error marked "saved, but AfterSave failed" | The document was saved and keeps its new version; the hook's error is reported after the other hooks have run. |
 
-| `*WriteConcernError`-style item | The write concern was not met for that item; its outcome is unknown, so its version is rolled back and `AfterSave` skipped. `BulkError.WriteConcernError` is set too. |
-| transport or context error | Attributed to the item it happened on; the rest of the batch still runs. |
+Models that succeeded are saved regardless of failures elsewhere in the batch; failed models keep their old version. A replacement that matched nothing is resolved by reading the document from the primary: still present means `ErrVersionConflict`, gone means `ErrNotFound`. Two writers racing from the same version therefore always see exactly one success and one conflict. If that resolution read itself fails, only the items it was resolving are reported as unknown; the items already known to be saved keep their new version.
 
-Models that succeeded are saved regardless of failures elsewhere in the batch; failed models keep their old version. A replacement that matched nothing is resolved by reading the document from the primary: still present means `ErrVersionConflict`, gone means `ErrNotFound`. Two writers racing from the same version therefore always see exactly one success and one conflict. If that resolution read itself fails, only the items it was resolving are reported as failed, with the read error; the items already known to be saved keep their new version.
+Inside a transaction the first failing item aborts the transaction on the server, so `SaveMany` stops there, restores every model's version, runs no `AfterSave`, and reports every item in the `*BulkError` (the items before the failure as "not saved", the ones after it as "not attempted").
+
+Of `UpdateOptions` only `DB` is used. Because replacements run on several goroutines outside a transaction, custom BSON marshalers on the model may run concurrently.
 
 Middleware may replace `op.Filter` for `OpSaveMany` (it starts as an empty document); it is ANDed into every document's filter and out-of-scope documents are reported as `ErrNotFound`.
 
@@ -183,8 +187,10 @@ type BulkError struct {
     Collection        string
     Errors            []BulkWriteError // one per failed operation or model
     Result            *BulkResult      // what did succeed
-    WriteConcernError error            // set when the write concern was not met for some operation
+    WriteConcernError error            // set when the write concern was not met for some write
 }
+
+`WriteConcernError` means different things per operation: for `CreateMany` and `Bulk` the whole batch's outcome is unknown, `Result` cannot be trusted, and no after-hooks ran; for `SaveMany` only the items listed with that error are unknown.
 
 type BulkWriteError struct {
     Index   int    // position in the batch

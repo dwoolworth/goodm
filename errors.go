@@ -127,9 +127,12 @@ func (e BulkWriteError) Unwrap() error { return e.Err }
 // typed error of any failed item (e.g. ErrDuplicateKey, ErrVersionConflict).
 //
 // When WriteConcernError is set the server could not satisfy the requested
-// write concern: the writes may or may not have been applied, Result cannot
-// be trusted, no after-hooks have run, and SaveMany has rolled every model's
-// version back. Errors still lists the operations the server rejected.
+// write concern for some write. For CreateMany and Bulk that write is the
+// whole batch: the operations may or may not have been applied, Result
+// cannot be trusted, and no after-hooks have run. For SaveMany it applies
+// only to the items listed with that error; the other items' outcomes are
+// known and reported as usual. Errors always lists the operations the server
+// rejected.
 type BulkError struct {
 	Collection        string
 	Errors            []BulkWriteError
@@ -149,7 +152,7 @@ func (e *BulkError) Error() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "goodm: bulk write on %s:", e.Collection)
 	if e.WriteConcernError != nil {
-		fmt.Fprintf(&b, " %v (outcome of every operation is unknown)", e.WriteConcernError)
+		fmt.Fprintf(&b, " write concern not met: %v", e.WriteConcernError)
 		if len(e.Errors) > 0 {
 			b.WriteString(";")
 		}
