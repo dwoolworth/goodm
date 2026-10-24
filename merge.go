@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"time"
 
+	"github.com/dwoolworth/goodm/internal"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
@@ -52,7 +53,7 @@ func saveWithRetry(ctx context.Context, coll *mongo.Collection, schema *Schema, 
 		// changes. The re-read state becomes the base for the next round, so
 		// the other writer's changes are not mistaken for ours on a second
 		// conflict.
-		theirs, err := mergeFromDB(ctx, coll, schema, model, base, id, scope)
+		theirs, err := mergeFromDB(ctx, coll, schema, model, base, id, scope, opt.Unset)
 		if err != nil {
 			return err
 		}
@@ -99,8 +100,9 @@ func attemptSave(ctx context.Context, coll *mongo.Collection, schema *Schema, mo
 // mergeFromDB re-reads the document, computes a 3-way diff (base vs ours vs theirs),
 // and applies non-conflicting changes from the caller onto the fresh DB state.
 // Returns a *MergeConflictError if both sides modified the same fields.
+// Fields the caller asked to unset count as removals on the caller's side.
 // It returns the re-read state in map form, the base for a further round.
-func mergeFromDB(ctx context.Context, coll *mongo.Collection, schema *Schema, model interface{}, base bson.M, id interface{}, scope interface{}) (bson.M, error) {
+func mergeFromDB(ctx context.Context, coll *mongo.Collection, schema *Schema, model interface{}, base bson.M, id interface{}, scope interface{}, unset []string) (bson.M, error) {
 	// Re-read the current document from the database.
 	fresh := reflect.New(reflect.TypeOf(model).Elem()).Interface()
 	if err := coll.FindOne(ctx, andFilter(scope, bson.D{{Key: "_id", Value: id}})).Decode(fresh); err != nil {
@@ -113,6 +115,9 @@ func mergeFromDB(ctx context.Context, coll *mongo.Collection, schema *Schema, mo
 	ours, err := toBsonMap(model)
 	if err != nil {
 		return nil, err
+	}
+	for _, f := range unset {
+		delete(ours, f)
 	}
 	theirs, err := toBsonMap(fresh)
 	if err != nil {
@@ -131,23 +136,49 @@ func mergeFromDB(ctx context.Context, coll *mongo.Collection, schema *Schema, mo
 	merged := buildMergedDoc(theirs, ours, ourChanges)
 
 	// Write the merged state back into the caller's model struct. Decoding
-	// into the existing struct would keep map keys and omitempty values the
-	// merged document no longer has, so decode into a fresh value and copy
-	// it over, keeping the model's merge base.
+	// into the struct as it is would keep map keys and omitempty values the
+	// merged document no longer has, so the BSON-mapped fields are zeroed
+	// first; fields tagged "-", unexported fields (including the merge
+	// base), and pointer identities are left alone.
 	raw, err := bson.Marshal(merged)
 	if err != nil {
 		return nil, fmt.Errorf("goodm: failed to marshal merged document: %w", err)
 	}
-	mv := reflect.ValueOf(model).Elem()
-	freshModel := reflect.New(mv.Type())
-	if err := bson.Unmarshal(raw, freshModel.Interface()); err != nil {
+	zeroBSONFields(reflect.ValueOf(model).Elem())
+	if err := bson.Unmarshal(raw, model); err != nil {
 		return nil, fmt.Errorf("goodm: failed to apply merged document: %w", err)
 	}
-	keep := modelBase(schema, model)
-	mv.Set(freshModel.Elem())
-	setModelBase(schema, model, keep)
 
 	return theirs, nil
+}
+
+// zeroBSONFields sets every field the driver would encode to its zero value,
+// recursing through inline embeds (keeping non-nil pointer embeds in place).
+func zeroBSONFields(v reflect.Value) {
+	t := v.Type()
+	for i := 0; i < t.NumField(); i++ {
+		sf := t.Field(i)
+		if !sf.IsExported() {
+			continue
+		}
+		if name, _ := ParseBSONTag(sf.Tag.Get("bson")); name == "-" {
+			continue
+		}
+		f := v.Field(i)
+		if internal.IsInlineStruct(sf) {
+			if f.Kind() == reflect.Pointer {
+				if f.IsNil() {
+					continue
+				}
+				f = f.Elem()
+			}
+			zeroBSONFields(f)
+			continue
+		}
+		if f.CanSet() {
+			f.Set(reflect.Zero(f.Type()))
+		}
+	}
 }
 
 // buildMergedDoc creates a merged document by starting with theirs and applying

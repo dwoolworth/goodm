@@ -1840,7 +1840,7 @@ func TestWithRetry_SecondConflictInOneCall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	theirs, err := mergeFromDB(ctx, coll, schema, &mine, base, m.ID, nil)
+	theirs, err := mergeFromDB(ctx, coll, schema, &mine, base, m.ID, nil, nil)
 	if err != nil {
 		t.Fatalf("first merge round: %v", err)
 	}
@@ -1852,7 +1852,7 @@ func TestWithRetry_SecondConflictInOneCall(t *testing.T) {
 	if err := Update(ctx, &b); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := mergeFromDB(ctx, coll, schema, &mine, theirs, m.ID, nil); err != nil {
+	if _, err := mergeFromDB(ctx, coll, schema, &mine, theirs, m.ID, nil, nil); err != nil {
 		t.Fatalf("second merge round with the advanced base must succeed: %v", err)
 	}
 	if mine.Name != "A" || mine.Count != 9 || mine.Note != "mine" {
@@ -1955,5 +1955,108 @@ func TestUpdateFields_BaseAdvancesOnlyByWrittenFields(t *testing.T) {
 	}
 	if fresh.Note != "local-unsaved" || fresh.Count != 7 || fresh.Name != "uf" {
 		t.Errorf("the unsaved edit must still count as ours: %+v", fresh)
+	}
+}
+
+type testMergeTransient struct {
+	Model     `bson:",inline"`
+	Note      string `bson:"note"`
+	Count     int    `bson:"count"`
+	Transient string `bson:"-"`
+	cache     string
+}
+
+func TestWithRetry_UnsetIsOurRemoval_AndTransientFieldsSurvive(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testMergeTransient{}, "test_merge_transient", "")
+	m := &testMergeTransient{Count: 1}
+	if err := Create(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	var a, b testMergeTransient
+	if err := FindByID(ctx, m.ID, &a); err != nil {
+		t.Fatal(err)
+	}
+	if err := FindByID(ctx, m.ID, &b); err != nil {
+		t.Fatal(err)
+	}
+	b.Count = 99
+	if err := Update(ctx, &b); err != nil {
+		t.Fatal(err)
+	}
+	a.Note = "mine"
+	a.Transient, a.cache = "keep", "cached"
+	var mce *MergeConflictError
+	opts := UnsetFields("count")
+	opts.MaxRetries = 1
+	if err := Update(ctx, &a, opts); !errors.As(err, &mce) || mce.Fields[0] != "count" {
+		t.Fatalf("unsetting a field another writer changed must conflict, got %v", err)
+	}
+	var fresh testMergeTransient
+	if err := FindByID(ctx, m.ID, &fresh); err != nil || fresh.Count != 99 {
+		t.Fatalf("the other writer's value must stand: %+v %v", fresh, err)
+	}
+
+	// A merge that succeeds keeps non-persisted fields and pointer identity.
+	if err := FindByID(ctx, m.ID, &a); err != nil {
+		t.Fatal(err)
+	}
+	if err := FindByID(ctx, m.ID, &b); err != nil {
+		t.Fatal(err)
+	}
+	b.Count = 100
+	if err := Update(ctx, &b); err != nil {
+		t.Fatal(err)
+	}
+	a.Note = "again"
+	a.Transient, a.cache = "keep", "cached"
+	held := &a.Model
+	if err := Update(ctx, &a, WithRetry(2)); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if a.Transient != "keep" || a.cache != "cached" {
+		t.Errorf("non-persisted fields must survive a merge: %q %q", a.Transient, a.cache)
+	}
+	if held != &a.Model || held.Version != a.Version {
+		t.Error("struct identity must be preserved through a merge")
+	}
+	if a.Count != 100 || a.Note != "again" {
+		t.Errorf("merged content: %+v", a)
+	}
+
+	// After an Unset save the base lacks the field, so a later merge sees a
+	// re-added value as ours.
+	if err := FindByID(ctx, m.ID, &a); err != nil {
+		t.Fatal(err)
+	}
+	if err := Update(ctx, &a, UnsetFields("count")); err != nil {
+		t.Fatal(err)
+	}
+	schema, _ := SchemaOf(&testMergeTransient{})
+	var baseDoc bson.M
+	if err := bson.Unmarshal(modelBase(schema, &a), &baseDoc); err != nil {
+		t.Fatal(err)
+	}
+	if _, has := baseDoc["count"]; has {
+		t.Error("the base after an Unset save must not contain the unset field")
+	}
+}
+
+func TestUpdateFields_BaseClearedWhenNotReconstructible(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testEnumSlice{}, "test_enum_slice", "")
+	m := &testEnumSlice{Tags: []string{"a"}}
+	if err := Create(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	m.Tags = append(m.Tags, "b", "c") // in memory only
+	if err := UpdateFields(ctx, m, bson.M{"tags.2": "c"}); err != nil {
+		t.Fatal(err)
+	}
+	schema, _ := SchemaOf(&testEnumSlice{})
+	if modelBase(schema, m) != nil {
+		t.Error("a base that cannot be reconstructed must be dropped, not left behind the database")
 	}
 }

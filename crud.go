@@ -544,7 +544,16 @@ func Update(ctx context.Context, model interface{}, opts ...UpdateOptions) error
 		if err := saveWithRetry(ctx, coll, schema, model, opt, id, scope); err != nil {
 			return err
 		}
-		setModelBaseFromModel(schema, model)
+		if len(opt.Unset) > 0 {
+			// The stored document lacks the unset fields; the base must too.
+			if written, err := buildReplacement(model, opt.Unset); err == nil {
+				if raw, err := bson.Marshal(written); err == nil {
+					setModelBase(schema, model, raw)
+				}
+			}
+		} else {
+			setModelBaseFromModel(schema, model)
+		}
 
 		// AfterSave hook
 		if hook, ok := model.(AfterSave); ok {
@@ -738,7 +747,13 @@ func advanceBaseAfterUpdateFields(schema *Schema, model interface{}, values map[
 		setModelBase(schema, model, nil)
 		return
 	}
-	applyFieldsToModel(stored.Interface(), values)
+	if !applyFieldsToModel(stored.Interface(), values) {
+		// The stored document was shaped differently (e.g. the caller wrote
+		// through an index its stored copy did not have): the base can no
+		// longer be reconstructed, so drop it rather than keep a wrong one.
+		setModelBase(schema, model, nil)
+		return
+	}
 	setUpdatedAt(stored.Interface(), now)
 	setModelVersion(stored.Interface(), version)
 	raw, err := bson.Marshal(stored.Interface())
@@ -1380,12 +1395,13 @@ func isSliceField(fs *FieldSchema) bool {
 // caller sees the updated state without a re-read. Dotted paths are followed
 // through nested structs, pointers, and slice indices; a path that cannot be
 // reached on the current model (e.g. an index past the end of a slice) is
-// skipped.
-func applyFieldsToModel(model interface{}, values map[string]reflect.Value) {
+// skipped, and the result reports whether every path was applied.
+func applyFieldsToModel(model interface{}, values map[string]reflect.Value) bool {
 	root := reflect.ValueOf(model)
 	if root.Kind() == reflect.Pointer {
 		root = root.Elem()
 	}
+	all := true
 	for path, val := range values {
 		target := root
 		ok := true
@@ -1396,10 +1412,12 @@ func applyFieldsToModel(model interface{}, values map[string]reflect.Value) {
 			}
 		}
 		if !ok || !target.CanSet() || !val.Type().AssignableTo(target.Type()) {
+			all = false
 			continue
 		}
 		target.Set(val)
 	}
+	return all
 }
 
 // stepIntoAlloc is stepInto for a write that has already happened: a nil
