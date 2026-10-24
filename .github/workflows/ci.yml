@@ -16,17 +16,6 @@ jobs:
         go-version: ['1.21', '1.22', '1.23']
         mongodb-version: ['6.0', '7.0', '8.0']
 
-    services:
-      mongodb:
-        image: mongo:${{ matrix.mongodb-version }}
-        ports:
-          - 27017:27017
-        options: >-
-          --health-cmd "mongosh --eval 'db.runCommand({ping:1})'"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
     steps:
       - uses: actions/checkout@v4
 
@@ -34,6 +23,27 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go-version }}
+
+      # Transactions, SaveMany's transaction handling, and write concern
+      # errors all need a replica set, so MongoDB runs as a single-node one
+      # rather than as a standalone service container.
+      - name: Start MongoDB ${{ matrix.mongodb-version }} as a single-node replica set
+        run: |
+          docker run -d --name mongo -p 27017:27017 mongo:${{ matrix.mongodb-version }} --replSet rs0 --bind_ip_all
+          for i in $(seq 1 60); do
+            if docker exec mongo mongosh --quiet --eval 'db.runCommand({ping:1}).ok' >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          docker exec mongo mongosh --quiet --eval 'rs.initiate({_id:"rs0",members:[{_id:0,host:"localhost:27017"}]})'
+          for i in $(seq 1 60); do
+            if docker exec mongo mongosh --quiet --eval 'db.hello().isWritablePrimary' 2>/dev/null | grep -q true; then
+              echo "primary ready"; exit 0
+            fi
+            sleep 1
+          done
+          echo "replica set did not become primary" >&2
+          docker logs mongo | tail -50
+          exit 1
 
       - name: Run tests
         run: go test -race -count=1 -coverprofile=coverage.out ./...
