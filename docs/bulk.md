@@ -1,6 +1,6 @@
 # Bulk Operations
 
-goodm provides batch operations for inserting, updating, and deleting multiple documents.
+goodm has two tiers of batch operations, mirroring the single-document API. `CreateMany` and `SaveMany` run the full model lifecycle per item and then write once. `UpdateMany`, `DeleteMany`, and the `Bulk` builder are raw passthroughs for speed.
 
 ## CreateMany
 
@@ -8,45 +8,78 @@ goodm provides batch operations for inserting, updating, and deleting multiple d
 func CreateMany(ctx context.Context, models interface{}, opts ...CreateOptions) error
 ```
 
-Inserts multiple documents with the full ODM lifecycle per model: ID generation, timestamps, hooks, and validation. Uses a single `InsertMany` call to MongoDB.
+Inserts multiple documents with the full ODM lifecycle per model: ID generation, timestamps, defaults, `BeforeCreate`, validation, a single `InsertMany`, then `AfterCreate` for every model that was inserted.
 
 ```go
 users := []User{
     {Email: "alice@example.com", Name: "Alice", Age: 30},
     {Email: "bob@example.com", Name: "Bob", Age: 25},
-    {Email: "carol@example.com", Name: "Carol", Age: 28},
 }
-
 err := goodm.CreateMany(ctx, users)
 ```
 
-Works with both value slices and pointer slices:
+Works with both value slices and pointer slices. After `CreateMany`, each model has its `ID`, `CreatedAt`, and `UpdatedAt` set.
+
+If any model fails its hook or validation, nothing is written:
 
 ```go
-// Also valid
-users := []*User{
-    {Email: "alice@example.com", Name: "Alice", Age: 30},
-    {Email: "bob@example.com", Name: "Bob", Age: 25},
-}
 err := goodm.CreateMany(ctx, users)
+// Error: "goodm: item 1: validation error on email: field is required"
 ```
 
-After `CreateMany`, each model in the slice has its `ID`, `CreatedAt`, and `UpdatedAt` set.
-
-> **Performance:** Hooks (`BeforeCreate`/`AfterCreate`) and validation run per-model. For large batches where you don't need the ODM lifecycle, use the mongo driver's `InsertMany` directly.
-
-### Validation
-
-If any model fails validation, the entire operation is aborted before the database write:
+Write failures such as duplicate keys come back as a `*BulkError`. The insert is ordered by default, so it stops at the first failure. Set `Unordered` to insert everything that can be inserted:
 
 ```go
-users := []User{
-    {Email: "ok@example.com", Name: "OK", Age: 30},
-    {Email: "", Name: "Bad", Age: 30}, // fails: email required
+err := goodm.CreateMany(ctx, users, goodm.CreateOptions{Unordered: true})
+var be *goodm.BulkError
+if errors.As(err, &be) {
+    for _, e := range be.Errors {
+        fmt.Printf("item %d: %v\n", e.Index, e.Err) // e.Err is *DuplicateKeyError here
+    }
+    fmt.Printf("%d inserted\n", be.Result.InsertedCount)
 }
-err := goodm.CreateMany(ctx, users)
-// Error: "goodm: validation failed on item 1: ..."
 ```
+
+## SaveMany
+
+```go
+func SaveMany(ctx context.Context, models interface{}, opts ...UpdateOptions) error
+```
+
+Persists changes to many loaded models in one round trip. Each model goes through the `Update` lifecycle: immutable fields are checked against the stored documents (one query for the whole batch), `BeforeSave` runs, the model is validated, and its `Version` and `UpdatedAt` advance. The replacements are sent as a single unordered bulk write, each guarded by its own version filter, and `AfterSave` runs for every model that was written.
+
+```go
+var tasks []Task
+goodm.Find(ctx, bson.D{{Key: "status", Value: "queued"}}, &tasks)
+for i := range tasks {
+    tasks[i].Status = "scheduled"
+}
+err := goodm.SaveMany(ctx, tasks)
+```
+
+If any model fails its immutable check, hook, or validation, `SaveMany` returns before writing anything. After the write, per-item problems are reported in a `*BulkError`:
+
+| Item error | Meaning |
+|-----------|---------|
+| `ErrVersionConflict` | Another writer changed the document first. The model's in-memory version is refreshed from the database, as `Update` does. |
+| `ErrNotFound` | The document was deleted. |
+| `*DuplicateKeyError` | The replacement violated a unique index. |
+
+Models that succeeded are saved regardless of failures elsewhere in the batch; failed models keep their old version.
+
+```go
+err := goodm.SaveMany(ctx, tasks)
+var be *goodm.BulkError
+if errors.As(err, &be) {
+    for _, e := range be.Errors {
+        if errors.Is(e.Err, goodm.ErrVersionConflict) {
+            // reload tasks[e.Index] and retry
+        }
+    }
+}
+```
+
+`errors.Is(err, goodm.ErrVersionConflict)` on the `*BulkError` itself reports whether any item had that error.
 
 ## UpdateMany
 
@@ -54,7 +87,7 @@ err := goodm.CreateMany(ctx, users)
 func UpdateMany(ctx context.Context, filter, update, model interface{}, opts ...UpdateOptions) (*BulkResult, error)
 ```
 
-Updates all documents matching the filter. The `model` parameter is for collection lookup only.
+Updates all documents matching the filter. The `model` parameter is for collection lookup only. `Upsert`, `ArrayFilters`, `Hint`, and `Collation` from `UpdateOptions` apply.
 
 ```go
 result, err := goodm.UpdateMany(ctx,
@@ -85,9 +118,45 @@ fmt.Printf("Deleted: %d\n", result.DeletedCount)
 
 > **Performance:** Direct passthrough to MongoDB. Bypasses hooks entirely.
 
-## BulkResult
+## Bulk Builder
 
-`UpdateMany` and `DeleteMany` return a `BulkResult`:
+```go
+func NewBulk(model interface{}, opts ...BulkOptions) *Bulk
+```
+
+`Bulk` accumulates heterogeneous writes against one collection and sends them in a single `BulkWrite`. It is a raw passthrough like `UpdateOne`: hooks, validation, timestamps, and versioning do not run, but middleware does (`OpBulkWrite`).
+
+```go
+res, err := goodm.NewBulk(&User{}).
+    InsertOne(&User{Email: "carol@example.com", Name: "Carol"}).
+    UpdateOne(bson.D{{Key: "email", Value: "alice@example.com"}},
+        bson.M{"$set": bson.M{"verified": true}}).
+    UpdateOne(bson.D{{Key: "email", Value: "dave@example.com"}},
+        bson.M{"$set": bson.M{"name": "Dave"}}, goodm.Upsert()).
+    UpdateMany(bson.D{{Key: "role", Value: "guest"}},
+        bson.M{"$set": bson.M{"role": "user"}}).
+    ReplaceOne(bson.D{{Key: "_id", Value: id}}, replacement).
+    DeleteOne(bson.D{{Key: "email", Value: "old@example.com"}}).
+    DeleteMany(bson.D{{Key: "disabled", Value: true}}).
+    Unordered().
+    Execute(ctx)
+```
+
+| Method | Operation |
+|--------|-----------|
+| `InsertOne(doc)` | Insert a model or BSON document |
+| `UpdateOne(filter, update, opts...)` | Update the first match; `UpdateOptions` for upsert, array filters, hint, collation |
+| `UpdateMany(filter, update, opts...)` | Update every match |
+| `ReplaceOne(filter, replacement, opts...)` | Replace the first match |
+| `DeleteOne(filter, opts...)` | Delete the first match |
+| `DeleteMany(filter, opts...)` | Delete every match |
+| `Unordered()` | Continue past failures (default is ordered) |
+| `Len()` | Number of queued operations |
+| `Execute(ctx)` | Send the batch; returns `*BulkResult` |
+
+The driver splits large batches to fit the server's limits, so there is no need to chunk. Inside `WithTransaction`, the bulk write joins the transaction like any other operation.
+
+## BulkResult
 
 ```go
 type BulkResult struct {
@@ -95,13 +164,36 @@ type BulkResult struct {
     MatchedCount  int64
     ModifiedCount int64
     DeletedCount  int64
+    UpsertedCount int64
+    UpsertedIDs   map[int64]interface{} // operation index -> inserted _id
 }
 ```
 
+## BulkError
+
+```go
+type BulkError struct {
+    Collection string
+    Errors     []BulkWriteError // one per failed operation or model
+    Result     *BulkResult      // what did succeed
+}
+
+type BulkWriteError struct {
+    Index   int    // position in the batch
+    Code    int    // server error code, 0 for ODM-level failures
+    Message string
+    Err     error  // *DuplicateKeyError, ErrNotFound, ErrVersionConflict, ...
+}
+```
+
+`errors.Is` and `errors.As` on a `*BulkError` see every item's `Err`, and `be.Failed(i)` reports whether item `i` failed.
+
 ## Comparison
 
-| Operation | Hooks | Validation | Immutable Check | DB Calls |
-|-----------|-------|-----------|----------------|----------|
-| `CreateMany` | Yes (per model) | Yes (per model) | No | 1 InsertMany |
-| `UpdateMany` | No | No | No | 1 UpdateMany |
-| `DeleteMany` | No | No | N/A | 1 DeleteMany |
+| Operation | Hooks | Validation | Immutable Check | Versioning | DB Calls |
+|-----------|-------|-----------|----------------|-----------|----------|
+| `CreateMany` | Yes (per model) | Yes (per model) | No | Sets 0 | 1 InsertMany |
+| `SaveMany` | Yes (per model) | Yes (per model) | Yes (1 query) | Per-document version filter | 1 BulkWrite (+1 verify query on conflicts) |
+| `UpdateMany` | No | No | No | No | 1 UpdateMany |
+| `DeleteMany` | No | No | N/A | No | 1 DeleteMany |
+| `Bulk` | No | No | No | No | 1 BulkWrite |

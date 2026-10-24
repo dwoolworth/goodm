@@ -8,8 +8,8 @@ Hooks are lifecycle callbacks that run before or after CRUD operations. Implemen
 |------|-------------|------|
 | `BeforeCreate` | `Create`, `CreateMany` | Before insert, after timestamps and ID generation |
 | `AfterCreate` | `Create`, `CreateMany` | After successful insert |
-| `BeforeSave` | `Update` | Before replace, after fetching existing doc |
-| `AfterSave` | `Update` | After successful replace |
+| `BeforeSave` | `Update`, `SaveMany` | Before replace, after the immutable check |
+| `AfterSave` | `Update`, `SaveMany` | After successful replace |
 | `BeforeDelete` | `Delete` | Before delete |
 | `AfterDelete` | `Delete` | After successful delete |
 
@@ -98,8 +98,10 @@ ID generation → Timestamps → BeforeCreate → Validate → InsertOne → Aft
 
 For `Update`:
 ```
-Fetch existing → BeforeSave → Immutable check → Validate → UpdatedAt → ReplaceOne → AfterSave
+Fetch existing → Immutable check → BeforeSave → Validate → UpdatedAt/Version → ReplaceOne → AfterSave
 ```
+
+For `SaveMany` the same steps run per model, with one fetch for the whole batch and one bulk replace; `AfterSave` runs only for models that were actually written.
 
 For `Delete`:
 ```
@@ -113,10 +115,14 @@ BeforeDelete → DeleteOne → AfterDelete
 | `Create` | BeforeCreate, AfterCreate | Full lifecycle |
 | `CreateMany` | BeforeCreate, AfterCreate | Per model in the batch |
 | `Update` | BeforeSave, AfterSave | Full lifecycle |
+| `SaveMany` | BeforeSave, AfterSave | Per model in the batch |
 | `Delete` | BeforeDelete, AfterDelete | Full lifecycle |
+| `UpdateFields` | None | Partial $set; validates values |
+| `FindOneAndUpdate` / `FindOneAndReplace` / `FindOneAndDelete` | None | Atomic; manages timestamps and version only |
 | `UpdateOne` | None | Raw passthrough |
 | `DeleteOne` | None | Raw passthrough |
 | `UpdateMany` | None | Raw passthrough |
 | `DeleteMany` | None | Raw passthrough |
+| `Bulk` | None | Raw passthrough |
 | `FindOne` | None | Read-only |
 | `Find` | None | Read-only |

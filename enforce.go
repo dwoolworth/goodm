@@ -113,7 +113,6 @@ func Enforce(ctx context.Context, db *mongo.Database, opts ...EnforceOptions) er
 func enforceSchema(ctx context.Context, db *mongo.Database, schema *Schema, policy IndexMismatchPolicy, probe *prepareUniqueProbe) error {
 	coll := db.Collection(schema.Collection)
 
-	// Get existing indexes
 	existing, err := ListExistingIndexes(ctx, coll)
 	if err != nil {
 		return &EnforcementError{
@@ -122,40 +121,23 @@ func enforceSchema(ctx context.Context, db *mongo.Database, schema *Schema, poli
 		}
 	}
 
-	// Single-field indexes from field tags
-	for _, field := range schema.Fields {
-		if !field.Unique && !field.Index {
-			continue
-		}
-		keys := bson.D{{Key: field.BSONName, Value: 1}}
-		if err := enforceIndex(ctx, coll, schema.Collection, existing, field.BSONName+"_1", keys, field.Unique, policy, probe); err != nil {
+	for _, def := range schema.IndexDefinitions() {
+		if err := enforceIndex(ctx, coll, schema.Collection, existing, def, policy, probe); err != nil {
 			return err
 		}
 	}
-
-	// Compound indexes
-	for _, ci := range schema.CompoundIndexes {
-		keys := bson.D{}
-		for _, f := range ci.Fields {
-			keys = append(keys, bson.E{Key: f, Value: 1})
-		}
-		if err := enforceIndex(ctx, coll, schema.Collection, existing, compoundIndexName(ci), keys, ci.Unique, policy, probe); err != nil {
-			return err
-		}
-	}
-
 	return nil
 }
 
-// enforceIndex ensures a single index exists with the expected keys and options,
-// creating it if missing and handling option mismatches per the policy.
-func enforceIndex(ctx context.Context, coll *mongo.Collection, collection string, existing map[string]IndexSpec, name string, keys bson.D, unique bool, policy IndexMismatchPolicy, probe *prepareUniqueProbe) error {
-	spec, exists := existing[name]
+// enforceIndex ensures one index exists exactly as defined, creating it if
+// missing and handling option mismatches per the policy.
+func enforceIndex(ctx context.Context, coll *mongo.Collection, collection string, existing map[string]IndexSpec, def IndexDefinition, policy IndexMismatchPolicy, probe *prepareUniqueProbe) error {
+	spec, exists := existing[def.Name]
 	if !exists {
-		return createIndex(ctx, coll, collection, name, keys, unique)
+		return createIndex(ctx, coll, collection, def)
 	}
 
-	mismatch := describeIndexMismatch(spec, keys, unique)
+	mismatch := describeIndexMismatch(spec, def)
 	if mismatch == "" || policy == IndexMismatchIgnore {
 		return nil
 	}
@@ -163,85 +145,99 @@ func enforceIndex(ctx context.Context, coll *mongo.Collection, collection string
 	if policy == IndexMismatchError {
 		return &EnforcementError{
 			Collection: collection,
-			Message:    fmt.Sprintf("index %s exists but %s (use IndexMismatchRebuild to rebuild it)", name, mismatch),
+			Message:    fmt.Sprintf("index %s exists but %s (use IndexMismatchRebuild to rebuild it)", def.Name, mismatch),
 		}
 	}
 
 	// IndexMismatchRebuild. A unique index can only be built over unique data.
 	// Check before touching the index so a failure here is a read-only no-op.
-	if unique {
-		hasDups, err := hasDuplicateValues(ctx, coll, keys)
+	if def.Unique {
+		hasDups, err := hasDuplicateValues(ctx, coll, def)
 		if err != nil {
 			return &EnforcementError{
 				Collection: collection,
-				Message:    fmt.Sprintf("failed to check for duplicates before rebuilding index %s: %v", name, err),
+				Message:    fmt.Sprintf("failed to check for duplicates before rebuilding index %s: %v", def.Name, err),
 			}
 		}
 		if hasDups {
 			return &EnforcementError{
 				Collection: collection,
-				Message:    fmt.Sprintf("cannot rebuild index %s as unique: collection contains duplicate values; existing index left in place", name),
+				Message:    fmt.Sprintf("cannot rebuild index %s as unique: collection contains duplicate values; existing index left in place", def.Name),
 			}
 		}
 	}
 
-	if canRevertPrepareUniqueInPlace(spec, keys, unique) {
-		if err := collModIndex(ctx, coll, name, "prepareUnique", false); err != nil {
+	if canRevertPrepareUniqueInPlace(spec, def) {
+		if err := collModIndex(ctx, coll, def.Name, "prepareUnique", false); err != nil {
 			return &EnforcementError{
 				Collection: collection,
-				Message:    fmt.Sprintf("failed to clear prepareUnique on index %s: %v", name, err),
+				Message:    fmt.Sprintf("failed to clear prepareUnique on index %s: %v", def.Name, err),
 			}
 		}
 		return nil
 	}
 
-	if canConvertToUniqueInPlace(spec, keys, unique) {
+	if canConvertToUniqueInPlace(spec, def) {
 		supported, err := probe.ok(ctx)
 		if err != nil {
 			return &EnforcementError{
 				Collection: collection,
-				Message:    fmt.Sprintf("cannot determine whether the server supports in-place unique conversion of index %s: %v", name, err),
+				Message:    fmt.Sprintf("cannot determine whether the server supports in-place unique conversion of index %s: %v", def.Name, err),
 			}
 		}
 		if supported {
-			converted, err := convertIndexToUnique(ctx, coll, collection, name)
+			converted, err := convertIndexToUnique(ctx, coll, collection, def.Name)
 			if err != nil || converted {
 				return err
 			}
 		}
 	}
 
-	if err := coll.Indexes().DropOne(ctx, name); err != nil {
+	if err := coll.Indexes().DropOne(ctx, def.Name); err != nil {
 		return &EnforcementError{
 			Collection: collection,
-			Message:    fmt.Sprintf("failed to drop mismatched index %s: %v", name, err),
+			Message:    fmt.Sprintf("failed to drop mismatched index %s: %v", def.Name, err),
 		}
 	}
-	if err := createIndex(ctx, coll, collection, name, keys, unique); err != nil {
+	if err := createIndex(ctx, coll, collection, def); err != nil {
 		return &EnforcementError{
 			Collection: collection,
-			Message:    fmt.Sprintf("index %s was dropped but recreate failed: %v", name, err),
+			Message:    fmt.Sprintf("index %s was dropped but recreate failed: %v", def.Name, err),
 		}
 	}
 	return nil
 }
 
+// optionsMatchExceptUnique reports whether an existing index matches the
+// definition in every respect other than the unique flag.
+func optionsMatchExceptUnique(spec IndexSpec, def IndexDefinition) bool {
+	return indexKeysEqual(spec.Keys, def.Keys) &&
+		spec.Sparse == def.Sparse &&
+		!spec.Hidden &&
+		ttlEqual(spec.ExpireAfterSeconds, def.ExpireAfterSeconds) &&
+		partialFiltersEqual(def.PartialFilter, spec.PartialFilter) &&
+		collationsEqual(def.Collation, spec.Collation)
+}
+
 // canConvertToUniqueInPlace reports whether the only difference between the
-// existing index and the schema is the unique flag. collMod can only add
-// uniqueness; it cannot change keys, sparse, partial filters, or remove unique.
-// Indexes carrying options the schema never sets (collation, TTL, hidden) are
-// excluded so the conversion does not silently keep them; drop+create
-// normalizes those to a plain unique index as it always has.
-func canConvertToUniqueInPlace(spec IndexSpec, keys bson.D, unique bool) bool {
-	return unique && !spec.Unique && !spec.Sparse && !spec.HasPartialFilter &&
-		!spec.HasCollation && !spec.HasTTL && !spec.Hidden && indexKeysEqual(spec.Keys, keys)
+// existing index and the schema is that the schema wants it unique. collMod
+// can only add uniqueness; every other difference needs a rebuild.
+func canConvertToUniqueInPlace(spec IndexSpec, def IndexDefinition) bool {
+	return def.Unique && !spec.Unique && optionsMatchExceptUnique(spec, def)
 }
 
 // canRevertPrepareUniqueInPlace reports whether the only mismatch is a stale
 // prepareUnique on an index the schema wants non-unique; clearing the flag
 // fixes that without a rebuild.
-func canRevertPrepareUniqueInPlace(spec IndexSpec, keys bson.D, unique bool) bool {
-	return !unique && spec.PrepareUnique && !spec.Unique && indexKeysEqual(spec.Keys, keys)
+func canRevertPrepareUniqueInPlace(spec IndexSpec, def IndexDefinition) bool {
+	return !def.Unique && spec.PrepareUnique && !spec.Unique && optionsMatchExceptUnique(spec, def)
+}
+
+func ttlEqual(a, b *int32) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
 }
 
 // codeCannotConvertIndexToUnique is the server error code returned by
@@ -374,87 +370,92 @@ func supportsPrepareUnique(ctx context.Context, db *mongo.Database) (bool, error
 	return n >= 6, nil
 }
 
-func createIndex(ctx context.Context, coll *mongo.Collection, collection, name string, keys bson.D, unique bool) error {
-	model := mongo.IndexModel{Keys: keys}
-	if unique {
-		model.Options = options.Index().SetUnique(true)
-	}
-	if _, err := coll.Indexes().CreateOne(ctx, model); err != nil {
+func createIndex(ctx context.Context, coll *mongo.Collection, collection string, def IndexDefinition) error {
+	if _, err := coll.Indexes().CreateOne(ctx, def.Model()); err != nil {
 		return &EnforcementError{
 			Collection: collection,
-			Message:    fmt.Sprintf("failed to create index %s: %v", name, err),
+			Message:    fmt.Sprintf("failed to create index %s: %v", def.Name, err),
 		}
 	}
 	return nil
 }
 
 // describeIndexMismatch returns a human-readable description of how an existing
-// index differs from what the schema expects, or "" if it matches.
-func describeIndexMismatch(spec IndexSpec, keys bson.D, unique bool) string {
-	if !indexKeysEqual(spec.Keys, keys) {
+// index differs from the definition, or "" if it matches.
+func describeIndexMismatch(spec IndexSpec, def IndexDefinition) string {
+	if !indexKeysEqual(spec.Keys, def.Keys) {
 		return "has different keys than the schema expects"
 	}
-	if unique && !spec.Unique {
+	if def.Unique && !spec.Unique {
 		if spec.PrepareUnique {
 			return "is prepareUnique but not yet unique: new duplicates are already rejected (schema requires unique)"
 		}
 		return "is not unique (schema requires unique)"
 	}
-	if !unique && spec.Unique {
+	if !def.Unique && spec.Unique {
 		return "is unique (schema expects non-unique)"
 	}
-	if !unique && spec.PrepareUnique {
+	if !def.Unique && spec.PrepareUnique {
 		return "is prepareUnique: new duplicates are rejected (schema expects non-unique)"
 	}
-	if unique && spec.Sparse {
-		return "is sparse (schema requires a plain unique index)"
+	if spec.Sparse != def.Sparse {
+		if spec.Sparse {
+			return "is sparse (schema expects non-sparse)"
+		}
+		return "is not sparse (schema requires sparse)"
 	}
-	if unique && spec.HasPartialFilter {
-		return "is partial (schema requires a plain unique index)"
+	if !ttlEqual(spec.ExpireAfterSeconds, def.ExpireAfterSeconds) {
+		switch {
+		case def.ExpireAfterSeconds == nil:
+			return "is a TTL index (schema expects no TTL)"
+		case spec.ExpireAfterSeconds == nil:
+			return "is not a TTL index (schema requires ttl)"
+		default:
+			return fmt.Sprintf("expires after %ds (schema requires %ds)", *spec.ExpireAfterSeconds, *def.ExpireAfterSeconds)
+		}
+	}
+	if !partialFiltersEqual(def.PartialFilter, spec.PartialFilter) {
+		if def.PartialFilter == nil {
+			return "is partial (schema expects no partial filter)"
+		}
+		return "has a different partial filter than the schema expects"
+	}
+	if !collationsEqual(def.Collation, spec.Collation) {
+		if def.Collation == nil {
+			return "has a collation (schema expects none)"
+		}
+		return "has a different collation than the schema expects"
+	}
+	if spec.Hidden {
+		return "is hidden"
 	}
 	return ""
 }
 
-func indexKeysEqual(a, b bson.D) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i].Key != b[i].Key || indexDirection(a[i].Value) != indexDirection(b[i].Value) {
-			return false
-		}
-	}
-	return true
-}
-
-// indexDirection normalizes an index key direction to int. Non-numeric values
-// (text/hashed indexes) normalize to 0 and thus never match a schema index.
-func indexDirection(v interface{}) int {
-	switch n := v.(type) {
-	case int:
-		return n
-	case int32:
-		return int(n)
-	case int64:
-		return int(n)
-	case float64:
-		return int(n)
-	}
-	return 0
-}
-
 // hasDuplicateValues reports whether any two documents would collide under a
-// unique index on keys. It mirrors unique-index semantics as closely as an
-// aggregation can: array fields are unwound so each element is its own entry,
-// duplicate elements within one document do not count, and missing fields
-// group as null. Empty arrays also group as null, so an empty array and a
-// missing field are reported as a collision the server would not raise; that
-// only errs toward refusing a rebuild, never toward an unsafe one.
-func hasDuplicateValues(ctx context.Context, coll *mongo.Collection, keys bson.D) (bool, error) {
+// unique index with the given definition. It mirrors unique-index semantics as
+// closely as an aggregation can: a partial filter restricts the candidates,
+// sparse indexes skip documents missing every key, array fields are unwound so
+// each element is its own entry, duplicate elements within one document do not
+// count, and missing fields group as null. Empty arrays also group as null, so
+// an empty array and a missing field are reported as a collision the server
+// would not raise; that only errs toward refusing a rebuild, never toward an
+// unsafe one.
+func hasDuplicateValues(ctx context.Context, coll *mongo.Collection, def IndexDefinition) (bool, error) {
 	pipeline := mongo.Pipeline{}
+	if def.PartialFilter != nil {
+		pipeline = append(pipeline, bson.D{{Key: "$match", Value: def.PartialFilter}})
+	}
+	if def.Sparse {
+		present := bson.A{}
+		for _, k := range def.Keys {
+			present = append(present, bson.D{{Key: k.Key, Value: bson.D{{Key: "$exists", Value: true}}}})
+		}
+		pipeline = append(pipeline, bson.D{{Key: "$match", Value: bson.D{{Key: "$or", Value: present}}}})
+	}
 	perDoc := bson.D{{Key: "doc", Value: "$_id"}}
 	perValue := bson.D{}
-	for i, k := range keys {
+	for i, k := range def.Keys {
 		// Positional names: $group _id field names cannot contain dots, and
 		// mapping "a.b" to "a_b" could collide with a real "a_b" key.
 		field := "k" + strconv.Itoa(i)
@@ -474,7 +475,11 @@ func hasDuplicateValues(ctx context.Context, coll *mongo.Collection, keys bson.D
 		bson.D{{Key: "$match", Value: bson.D{{Key: "n", Value: bson.D{{Key: "$gt", Value: 1}}}}}},
 		bson.D{{Key: "$limit", Value: 1}},
 	)
-	cursor, err := coll.Aggregate(ctx, pipeline)
+	aggOpts := options.Aggregate()
+	if def.Collation != nil {
+		aggOpts.SetCollation(def.Collation)
+	}
+	cursor, err := coll.Aggregate(ctx, pipeline, aggOpts)
 	if err != nil {
 		return false, err
 	}
@@ -527,15 +532,18 @@ func DetectDrift(ctx context.Context, db *mongo.Database, schema *Schema, sample
 
 // IndexSpec describes an existing index on a collection.
 type IndexSpec struct {
-	Name             string
-	Keys             bson.D
-	Unique           bool
-	PrepareUnique    bool // collMod prepareUnique is set: not unique, but new duplicates are rejected
-	Sparse           bool
-	HasPartialFilter bool // index has a partialFilterExpression
-	HasCollation     bool
-	HasTTL           bool // index has expireAfterSeconds
-	Hidden           bool
+	Name               string
+	Keys               bson.D // for text indexes, the weighted fields appear as field: "text"
+	Unique             bool
+	PrepareUnique      bool // collMod prepareUnique is set: not unique, but new duplicates are rejected
+	Sparse             bool
+	HasPartialFilter   bool // index has a partialFilterExpression
+	HasCollation       bool
+	HasTTL             bool // index has expireAfterSeconds
+	Hidden             bool
+	ExpireAfterSeconds *int32   // TTL in seconds when HasTTL
+	PartialFilter      bson.Raw // raw partialFilterExpression when HasPartialFilter
+	Collation          bson.Raw // raw collation document when HasCollation
 }
 
 // ListExistingIndexes returns the indexes that exist on the collection, keyed
@@ -558,8 +566,9 @@ func ListExistingIndexes(ctx context.Context, coll *mongo.Collection) (map[strin
 			Sparse                  bool     `bson:"sparse"`
 			PartialFilterExpression bson.Raw `bson:"partialFilterExpression"`
 			Collation               bson.Raw `bson:"collation"`
-			ExpireAfterSeconds      *int64   `bson:"expireAfterSeconds"`
+			ExpireAfterSeconds      *int32   `bson:"expireAfterSeconds"`
 			Hidden                  bool     `bson:"hidden"`
+			Weights                 bson.D   `bson:"weights"`
 		}
 		if err := cursor.Decode(&idx); err != nil {
 			continue
@@ -568,25 +577,44 @@ func ListExistingIndexes(ctx context.Context, coll *mongo.Collection) (map[strin
 			continue
 		}
 		result[idx.Name] = IndexSpec{
-			Name:             idx.Name,
-			Keys:             idx.Key,
-			Unique:           idx.Unique,
-			PrepareUnique:    idx.PrepareUnique,
-			Sparse:           idx.Sparse,
-			HasPartialFilter: len(idx.PartialFilterExpression) > 0,
-			HasCollation:     len(idx.Collation) > 0,
-			HasTTL:           idx.ExpireAfterSeconds != nil,
-			Hidden:           idx.Hidden,
+			Name:               idx.Name,
+			Keys:               normalizeTextKeys(idx.Key, idx.Weights),
+			Unique:             idx.Unique,
+			PrepareUnique:      idx.PrepareUnique,
+			Sparse:             idx.Sparse,
+			HasPartialFilter:   len(idx.PartialFilterExpression) > 0,
+			HasCollation:       len(idx.Collation) > 0,
+			HasTTL:             idx.ExpireAfterSeconds != nil,
+			Hidden:             idx.Hidden,
+			ExpireAfterSeconds: idx.ExpireAfterSeconds,
+			PartialFilter:      idx.PartialFilterExpression,
+			Collation:          idx.Collation,
 		}
 	}
 
 	return result, nil
 }
 
-func compoundIndexName(ci CompoundIndex) string {
-	parts := make([]string, 0, len(ci.Fields)*2)
-	for _, f := range ci.Fields {
-		parts = append(parts, f, "1")
+// normalizeTextKeys rewrites the server's internal text index key form
+// ({_fts: "text", _ftsx: 1} plus a weights document) back into the
+// {field: "text"} form a schema declares, so the two compare equal.
+func normalizeTextKeys(keys bson.D, weights bson.D) bson.D {
+	if len(weights) == 0 {
+		return keys
 	}
-	return strings.Join(parts, "_")
+	out := make(bson.D, 0, len(keys)+len(weights))
+	inserted := false
+	for _, k := range keys {
+		if k.Key == "_fts" || k.Key == "_ftsx" {
+			if !inserted {
+				for _, w := range weights {
+					out = append(out, bson.E{Key: w.Key, Value: "text"})
+				}
+				inserted = true
+			}
+			continue
+		}
+		out = append(out, k)
+	}
+	return out
 }

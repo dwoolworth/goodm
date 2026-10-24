@@ -3,6 +3,7 @@ package goodm
 import (
 	"fmt"
 	"reflect"
+	"strconv"
 )
 
 // Validate checks a model instance against its schema.
@@ -40,24 +41,26 @@ func validateFields(v reflect.Value, fields []FieldSchema, pathPrefix string) []
 			})
 		}
 
-		// Enum: value must be in the allowed set
+		// Enum: value must be in the allowed set. A zero value is treated as
+		// unset here; combine with required to reject it.
 		if len(fs.Enum) > 0 && !fv.IsZero() {
 			if err := validateEnum(fv, fs.Enum, fieldPath); err != nil {
 				errs = append(errs, *err)
 			}
 		}
 
-		// Min: numeric or string length lower bound
-		if fs.Min != nil && !fv.IsZero() {
-			if err := validateMin(fv, *fs.Min, fieldPath); err != nil {
-				errs = append(errs, *err)
+		// Min/Max apply to every present value, including the zero value: a
+		// field tagged min=1 must reject 0. Only a nil pointer counts as absent.
+		if (fs.Min != nil || fs.Max != nil) && !isNilPointer(fv) {
+			if fs.Min != nil {
+				if err := validateMin(fv, *fs.Min, fieldPath); err != nil {
+					errs = append(errs, *err)
+				}
 			}
-		}
-
-		// Max: numeric or string length upper bound
-		if fs.Max != nil && !fv.IsZero() {
-			if err := validateMax(fv, *fs.Max, fieldPath); err != nil {
-				errs = append(errs, *err)
+			if fs.Max != nil {
+				if err := validateMax(fv, *fs.Max, fieldPath); err != nil {
+					errs = append(errs, *err)
+				}
 			}
 		}
 
@@ -82,44 +85,75 @@ func validateEnum(fv reflect.Value, enum []string, fieldPath string) *Validation
 	}
 }
 
-// validateMin checks that fv meets the minimum length (strings) or value (numerics).
-func validateMin(fv reflect.Value, min int, fieldPath string) *ValidationError {
-	if fv.Kind() == reflect.String {
-		if fv.Len() < min {
+// isNilPointer reports whether v is a nil pointer (an absent optional value).
+func isNilPointer(v reflect.Value) bool {
+	return v.Kind() == reflect.Pointer && v.IsNil()
+}
+
+// validateMin checks that fv meets the minimum length (strings, slices, maps)
+// or value (numerics). Non-numeric, non-measurable kinds are skipped.
+func validateMin(fv reflect.Value, min float64, fieldPath string) *ValidationError {
+	fv = derefValue(fv)
+	if n, ok := lengthOf(fv); ok {
+		if float64(n) < min {
 			return &ValidationError{
 				Field:   fieldPath,
-				Message: fmt.Sprintf("length %d is less than minimum %d", fv.Len(), min),
+				Message: fmt.Sprintf("length %d is less than minimum %s", n, formatBound(min)),
 			}
 		}
-	} else if intVal, ok := toInt(fv); ok {
-		if intVal < min {
-			return &ValidationError{
-				Field:   fieldPath,
-				Message: fmt.Sprintf("value %d is less than minimum %d", intVal, min),
-			}
+		return nil
+	}
+	if num, ok := toFloat(fv); ok && num < min {
+		return &ValidationError{
+			Field:   fieldPath,
+			Message: fmt.Sprintf("value %s is less than minimum %s", formatBound(num), formatBound(min)),
 		}
 	}
 	return nil
 }
 
-// validateMax checks that fv does not exceed the maximum length (strings) or value (numerics).
-func validateMax(fv reflect.Value, max int, fieldPath string) *ValidationError {
-	if fv.Kind() == reflect.String {
-		if fv.Len() > max {
+// validateMax checks that fv does not exceed the maximum length (strings,
+// slices, maps) or value (numerics).
+func validateMax(fv reflect.Value, max float64, fieldPath string) *ValidationError {
+	fv = derefValue(fv)
+	if n, ok := lengthOf(fv); ok {
+		if float64(n) > max {
 			return &ValidationError{
 				Field:   fieldPath,
-				Message: fmt.Sprintf("length %d exceeds maximum %d", fv.Len(), max),
+				Message: fmt.Sprintf("length %d exceeds maximum %s", n, formatBound(max)),
 			}
 		}
-	} else if intVal, ok := toInt(fv); ok {
-		if intVal > max {
-			return &ValidationError{
-				Field:   fieldPath,
-				Message: fmt.Sprintf("value %d exceeds maximum %d", intVal, max),
-			}
+		return nil
+	}
+	if num, ok := toFloat(fv); ok && num > max {
+		return &ValidationError{
+			Field:   fieldPath,
+			Message: fmt.Sprintf("value %s exceeds maximum %s", formatBound(num), formatBound(max)),
 		}
 	}
 	return nil
+}
+
+// derefValue follows a non-nil pointer to its element.
+func derefValue(v reflect.Value) reflect.Value {
+	if v.Kind() == reflect.Pointer && !v.IsNil() {
+		return v.Elem()
+	}
+	return v
+}
+
+// lengthOf returns the length of strings, slices, arrays, and maps.
+func lengthOf(v reflect.Value) (int, bool) {
+	switch v.Kind() {
+	case reflect.String, reflect.Slice, reflect.Array, reflect.Map:
+		return v.Len(), true
+	}
+	return 0, false
+}
+
+// formatBound renders a bound without a trailing ".0" for whole numbers.
+func formatBound(f float64) string {
+	return strconv.FormatFloat(f, 'f', -1, 64)
 }
 
 // validateSubFields dispatches subdocument validation for struct and slice fields.
@@ -167,15 +201,15 @@ func stringValue(v reflect.Value) string {
 	return fmt.Sprintf("%v", v.Interface())
 }
 
-// toInt attempts to extract an integer value from a reflect.Value.
-func toInt(v reflect.Value) (int, bool) {
+// toFloat extracts a numeric value from a reflect.Value as float64.
+func toFloat(v reflect.Value) (float64, bool) {
 	switch v.Kind() {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return int(v.Int()), true
+		return float64(v.Int()), true
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		return int(v.Uint()), true
+		return float64(v.Uint()), true
 	case reflect.Float32, reflect.Float64:
-		return int(v.Float()), true
+		return v.Float(), true
 	default:
 		return 0, false
 	}

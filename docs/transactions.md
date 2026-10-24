@@ -52,13 +52,20 @@ goodm.WithTransaction(outerCtx, func(ctx context.Context) error {
 })
 ```
 
+## Nested Calls
+
+If the context already carries a session, a nested `WithTransaction` runs its callback inside the existing transaction instead of starting a second one. An error from the inner callback therefore aborts the whole outer transaction, and the inner writes are never committed on their own. This lets helpers that wrap themselves in `WithTransaction` be composed freely.
+
 ## Options
 
-Override the database connection:
+Override the database connection or pass driver transaction options (read concern, write concern, read preference, max commit time):
 
 ```go
 goodm.WithTransaction(ctx, fn, goodm.TransactionOptions{
     DB: otherDB,
+    Transaction: options.Transaction().
+        SetReadConcern(readconcern.Snapshot()).
+        SetWriteConcern(writeconcern.Majority()),
 })
 ```
 

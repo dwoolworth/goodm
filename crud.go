@@ -2,8 +2,11 @@ package goodm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
+	"strconv"
+	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -32,24 +35,40 @@ func getCollection(db *mongo.Database, schema *Schema) *mongo.Collection {
 	return db.Collection(schema.Collection, collOpts)
 }
 
-// CreateOptions configures the Create operation.
+// CreateOptions configures Create and CreateMany.
 type CreateOptions struct {
 	DB *mongo.Database
+
+	// Unordered lets CreateMany continue inserting after a failure instead of
+	// stopping at the first error. Failures are reported in a *BulkError.
+	Unordered bool
 }
 
-// FindOptions configures Find, FindOne, and FindCursor operations.
+// FindOptions configures Find, FindOne, FindCursor, FindByID, Count, Exists,
+// Distinct, and FindOneAndDelete.
 type FindOptions struct {
-	DB    *mongo.Database
-	Limit int64
-	Skip  int64
-	Sort  bson.D
+	DB         *mongo.Database
+	Limit      int64
+	Skip       int64
+	Sort       bson.D
+	Projection interface{}        // fields to include or exclude, e.g. bson.D{{Key: "email", Value: 1}}
+	Hint       interface{}        // index name or key document to use
+	Collation  *options.Collation // collation for string comparison
+	BatchSize  int32              // documents per cursor batch (Find, FindCursor)
 }
 
-// UpdateOptions configures the Update operation.
+// UpdateOptions configures Update, UpdateFields, UpdateOne, UpdateMany, and
+// the update operations of a Bulk.
 type UpdateOptions struct {
 	DB         *mongo.Database
-	Unset      []string // bson field names to remove from the document
-	MaxRetries int      // retry with 3-way merge on version conflict (0 = no retry)
+	Unset      []string // Update only: bson field names to remove from the document
+	MaxRetries int      // Update only: retry with 3-way merge on version conflict (0 = no retry)
+
+	// Raw operations (UpdateOne, UpdateMany, Bulk) only:
+	Upsert       bool               // insert a new document when the filter matches nothing
+	ArrayFilters []interface{}      // filters for positional $[<identifier>] operators
+	Hint         interface{}        // index name or key document to use
+	Collation    *options.Collation // collation for string comparison
 }
 
 // UnsetFields returns UpdateOptions that will remove the specified fields from
@@ -75,13 +94,42 @@ func WithRetry(maxRetries int) UpdateOptions {
 	return UpdateOptions{MaxRetries: maxRetries}
 }
 
-// DeleteOptions configures the Delete operation.
-type DeleteOptions struct {
-	DB *mongo.Database
+// Upsert returns UpdateOptions that insert a new document when the filter
+// matches nothing. For UpdateOne, UpdateMany, FindOneAndUpdate, and Bulk.
+//
+// Example:
+//
+//	goodm.UpdateOne(ctx, filter, update, &User{}, goodm.Upsert())
+func Upsert() UpdateOptions {
+	return UpdateOptions{Upsert: true}
 }
 
-// Create inserts a new document. It generates an ID if zero, sets timestamps,
-// runs BeforeCreate/AfterCreate hooks, and validates against the schema.
+// DeleteOptions configures Delete, DeleteOne, DeleteMany, and the delete
+// operations of a Bulk.
+type DeleteOptions struct {
+	DB        *mongo.Database
+	Hint      interface{}        // index name or key document to use
+	Collation *options.Collation // collation for string comparison
+}
+
+// FindOneAndUpdateOptions configures FindOneAndUpdate and FindOneAndReplace.
+type FindOneAndUpdateOptions struct {
+	DB             *mongo.Database
+	Upsert         bool               // insert when the filter matches nothing
+	ReturnOriginal bool               // decode the document as it was before the update (default: after)
+	Sort           bson.D             // which document to update when several match
+	Projection     interface{}        // fields to decode into result
+	ArrayFilters   []interface{}      // FindOneAndUpdate only
+	Hint           interface{}        // index name or key document to use
+	Collation      *options.Collation // collation for string comparison
+}
+
+// Create inserts a new document. It generates an ObjectID if the ID is zero,
+// sets timestamps, applies defaults, runs BeforeCreate/AfterCreate hooks, and
+// validates against the schema.
+//
+// Models whose _id is not a bson.ObjectID must set it themselves, either
+// before calling Create or in a BeforeCreate hook.
 func Create(ctx context.Context, model interface{}, opts ...CreateOptions) error {
 	schema, err := getSchemaForModel(model)
 	if err != nil {
@@ -101,42 +149,13 @@ func Create(ctx context.Context, model interface{}, opts ...CreateOptions) error
 			return err
 		}
 
-		// Set ID if zero
-		id, err := getModelID(model)
-		if err != nil {
-			return err
-		}
-		if id.IsZero() {
-			setModelID(model, bson.NewObjectID())
-		}
-
-		// Set timestamps
-		setTimestamps(model, time.Now())
-
-		// Apply schema defaults to zero-valued fields
-		if err := applyDefaults(model, schema); err != nil {
+		if err := prepareCreate(ctx, schema, model, time.Now()); err != nil {
 			return err
 		}
 
-		// Initialize version to 0
-		setModelVersion(model, 0)
-
-		// BeforeCreate hook
-		if hook, ok := model.(BeforeCreate); ok {
-			if err := hook.BeforeCreate(ctx); err != nil {
-				return err
-			}
-		}
-
-		// Validate
-		if errs := Validate(model, schema); len(errs) > 0 {
-			return ValidationErrors(errs)
-		}
-
-		// Insert
 		coll := getCollection(db, schema)
 		if _, err := coll.InsertOne(ctx, model); err != nil {
-			return fmt.Errorf("goodm: insert failed: %w", err)
+			return translateWriteError(err, schema, "insert failed")
 		}
 
 		// AfterCreate hook
@@ -150,6 +169,33 @@ func Create(ctx context.Context, model interface{}, opts ...CreateOptions) error
 	})
 }
 
+// prepareCreate runs the pre-insert lifecycle on a model: ID generation,
+// timestamps, defaults, version, BeforeCreate, and validation.
+func prepareCreate(ctx context.Context, schema *Schema, model interface{}, now time.Time) error {
+	if err := assignObjectID(schema, model); err != nil {
+		return err
+	}
+	setTimestamps(model, now)
+	if err := applyDefaults(model, schema); err != nil {
+		return err
+	}
+	setModelVersion(model, 0)
+
+	if hook, ok := model.(BeforeCreate); ok {
+		if err := hook.BeforeCreate(ctx); err != nil {
+			return err
+		}
+	}
+
+	if err := requireID(schema, model); err != nil {
+		return err
+	}
+	if errs := Validate(model, schema); len(errs) > 0 {
+		return ValidationErrors(errs)
+	}
+	return nil
+}
+
 // FindOne finds a single document matching filter and decodes it into result.
 // Returns ErrNotFound if no document matches.
 func FindOne(ctx context.Context, filter interface{}, result interface{}, opts ...FindOptions) error {
@@ -158,22 +204,23 @@ func FindOne(ctx context.Context, filter interface{}, result interface{}, opts .
 		return err
 	}
 
-	return runMiddleware(ctx, &OpInfo{
+	info := &OpInfo{
 		Operation: OpFind, Collection: schema.Collection,
 		ModelName: schema.ModelName, Model: result, Filter: filter,
-	}, func(ctx context.Context) error {
-		var optDB *mongo.Database
+	}
+	return runMiddleware(ctx, info, func(ctx context.Context) error {
+		var opt FindOptions
 		if len(opts) > 0 {
-			optDB = opts[0].DB
+			opt = opts[0]
 		}
-		db, err := getDB(optDB)
+		db, err := getDB(opt.DB)
 		if err != nil {
 			return err
 		}
 
 		coll := getCollection(db, schema)
-		if err := coll.FindOne(ctx, filter).Decode(result); err != nil {
-			if err == mongo.ErrNoDocuments {
+		if err := coll.FindOne(ctx, info.Filter, findOneOptions(opt)).Decode(result); err != nil {
+			if errors.Is(err, mongo.ErrNoDocuments) {
 				return ErrNotFound
 			}
 			return fmt.Errorf("goodm: find one failed: %w", err)
@@ -181,6 +228,21 @@ func FindOne(ctx context.Context, filter interface{}, result interface{}, opts .
 
 		return nil
 	})
+}
+
+// FindByID finds the document with the given _id and decodes it into result.
+// When the model's ID is a bson.ObjectID, id may also be its hex string.
+// Returns ErrNotFound if no document matches.
+func FindByID(ctx context.Context, id interface{}, result interface{}, opts ...FindOptions) error {
+	schema, err := getSchemaForModel(result)
+	if err != nil {
+		return err
+	}
+	id, err = coerceID(schema, id)
+	if err != nil {
+		return err
+	}
+	return FindOne(ctx, bson.D{{Key: "_id", Value: id}}, result, opts...)
 }
 
 // Find finds all documents matching filter and decodes them into results.
@@ -192,17 +254,16 @@ func Find(ctx context.Context, filter interface{}, results interface{}, opts ...
 		return fmt.Errorf("goodm: results must be a pointer to a slice, got %T", results)
 	}
 
-	elemType := rv.Elem().Type().Elem()
-	tmpPtr := reflect.New(elemType)
-	schema, err := getSchemaForModel(tmpPtr.Interface())
+	schema, err := getSchemaForModel(results)
 	if err != nil {
 		return err
 	}
 
-	return runMiddleware(ctx, &OpInfo{
+	info := &OpInfo{
 		Operation: OpFind, Collection: schema.Collection,
 		ModelName: schema.ModelName, Filter: filter,
-	}, func(ctx context.Context) error {
+	}
+	return runMiddleware(ctx, info, func(ctx context.Context) error {
 		var opt FindOptions
 		if len(opts) > 0 {
 			opt = opts[0]
@@ -212,19 +273,8 @@ func Find(ctx context.Context, filter interface{}, results interface{}, opts ...
 			return err
 		}
 
-		findOpts := options.Find()
-		if opt.Limit > 0 {
-			findOpts.SetLimit(opt.Limit)
-		}
-		if opt.Skip > 0 {
-			findOpts.SetSkip(opt.Skip)
-		}
-		if opt.Sort != nil {
-			findOpts.SetSort(opt.Sort)
-		}
-
 		coll := getCollection(db, schema)
-		cursor, err := coll.Find(ctx, filter, findOpts)
+		cursor, err := coll.Find(ctx, info.Filter, findOptions(opt))
 		if err != nil {
 			return fmt.Errorf("goodm: find failed: %w", err)
 		}
@@ -247,10 +297,11 @@ func FindCursor(ctx context.Context, filter interface{}, model interface{}, opts
 	}
 
 	var cursor *mongo.Cursor
-	err = runMiddleware(ctx, &OpInfo{
+	info := &OpInfo{
 		Operation: OpFind, Collection: schema.Collection,
 		ModelName: schema.ModelName, Model: model, Filter: filter,
-	}, func(ctx context.Context) error {
+	}
+	err = runMiddleware(ctx, info, func(ctx context.Context) error {
 		var opt FindOptions
 		if len(opts) > 0 {
 			opt = opts[0]
@@ -260,19 +311,8 @@ func FindCursor(ctx context.Context, filter interface{}, model interface{}, opts
 			return err
 		}
 
-		findOpts := options.Find()
-		if opt.Limit > 0 {
-			findOpts.SetLimit(opt.Limit)
-		}
-		if opt.Skip > 0 {
-			findOpts.SetSkip(opt.Skip)
-		}
-		if opt.Sort != nil {
-			findOpts.SetSort(opt.Sort)
-		}
-
 		coll := getCollection(db, schema)
-		c, err := coll.Find(ctx, filter, findOpts)
+		c, err := coll.Find(ctx, info.Filter, findOptions(opt))
 		if err != nil {
 			return fmt.Errorf("goodm: find cursor failed: %w", err)
 		}
@@ -283,6 +323,126 @@ func FindCursor(ctx context.Context, filter interface{}, model interface{}, opts
 	return cursor, err
 }
 
+// Count returns the number of documents matching filter. Limit, Skip, Hint,
+// and Collation from FindOptions apply.
+func Count(ctx context.Context, filter interface{}, model interface{}, opts ...FindOptions) (int64, error) {
+	schema, err := getSchemaForModel(model)
+	if err != nil {
+		return 0, err
+	}
+
+	var n int64
+	info := &OpInfo{
+		Operation: OpFind, Collection: schema.Collection,
+		ModelName: schema.ModelName, Model: model, Filter: filter,
+	}
+	err = runMiddleware(ctx, info, func(ctx context.Context) error {
+		var opt FindOptions
+		if len(opts) > 0 {
+			opt = opts[0]
+		}
+		db, err := getDB(opt.DB)
+		if err != nil {
+			return err
+		}
+		countOpts := options.Count()
+		if opt.Limit > 0 {
+			countOpts.SetLimit(opt.Limit)
+		}
+		if opt.Skip > 0 {
+			countOpts.SetSkip(opt.Skip)
+		}
+		if opt.Hint != nil {
+			countOpts.SetHint(opt.Hint)
+		}
+		if opt.Collation != nil {
+			countOpts.SetCollation(opt.Collation)
+		}
+		coll := getCollection(db, schema)
+		c, err := coll.CountDocuments(ctx, info.Filter, countOpts)
+		if err != nil {
+			return fmt.Errorf("goodm: count failed: %w", err)
+		}
+		n = c
+		return nil
+	})
+	return n, err
+}
+
+// Exists reports whether at least one document matches filter.
+func Exists(ctx context.Context, filter interface{}, model interface{}, opts ...FindOptions) (bool, error) {
+	schema, err := getSchemaForModel(model)
+	if err != nil {
+		return false, err
+	}
+
+	var found bool
+	info := &OpInfo{
+		Operation: OpFind, Collection: schema.Collection,
+		ModelName: schema.ModelName, Model: model, Filter: filter,
+	}
+	err = runMiddleware(ctx, info, func(ctx context.Context) error {
+		var opt FindOptions
+		if len(opts) > 0 {
+			opt = opts[0]
+		}
+		db, err := getDB(opt.DB)
+		if err != nil {
+			return err
+		}
+		opt.Projection = bson.D{{Key: "_id", Value: 1}}
+		coll := getCollection(db, schema)
+		var doc bson.Raw
+		err = coll.FindOne(ctx, info.Filter, findOneOptions(opt)).Decode(&doc)
+		if err == nil {
+			found = true
+			return nil
+		}
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return nil
+		}
+		return fmt.Errorf("goodm: exists failed: %w", err)
+	})
+	return found, err
+}
+
+// Distinct finds the distinct values of a bson field among the documents
+// matching filter and decodes them into results, a pointer to a slice
+// (e.g. *[]string).
+func Distinct(ctx context.Context, field string, filter interface{}, model interface{}, results interface{}, opts ...FindOptions) error {
+	schema, err := getSchemaForModel(model)
+	if err != nil {
+		return err
+	}
+
+	info := &OpInfo{
+		Operation: OpFind, Collection: schema.Collection,
+		ModelName: schema.ModelName, Model: model, Filter: filter,
+	}
+	return runMiddleware(ctx, info, func(ctx context.Context) error {
+		var opt FindOptions
+		if len(opts) > 0 {
+			opt = opts[0]
+		}
+		db, err := getDB(opt.DB)
+		if err != nil {
+			return err
+		}
+		distinctOpts := options.Distinct()
+		if opt.Collation != nil {
+			distinctOpts.SetCollation(opt.Collation)
+		}
+		if opt.Hint != nil {
+			distinctOpts.SetHint(opt.Hint)
+		}
+		coll := getCollection(db, schema)
+		if err := coll.Distinct(ctx, field, info.Filter, distinctOpts).Decode(results); err != nil {
+			return fmt.Errorf("goodm: distinct failed: %w", err)
+		}
+		return nil
+	})
+}
+
 // Update replaces an existing document. It fetches the current document to enforce
 // immutable fields, runs BeforeSave/AfterSave hooks, validates, and sets UpdatedAt.
 func Update(ctx context.Context, model interface{}, opts ...UpdateOptions) error {
@@ -291,11 +451,11 @@ func Update(ctx context.Context, model interface{}, opts ...UpdateOptions) error
 		return err
 	}
 
-	id, err := getModelID(model)
+	id, err := modelID(schema, model)
 	if err != nil {
 		return err
 	}
-	if id.IsZero() {
+	if isZeroValue(id) {
 		return fmt.Errorf("goodm: cannot update document with zero ID")
 	}
 
@@ -338,7 +498,7 @@ func Update(ctx context.Context, model interface{}, opts ...UpdateOptions) error
 		}
 
 		// Save with optional retry-with-merge on version conflict.
-		if err := saveWithRetry(ctx, coll, model, opt, id); err != nil {
+		if err := saveWithRetry(ctx, coll, schema, model, opt, id); err != nil {
 			return err
 		}
 
@@ -355,13 +515,13 @@ func Update(ctx context.Context, model interface{}, opts ...UpdateOptions) error
 
 // checkImmutableFields verifies that immutable fields have not been modified.
 // Skips the check entirely if no fields are marked immutable.
-func checkImmutableFields(ctx context.Context, coll *mongo.Collection, id bson.ObjectID, model interface{}, schema *Schema) error {
+func checkImmutableFields(ctx context.Context, coll *mongo.Collection, id interface{}, model interface{}, schema *Schema) error {
 	if !hasImmutableFields(schema) {
 		return nil
 	}
 	existing := reflect.New(reflect.TypeOf(model).Elem()).Interface()
 	if err := coll.FindOne(ctx, bson.D{{Key: "_id", Value: id}}).Decode(existing); err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, mongo.ErrNoDocuments) {
 			return ErrNotFound
 		}
 		return fmt.Errorf("goodm: failed to fetch existing document: %w", err)
@@ -374,7 +534,7 @@ func checkImmutableFields(ctx context.Context, coll *mongo.Collection, id bson.O
 
 // buildVersionFilter constructs a filter with optimistic concurrency version checking.
 // When oldVersion == 0, also matches documents without __v (legacy compat).
-func buildVersionFilter(id bson.ObjectID, oldVersion int) bson.D {
+func buildVersionFilter(id interface{}, oldVersion int) bson.D {
 	if oldVersion == 0 {
 		return bson.D{
 			{Key: "_id", Value: id},
@@ -392,7 +552,7 @@ func buildVersionFilter(id bson.ObjectID, oldVersion int) bson.D {
 
 // checkUpdateConflict disambiguates between a missing document and a version conflict
 // when an update matched zero documents.
-func checkUpdateConflict(ctx context.Context, coll *mongo.Collection, id bson.ObjectID) error {
+func checkUpdateConflict(ctx context.Context, coll *mongo.Collection, id interface{}) error {
 	count, err := coll.CountDocuments(ctx, bson.D{{Key: "_id", Value: id}})
 	if err != nil {
 		return fmt.Errorf("goodm: update failed: %w", err)
@@ -410,7 +570,10 @@ func checkUpdateConflict(ctx context.Context, coll *mongo.Collection, id bson.Ob
 // Use this instead of Update when concurrent writers touch disjoint fields and
 // version conflicts are acceptable (e.g. progress tracking, heartbeats).
 //
-// fields is a map of bson field names to their new values:
+// fields maps bson field names to their new values. Dotted paths into
+// subdocuments and array elements are allowed ("address.city", "items.0.qty").
+// Each value is validated against the field's schema (required, enum, min,
+// max), and immutable fields are rejected. The caller's map is not modified.
 //
 //	err := goodm.UpdateFields(ctx, &task, bson.M{"step": 5, "tokens_used": 12000})
 func UpdateFields(ctx context.Context, model interface{}, fields bson.M, opts ...UpdateOptions) error {
@@ -419,15 +582,15 @@ func UpdateFields(ctx context.Context, model interface{}, fields bson.M, opts ..
 		return err
 	}
 
-	id, err := getModelID(model)
+	id, err := modelID(schema, model)
 	if err != nil {
 		return err
 	}
-	if id.IsZero() {
+	if isZeroValue(id) {
 		return fmt.Errorf("goodm: cannot update document with zero ID")
 	}
 
-	if err := validateUpdateFieldNames(schema, fields); err != nil {
+	if err := validateUpdateFields(schema, fields); err != nil {
 		return err
 	}
 
@@ -445,78 +608,231 @@ func UpdateFields(ctx context.Context, model interface{}, fields bson.M, opts ..
 			return err
 		}
 
-		// Add updated_at and increment version
-		fields["updated_at"] = time.Now()
+		// Work on a copy so the caller's map is left untouched.
+		set := make(bson.M, len(fields)+1)
+		for k, v := range fields {
+			set[k] = v
+		}
+		now := time.Now()
+		set["updated_at"] = now
 		oldVersion, _ := getModelVersion(model)
-		newVersion := oldVersion + 1
 
 		coll := getCollection(db, schema)
 		result, err := coll.UpdateOne(ctx, bson.D{{Key: "_id", Value: id}}, bson.D{
-			{Key: "$set", Value: fields},
+			{Key: "$set", Value: set},
 			{Key: "$inc", Value: bson.D{{Key: "__v", Value: 1}}},
 		})
 		if err != nil {
-			return fmt.Errorf("goodm: update fields failed: %w", err)
+			return translateWriteError(err, schema, "update fields failed")
 		}
 		if result.MatchedCount == 0 {
 			return ErrNotFound
 		}
 
 		// Reflect the changes back onto the struct
-		setUpdatedAt(model, fields["updated_at"].(time.Time))
-		setModelVersion(model, newVersion)
+		setUpdatedAt(model, now)
+		setModelVersion(model, oldVersion+1)
 		applyFieldsToModel(model, fields)
 
 		return nil
 	})
 }
 
-// validateUpdateFieldNames checks that all field names in the map are known schema
-// fields and not managed by the ODM.
-func validateUpdateFieldNames(schema *Schema, fields bson.M) error {
-	for name := range fields {
+// validateUpdateFields checks that every key in fields is a known, mutable,
+// non-managed schema field and that its value satisfies the field's rules.
+func validateUpdateFields(schema *Schema, fields bson.M) error {
+	var errs ValidationErrors
+	for name, val := range fields {
 		if managedFields[name] {
 			return fmt.Errorf("goodm: cannot set managed field %q via UpdateFields", name)
 		}
-		if !schema.HasField(name) {
+		fs, immutable := resolveFieldPath(schema, name)
+		if fs == nil {
 			return fmt.Errorf("goodm: unknown field %q in %s", name, schema.ModelName)
 		}
+		if immutable {
+			return ValidationErrors{{Field: name, Message: "field is immutable and cannot be changed"}}
+		}
+		errs = append(errs, validateFieldValue(fs, val, name)...)
+	}
+	if len(errs) > 0 {
+		return errs
 	}
 	return nil
 }
 
-// applyFieldsToModel reflects $set values back onto the Go struct so the caller
-// sees the updated state without a re-read.
-func applyFieldsToModel(model interface{}, fields bson.M) {
-	v := reflect.ValueOf(model)
-	if v.Kind() == reflect.Pointer {
-		v = v.Elem()
-	}
-	t := v.Type()
-
-	for i := 0; i < t.NumField(); i++ {
-		sf := t.Field(i)
-		bsonName, _ := ParseBSONTag(sf.Tag.Get("bson"))
-		if bsonName == "" || bsonName == "-" {
+// resolveFieldPath walks a dotted bson path through the schema, skipping
+// numeric array-index segments. It returns the leaf field and whether the
+// leaf or any ancestor is immutable; the field is nil if the path is unknown.
+func resolveFieldPath(schema *Schema, path string) (*FieldSchema, bool) {
+	fields := schema.Fields
+	var leaf *FieldSchema
+	immutable := false
+	for _, seg := range strings.Split(path, ".") {
+		if _, err := strconv.Atoi(seg); err == nil && leaf != nil && leaf.IsSlice {
 			continue
 		}
-		val, ok := fields[bsonName]
-		if !ok {
-			continue
+		if fields == nil {
+			return nil, false
 		}
-		fv := v.Field(i)
-		if fv.CanSet() {
-			rv := reflect.ValueOf(val)
-			if rv.Type().AssignableTo(fv.Type()) {
-				fv.Set(rv)
+		var next *FieldSchema
+		for i := range fields {
+			if fields[i].BSONName == seg {
+				next = &fields[i]
+				break
 			}
 		}
+		if next == nil {
+			return nil, false
+		}
+		leaf = next
+		immutable = immutable || next.Immutable
+		fields = next.SubFields
+	}
+	return leaf, immutable
+}
+
+// validateFieldValue checks one value against a field's required, enum, min,
+// max, and subdocument rules.
+func validateFieldValue(fs *FieldSchema, val interface{}, path string) []ValidationError {
+	if val == nil {
+		if fs.Required {
+			return []ValidationError{{Field: path, Message: "field is required"}}
+		}
+		return nil
+	}
+	rv := reflect.ValueOf(val)
+	var errs []ValidationError
+	if fs.Required && rv.IsZero() {
+		errs = append(errs, ValidationError{Field: path, Message: "field is required"})
+	}
+	if len(fs.Enum) > 0 && !rv.IsZero() {
+		if err := validateEnum(rv, fs.Enum, path); err != nil {
+			errs = append(errs, *err)
+		}
+	}
+	if !isNilPointer(rv) {
+		if fs.Min != nil {
+			if err := validateMin(rv, *fs.Min, path); err != nil {
+				errs = append(errs, *err)
+			}
+		}
+		if fs.Max != nil {
+			if err := validateMax(rv, *fs.Max, path); err != nil {
+				errs = append(errs, *err)
+			}
+		}
+	}
+	if len(fs.SubFields) > 0 {
+		errs = append(errs, validateSubFields(rv, *fs, path)...)
+	}
+	return errs
+}
+
+// applyFieldsToModel reflects $set values back onto the Go struct so the caller
+// sees the updated state without a re-read. Dotted paths are followed through
+// nested structs, pointers, and slice indices; values that cannot be assigned
+// are skipped.
+func applyFieldsToModel(model interface{}, fields bson.M) {
+	root := reflect.ValueOf(model)
+	if root.Kind() == reflect.Pointer {
+		root = root.Elem()
+	}
+	for path, val := range fields {
+		target := root
+		ok := true
+		for _, seg := range strings.Split(path, ".") {
+			target, ok = stepInto(target, seg)
+			if !ok {
+				break
+			}
+		}
+		if !ok || !target.CanSet() {
+			continue
+		}
+		assignValue(target, val)
+	}
+}
+
+// stepInto resolves one path segment from v: a bson field name on a struct or
+// a numeric index on a slice/array. Nil pointers end the walk.
+func stepInto(v reflect.Value, seg string) (reflect.Value, bool) {
+	if v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return v, false
+		}
+		v = v.Elem()
+	}
+	switch v.Kind() {
+	case reflect.Struct:
+		f := fieldByBSONName(v, seg)
+		return f, f.IsValid()
+	case reflect.Slice, reflect.Array:
+		i, err := strconv.Atoi(seg)
+		if err != nil || i < 0 || i >= v.Len() {
+			return v, false
+		}
+		return v.Index(i), true
+	}
+	return v, false
+}
+
+// fieldByBSONName finds the struct field whose bson name matches, descending
+// into embedded structs.
+func fieldByBSONName(v reflect.Value, name string) reflect.Value {
+	t := v.Type()
+	for i := 0; i < t.NumField(); i++ {
+		sf := t.Field(i)
+		if sf.Anonymous {
+			inner := v.Field(i)
+			if inner.Kind() == reflect.Pointer {
+				if inner.IsNil() {
+					continue
+				}
+				inner = inner.Elem()
+			}
+			if inner.Kind() == reflect.Struct {
+				if f := fieldByBSONName(inner, name); f.IsValid() {
+					return f
+				}
+			}
+			continue
+		}
+		if !sf.IsExported() {
+			continue
+		}
+		bsonName, _ := ParseBSONTag(sf.Tag.Get("bson"))
+		if bsonName == "" {
+			bsonName = strings.ToLower(sf.Name)
+		}
+		if bsonName == name {
+			return v.Field(i)
+		}
+	}
+	return reflect.Value{}
+}
+
+// assignValue sets val onto target when it is assignable or convertible.
+func assignValue(target reflect.Value, val interface{}) {
+	if val == nil {
+		target.Set(reflect.Zero(target.Type()))
+		return
+	}
+	rv := reflect.ValueOf(val)
+	switch {
+	case rv.Type().AssignableTo(target.Type()):
+		target.Set(rv)
+	case rv.Type().ConvertibleTo(target.Type()) && rv.Kind() != reflect.String && target.Kind() != reflect.String:
+		target.Set(rv.Convert(target.Type()))
+	case rv.Kind() == reflect.String && target.Kind() == reflect.String:
+		target.SetString(rv.String())
 	}
 }
 
 // UpdateOne performs a partial update on a single document matching filter.
 // The model parameter is used only for schema/collection lookup (e.g. &User{}).
 // The update parameter should be a MongoDB update document (e.g. bson.D{{"$set", bson.D{...}}}).
+// Upsert, ArrayFilters, Hint, and Collation from UpdateOptions apply.
 //
 // Performance: This is a direct passthrough to MongoDB's UpdateOne. It bypasses
 // hooks, validation, and immutable field enforcement. Use Update for the full
@@ -528,30 +844,302 @@ func UpdateOne(ctx context.Context, filter interface{}, update interface{}, mode
 		return err
 	}
 
-	return runMiddleware(ctx, &OpInfo{
+	info := &OpInfo{
 		Operation: OpUpdate, Collection: schema.Collection,
 		ModelName: schema.ModelName, Model: model, Filter: filter,
-	}, func(ctx context.Context) error {
-		var optDB *mongo.Database
+	}
+	return runMiddleware(ctx, info, func(ctx context.Context) error {
+		var opt UpdateOptions
 		if len(opts) > 0 {
-			optDB = opts[0].DB
+			opt = opts[0]
 		}
-		db, err := getDB(optDB)
+		db, err := getDB(opt.DB)
 		if err != nil {
 			return err
 		}
 
 		coll := getCollection(db, schema)
-		result, err := coll.UpdateOne(ctx, filter, update)
+		result, err := coll.UpdateOne(ctx, info.Filter, update, updateOneOptions(opt))
 		if err != nil {
-			return fmt.Errorf("goodm: update one failed: %w", err)
+			return translateWriteError(err, schema, "update one failed")
 		}
-		if result.MatchedCount == 0 {
+		if result.MatchedCount == 0 && result.UpsertedCount == 0 {
 			return ErrNotFound
 		}
 
 		return nil
 	})
+}
+
+// FindOneAndUpdate atomically updates the first document matching filter and
+// decodes it into result (the updated document by default; set ReturnOriginal
+// to get the pre-update state). It sets updated_at, increments __v, and on an
+// upsert that inserts, sets created_at, unless the update already touches
+// those fields. The update is otherwise applied as given: hooks, validation,
+// and immutable enforcement do not run.
+//
+// Returns ErrNotFound if nothing matched and Upsert is false.
+func FindOneAndUpdate(ctx context.Context, filter interface{}, update interface{}, result interface{}, opts ...FindOneAndUpdateOptions) error {
+	schema, err := getSchemaForModel(result)
+	if err != nil {
+		return err
+	}
+
+	info := &OpInfo{
+		Operation: OpUpdate, Collection: schema.Collection,
+		ModelName: schema.ModelName, Model: result, Filter: filter,
+	}
+	return runMiddleware(ctx, info, func(ctx context.Context) error {
+		var opt FindOneAndUpdateOptions
+		if len(opts) > 0 {
+			opt = opts[0]
+		}
+		db, err := getDB(opt.DB)
+		if err != nil {
+			return err
+		}
+
+		fo := options.FindOneAndUpdate().SetReturnDocument(options.After)
+		if opt.ReturnOriginal {
+			fo.SetReturnDocument(options.Before)
+		}
+		if opt.Upsert {
+			fo.SetUpsert(true)
+		}
+		if opt.Sort != nil {
+			fo.SetSort(opt.Sort)
+		}
+		if opt.Projection != nil {
+			fo.SetProjection(opt.Projection)
+		}
+		if opt.ArrayFilters != nil {
+			fo.SetArrayFilters(opt.ArrayFilters)
+		}
+		if opt.Hint != nil {
+			fo.SetHint(opt.Hint)
+		}
+		if opt.Collation != nil {
+			fo.SetCollation(opt.Collation)
+		}
+
+		coll := getCollection(db, schema)
+		managed := withManagedUpdate(update, time.Now(), opt.Upsert)
+		err = coll.FindOneAndUpdate(ctx, info.Filter, managed, fo).Decode(result)
+		if err != nil {
+			if errors.Is(err, mongo.ErrNoDocuments) {
+				return ErrNotFound
+			}
+			return translateWriteError(err, schema, "find one and update failed")
+		}
+		return nil
+	})
+}
+
+// FindOneAndReplace atomically replaces the first document matching filter
+// with replacement and decodes the resulting document into result (the new
+// document by default). Like Update it sets updated_at on the replacement
+// when it is a registered model, but hooks, validation, versioning, and
+// immutable enforcement do not run.
+//
+// Returns ErrNotFound if nothing matched and Upsert is false.
+func FindOneAndReplace(ctx context.Context, filter interface{}, replacement interface{}, result interface{}, opts ...FindOneAndUpdateOptions) error {
+	schema, err := getSchemaForModel(result)
+	if err != nil {
+		return err
+	}
+
+	info := &OpInfo{
+		Operation: OpUpdate, Collection: schema.Collection,
+		ModelName: schema.ModelName, Model: result, Filter: filter,
+	}
+	return runMiddleware(ctx, info, func(ctx context.Context) error {
+		var opt FindOneAndUpdateOptions
+		if len(opts) > 0 {
+			opt = opts[0]
+		}
+		db, err := getDB(opt.DB)
+		if err != nil {
+			return err
+		}
+
+		fo := options.FindOneAndReplace().SetReturnDocument(options.After)
+		if opt.ReturnOriginal {
+			fo.SetReturnDocument(options.Before)
+		}
+		if opt.Upsert {
+			fo.SetUpsert(true)
+		}
+		if opt.Sort != nil {
+			fo.SetSort(opt.Sort)
+		}
+		if opt.Projection != nil {
+			fo.SetProjection(opt.Projection)
+		}
+		if opt.Hint != nil {
+			fo.SetHint(opt.Hint)
+		}
+		if opt.Collation != nil {
+			fo.SetCollation(opt.Collation)
+		}
+
+		if _, ok := SchemaOf(replacement); ok && reflect.ValueOf(replacement).Kind() == reflect.Pointer {
+			setUpdatedAt(replacement, time.Now())
+		}
+
+		coll := getCollection(db, schema)
+		err = coll.FindOneAndReplace(ctx, info.Filter, replacement, fo).Decode(result)
+		if err != nil {
+			if errors.Is(err, mongo.ErrNoDocuments) {
+				return ErrNotFound
+			}
+			return translateWriteError(err, schema, "find one and replace failed")
+		}
+		return nil
+	})
+}
+
+// FindOneAndDelete atomically deletes the first document matching filter and
+// decodes the deleted document into result. Sort, Projection, Hint, and
+// Collation from FindOptions apply. Hooks do not run.
+//
+// Returns ErrNotFound if nothing matched.
+func FindOneAndDelete(ctx context.Context, filter interface{}, result interface{}, opts ...FindOptions) error {
+	schema, err := getSchemaForModel(result)
+	if err != nil {
+		return err
+	}
+
+	info := &OpInfo{
+		Operation: OpDelete, Collection: schema.Collection,
+		ModelName: schema.ModelName, Model: result, Filter: filter,
+	}
+	return runMiddleware(ctx, info, func(ctx context.Context) error {
+		var opt FindOptions
+		if len(opts) > 0 {
+			opt = opts[0]
+		}
+		db, err := getDB(opt.DB)
+		if err != nil {
+			return err
+		}
+
+		fo := options.FindOneAndDelete()
+		if opt.Sort != nil {
+			fo.SetSort(opt.Sort)
+		}
+		if opt.Projection != nil {
+			fo.SetProjection(opt.Projection)
+		}
+		if opt.Hint != nil {
+			fo.SetHint(opt.Hint)
+		}
+		if opt.Collation != nil {
+			fo.SetCollation(opt.Collation)
+		}
+
+		coll := getCollection(db, schema)
+		err = coll.FindOneAndDelete(ctx, info.Filter, fo).Decode(result)
+		if err != nil {
+			if errors.Is(err, mongo.ErrNoDocuments) {
+				return ErrNotFound
+			}
+			return fmt.Errorf("goodm: find one and delete failed: %w", err)
+		}
+		return nil
+	})
+}
+
+// withManagedUpdate adds goodm's managed fields to an update document:
+// $set updated_at, $inc __v, and on upsert $setOnInsert created_at. Fields the
+// caller already sets are left alone. Updates that are not bson.D or bson.M
+// (e.g. aggregation pipelines) are returned unchanged.
+func withManagedUpdate(update interface{}, now time.Time, upsert bool) interface{} {
+	doc, ok := toUpdateDoc(update)
+	if !ok {
+		return update
+	}
+
+	touched := func(field string, ops ...string) bool {
+		for _, op := range ops {
+			if d, _ := operatorDoc(doc, op); d != nil {
+				for _, e := range d {
+					if e.Key == field {
+						return true
+					}
+				}
+			}
+		}
+		return false
+	}
+
+	if !touched("updated_at", "$set", "$currentDate", "$unset", "$setOnInsert") {
+		doc = addToOperator(doc, "$set", bson.E{Key: "updated_at", Value: now})
+	}
+	if !touched("__v", "$set", "$inc", "$unset", "$setOnInsert") {
+		doc = addToOperator(doc, "$inc", bson.E{Key: "__v", Value: 1})
+	}
+	if upsert && !touched("created_at", "$set", "$currentDate", "$setOnInsert") {
+		doc = addToOperator(doc, "$setOnInsert", bson.E{Key: "created_at", Value: now})
+	}
+	return doc
+}
+
+// toUpdateDoc converts a bson.D or bson.M update into a bson.D copy.
+func toUpdateDoc(update interface{}) (bson.D, bool) {
+	switch u := update.(type) {
+	case bson.D:
+		out := make(bson.D, len(u))
+		copy(out, u)
+		return out, true
+	case bson.M:
+		out := make(bson.D, 0, len(u))
+		for k, v := range u {
+			out = append(out, bson.E{Key: k, Value: v})
+		}
+		return out, true
+	}
+	return nil, false
+}
+
+// operatorDoc returns the document under an update operator as a bson.D and
+// its position, or nil and -1 if the operator is absent.
+func operatorDoc(doc bson.D, op string) (bson.D, int) {
+	for i, e := range doc {
+		if e.Key != op {
+			continue
+		}
+		switch v := e.Value.(type) {
+		case bson.D:
+			return v, i
+		case bson.M:
+			out := make(bson.D, 0, len(v))
+			for k, val := range v {
+				out = append(out, bson.E{Key: k, Value: val})
+			}
+			return out, i
+		default:
+			if m, err := toBsonMap(v); err == nil {
+				out := make(bson.D, 0, len(m))
+				for k, val := range m {
+					out = append(out, bson.E{Key: k, Value: val})
+				}
+				return out, i
+			}
+			return bson.D{}, i
+		}
+	}
+	return nil, -1
+}
+
+// addToOperator appends a field to the given operator's document, creating the
+// operator if needed.
+func addToOperator(doc bson.D, op string, field bson.E) bson.D {
+	existing, i := operatorDoc(doc, op)
+	if i < 0 {
+		return append(doc, bson.E{Key: op, Value: bson.D{field}})
+	}
+	doc[i] = bson.E{Key: op, Value: append(existing, field)}
+	return doc
 }
 
 // Delete removes a document by its ID.
@@ -562,11 +1150,11 @@ func Delete(ctx context.Context, model interface{}, opts ...DeleteOptions) error
 		return err
 	}
 
-	id, err := getModelID(model)
+	id, err := modelID(schema, model)
 	if err != nil {
 		return err
 	}
-	if id.IsZero() {
+	if isZeroValue(id) {
 		return fmt.Errorf("goodm: cannot delete document with zero ID")
 	}
 
@@ -575,11 +1163,11 @@ func Delete(ctx context.Context, model interface{}, opts ...DeleteOptions) error
 		ModelName: schema.ModelName, Model: model,
 		Filter: bson.D{{Key: "_id", Value: id}},
 	}, func(ctx context.Context) error {
-		var optDB *mongo.Database
+		var opt DeleteOptions
 		if len(opts) > 0 {
-			optDB = opts[0].DB
+			opt = opts[0]
 		}
-		db, err := getDB(optDB)
+		db, err := getDB(opt.DB)
 		if err != nil {
 			return err
 		}
@@ -592,7 +1180,7 @@ func Delete(ctx context.Context, model interface{}, opts ...DeleteOptions) error
 		}
 
 		coll := getCollection(db, schema)
-		result, err := coll.DeleteOne(ctx, bson.D{{Key: "_id", Value: id}})
+		result, err := coll.DeleteOne(ctx, bson.D{{Key: "_id", Value: id}}, deleteOneOptions(opt))
 		if err != nil {
 			return fmt.Errorf("goodm: delete failed: %w", err)
 		}
@@ -623,21 +1211,22 @@ func DeleteOne(ctx context.Context, filter interface{}, model interface{}, opts 
 		return err
 	}
 
-	return runMiddleware(ctx, &OpInfo{
+	info := &OpInfo{
 		Operation: OpDelete, Collection: schema.Collection,
 		ModelName: schema.ModelName, Model: model, Filter: filter,
-	}, func(ctx context.Context) error {
-		var optDB *mongo.Database
+	}
+	return runMiddleware(ctx, info, func(ctx context.Context) error {
+		var opt DeleteOptions
 		if len(opts) > 0 {
-			optDB = opts[0].DB
+			opt = opts[0]
 		}
-		db, err := getDB(optDB)
+		db, err := getDB(opt.DB)
 		if err != nil {
 			return err
 		}
 
 		coll := getCollection(db, schema)
-		result, err := coll.DeleteOne(ctx, filter)
+		result, err := coll.DeleteOne(ctx, info.Filter, deleteOneOptions(opt))
 		if err != nil {
 			return fmt.Errorf("goodm: delete one failed: %w", err)
 		}
@@ -649,55 +1238,199 @@ func DeleteOne(ctx context.Context, filter interface{}, model interface{}, opts 
 	})
 }
 
+// --- option builders ---
+
+func findOptions(opt FindOptions) *options.FindOptionsBuilder {
+	fo := options.Find()
+	if opt.Limit > 0 {
+		fo.SetLimit(opt.Limit)
+	}
+	if opt.Skip > 0 {
+		fo.SetSkip(opt.Skip)
+	}
+	if opt.Sort != nil {
+		fo.SetSort(opt.Sort)
+	}
+	if opt.Projection != nil {
+		fo.SetProjection(opt.Projection)
+	}
+	if opt.Hint != nil {
+		fo.SetHint(opt.Hint)
+	}
+	if opt.Collation != nil {
+		fo.SetCollation(opt.Collation)
+	}
+	if opt.BatchSize > 0 {
+		fo.SetBatchSize(opt.BatchSize)
+	}
+	return fo
+}
+
+func findOneOptions(opt FindOptions) *options.FindOneOptionsBuilder {
+	fo := options.FindOne()
+	if opt.Skip > 0 {
+		fo.SetSkip(opt.Skip)
+	}
+	if opt.Sort != nil {
+		fo.SetSort(opt.Sort)
+	}
+	if opt.Projection != nil {
+		fo.SetProjection(opt.Projection)
+	}
+	if opt.Hint != nil {
+		fo.SetHint(opt.Hint)
+	}
+	if opt.Collation != nil {
+		fo.SetCollation(opt.Collation)
+	}
+	return fo
+}
+
+func updateOneOptions(opt UpdateOptions) *options.UpdateOneOptionsBuilder {
+	uo := options.UpdateOne()
+	if opt.Upsert {
+		uo.SetUpsert(true)
+	}
+	if opt.ArrayFilters != nil {
+		uo.SetArrayFilters(opt.ArrayFilters)
+	}
+	if opt.Hint != nil {
+		uo.SetHint(opt.Hint)
+	}
+	if opt.Collation != nil {
+		uo.SetCollation(opt.Collation)
+	}
+	return uo
+}
+
+func updateManyOptions(opt UpdateOptions) *options.UpdateManyOptionsBuilder {
+	uo := options.UpdateMany()
+	if opt.Upsert {
+		uo.SetUpsert(true)
+	}
+	if opt.ArrayFilters != nil {
+		uo.SetArrayFilters(opt.ArrayFilters)
+	}
+	if opt.Hint != nil {
+		uo.SetHint(opt.Hint)
+	}
+	if opt.Collation != nil {
+		uo.SetCollation(opt.Collation)
+	}
+	return uo
+}
+
+func deleteOneOptions(opt DeleteOptions) *options.DeleteOneOptionsBuilder {
+	do := options.DeleteOne()
+	if opt.Hint != nil {
+		do.SetHint(opt.Hint)
+	}
+	if opt.Collation != nil {
+		do.SetCollation(opt.Collation)
+	}
+	return do
+}
+
+func deleteManyOptions(opt DeleteOptions) *options.DeleteManyOptionsBuilder {
+	do := options.DeleteMany()
+	if opt.Hint != nil {
+		do.SetHint(opt.Hint)
+	}
+	if opt.Collation != nil {
+		do.SetCollation(opt.Collation)
+	}
+	return do
+}
+
 // --- helpers ---
 
-// getSchemaForModel resolves the schema for a model instance from the registry.
+// getSchemaForModel resolves the schema for a model value, pointer, or slice
+// from the registry by struct type.
 func getSchemaForModel(model interface{}) (*Schema, error) {
-	t := reflect.TypeOf(model)
-	if t.Kind() == reflect.Pointer {
-		t = t.Elem()
-	}
-	if t.Kind() == reflect.Slice {
-		t = t.Elem()
-		if t.Kind() == reflect.Pointer {
-			t = t.Elem()
-		}
-	}
-
-	schema, ok := Get(t.Name())
+	schema, ok := SchemaOf(model)
 	if !ok {
+		t := modelType(model)
+		if t == nil {
+			return nil, fmt.Errorf("goodm: %T is not a struct model", model)
+		}
 		return nil, fmt.Errorf("goodm: model %q is not registered", t.Name())
 	}
 	return schema, nil
 }
 
-// getModelID extracts the ID field from a model via reflection.
-func getModelID(model interface{}) (bson.ObjectID, error) {
+// idFieldValue returns the settable reflect.Value of the model's _id field.
+func idFieldValue(schema *Schema, model interface{}) (reflect.Value, error) {
+	if schema.idField == nil {
+		return reflect.Value{}, fmt.Errorf("goodm: model %s has no _id field", schema.ModelName)
+	}
 	v := reflect.ValueOf(model)
 	if v.Kind() == reflect.Pointer {
 		v = v.Elem()
 	}
-	idField := v.FieldByName("ID")
-	if !idField.IsValid() {
-		return bson.ObjectID{}, fmt.Errorf("goodm: model has no ID field")
+	f, err := v.FieldByIndexErr(schema.idField)
+	if err != nil {
+		return reflect.Value{}, fmt.Errorf("goodm: cannot access _id field of %s: %w", schema.ModelName, err)
 	}
-	id, ok := idField.Interface().(bson.ObjectID)
-	if !ok {
-		return bson.ObjectID{}, fmt.Errorf("goodm: ID field is not bson.ObjectID")
-	}
-	return id, nil
+	return f, nil
 }
 
-// setModelID sets the ID field on a model via reflection.
-func setModelID(model interface{}, id bson.ObjectID) {
-	v := reflect.ValueOf(model)
-	if v.Kind() == reflect.Pointer {
-		v = v.Elem()
+// modelID extracts the _id value from a model.
+func modelID(schema *Schema, model interface{}) (interface{}, error) {
+	f, err := idFieldValue(schema, model)
+	if err != nil {
+		return nil, err
 	}
-	idField := v.FieldByName("ID")
-	if idField.IsValid() && idField.CanSet() {
-		idField.Set(reflect.ValueOf(id))
+	return f.Interface(), nil
+}
+
+// isZeroValue reports whether an _id value is unset.
+func isZeroValue(id interface{}) bool {
+	if id == nil {
+		return true
 	}
+	return reflect.ValueOf(id).IsZero()
+}
+
+// assignObjectID generates a new ObjectID for models whose _id is a zero
+// bson.ObjectID. Other ID types are left for the caller to populate.
+func assignObjectID(schema *Schema, model interface{}) error {
+	f, err := idFieldValue(schema, model)
+	if err != nil {
+		return err
+	}
+	if f.Type() == reflect.TypeOf(bson.ObjectID{}) && f.IsZero() && f.CanSet() {
+		f.Set(reflect.ValueOf(bson.NewObjectID()))
+	}
+	return nil
+}
+
+// requireID fails if the model's _id is still zero after hooks ran.
+func requireID(schema *Schema, model interface{}) error {
+	f, err := idFieldValue(schema, model)
+	if err != nil {
+		return err
+	}
+	if f.IsZero() {
+		return fmt.Errorf("goodm: %s has a zero _id of type %s; set it before Create or in BeforeCreate", schema.ModelName, f.Type())
+	}
+	return nil
+}
+
+// coerceID converts an id supplied by the caller to the model's ID type where
+// that is unambiguous: a hex string becomes a bson.ObjectID.
+func coerceID(schema *Schema, id interface{}) (interface{}, error) {
+	if schema.idField == nil {
+		return id, nil
+	}
+	idType := schema.Type.FieldByIndex(schema.idField).Type
+	if s, ok := id.(string); ok && idType == reflect.TypeOf(bson.ObjectID{}) {
+		oid, err := bson.ObjectIDFromHex(s)
+		if err != nil {
+			return nil, fmt.Errorf("goodm: invalid ObjectID %q: %w", s, err)
+		}
+		return oid, nil
+	}
+	return id, nil
 }
 
 // setTimestamps sets CreatedAt (if zero) and UpdatedAt on a model via reflection.
@@ -706,14 +1439,12 @@ func setTimestamps(model interface{}, now time.Time) {
 	if v.Kind() == reflect.Pointer {
 		v = v.Elem()
 	}
-	if f := v.FieldByName("CreatedAt"); f.IsValid() && f.CanSet() {
+	if f := v.FieldByName("CreatedAt"); f.IsValid() && f.CanSet() && f.Type() == reflect.TypeOf(time.Time{}) {
 		if f.Interface().(time.Time).IsZero() {
 			f.Set(reflect.ValueOf(now))
 		}
 	}
-	if f := v.FieldByName("UpdatedAt"); f.IsValid() && f.CanSet() {
-		f.Set(reflect.ValueOf(now))
-	}
+	setUpdatedAt(model, now)
 }
 
 // setUpdatedAt sets only UpdatedAt on a model via reflection.
@@ -722,7 +1453,7 @@ func setUpdatedAt(model interface{}, now time.Time) {
 	if v.Kind() == reflect.Pointer {
 		v = v.Elem()
 	}
-	if f := v.FieldByName("UpdatedAt"); f.IsValid() && f.CanSet() {
+	if f := v.FieldByName("UpdatedAt"); f.IsValid() && f.CanSet() && f.Type() == reflect.TypeOf(time.Time{}) {
 		f.Set(reflect.ValueOf(now))
 	}
 }
@@ -789,7 +1520,7 @@ func getModelVersion(model interface{}) (int, error) {
 		v = v.Elem()
 	}
 	f := v.FieldByName("Version")
-	if !f.IsValid() {
+	if !f.IsValid() || !f.CanInt() {
 		return 0, fmt.Errorf("goodm: model has no Version field")
 	}
 	return int(f.Int()), nil
@@ -801,12 +1532,12 @@ func setModelVersion(model interface{}, version int) {
 	if v.Kind() == reflect.Pointer {
 		v = v.Elem()
 	}
-	if f := v.FieldByName("Version"); f.IsValid() && f.CanSet() {
+	if f := v.FieldByName("Version"); f.IsValid() && f.CanSet() && f.CanInt() {
 		f.SetInt(int64(version))
 	}
 }
 
-// managedFields are internal fields that must not be unset.
+// managedFields are internal fields that must not be unset or set directly.
 var managedFields = map[string]bool{
 	"_id": true, "created_at": true, "updated_at": true, "__v": true,
 }
@@ -831,14 +1562,14 @@ func validateUnsetFields(schema *Schema, fields []string) error {
 
 // replaceWithUnset builds the replacement document, strips any unset fields, and
 // performs the ReplaceOne. Returns the number of matched documents.
-func replaceWithUnset(ctx context.Context, coll *mongo.Collection, filter bson.D, model interface{}, unsetFields []string) (int64, error) {
+func replaceWithUnset(ctx context.Context, coll *mongo.Collection, schema *Schema, filter bson.D, model interface{}, unsetFields []string) (int64, error) {
 	replacement, err := buildReplacement(model, unsetFields)
 	if err != nil {
 		return 0, err
 	}
 	result, err := coll.ReplaceOne(ctx, filter, replacement)
 	if err != nil {
-		return 0, fmt.Errorf("goodm: update failed: %w", err)
+		return 0, translateWriteError(err, schema, "update failed")
 	}
 	return result.MatchedCount, nil
 }

@@ -212,35 +212,35 @@ func TestMergeConflictError(t *testing.T) {
 func TestEndToEndMergeScenario(t *testing.T) {
 	// Base state when both read the document.
 	base := bson.M{
-		"_id":            "task1",
-		"__v":            int32(10),
-		"updated_at":     "t0",
-		"step":           int32(4),
-		"tokens_used":    int32(8000),
+		"_id":             "task1",
+		"__v":             int32(10),
+		"updated_at":      "t0",
+		"step":            int32(4),
+		"tokens_used":     int32(8000),
 		"last_checked_at": "1pm",
-		"status":         "running",
+		"status":          "running",
 	}
 
 	// Worker changed step and tokens_used.
 	ours := bson.M{
-		"_id":            "task1",
-		"__v":            int32(10),
-		"updated_at":     "t0",
-		"step":           int32(5),
-		"tokens_used":    int32(12000),
+		"_id":             "task1",
+		"__v":             int32(10),
+		"updated_at":      "t0",
+		"step":            int32(5),
+		"tokens_used":     int32(12000),
 		"last_checked_at": "1pm",
-		"status":         "running",
+		"status":          "running",
 	}
 
 	// Supervisor changed last_checked_at.
 	theirs := bson.M{
-		"_id":            "task1",
-		"__v":            int32(11),
-		"updated_at":     "t1",
-		"step":           int32(4),
-		"tokens_used":    int32(8000),
+		"_id":             "task1",
+		"__v":             int32(11),
+		"updated_at":      "t1",
+		"step":            int32(4),
+		"tokens_used":     int32(8000),
 		"last_checked_at": "2pm",
-		"status":         "running",
+		"status":          "running",
 	}
 
 	ourChanges := diffFields(base, ours)
@@ -283,8 +283,8 @@ func TestEndToEndMergeScenario(t *testing.T) {
 func TestConflictingMergeScenario(t *testing.T) {
 	base := bson.M{"status": "running", "step": int32(4)}
 
-	ours := bson.M{"status": "completed", "step": int32(5)}  // we changed both
-	theirs := bson.M{"status": "failed", "step": int32(4)}   // they changed status
+	ours := bson.M{"status": "completed", "step": int32(5)} // we changed both
+	theirs := bson.M{"status": "failed", "step": int32(4)}  // they changed status
 
 	ourChanges := diffFields(base, ours)
 	theirChanges := diffFields(base, theirs)

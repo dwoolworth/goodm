@@ -73,6 +73,7 @@ type OpInfo struct {
     ModelName  string      // Go struct name
     Model      interface{} // The model instance (may be nil for filter-based ops)
     Filter     interface{} // The query filter (may be nil for Create)
+    Pipeline   []bson.D    // The aggregation stages (OpAggregate only)
 }
 ```
 
@@ -81,12 +82,38 @@ type OpInfo struct {
 | OpType | Operations |
 |--------|-----------|
 | `OpCreate` | `Create` |
-| `OpFind` | `FindOne`, `Find`, `FindCursor` |
-| `OpUpdate` | `Update`, `UpdateOne` |
-| `OpDelete` | `Delete`, `DeleteOne` |
+| `OpFind` | `FindOne`, `FindByID`, `Find`, `FindCursor`, `Count`, `Exists`, `Distinct` |
+| `OpUpdate` | `Update`, `UpdateFields`, `UpdateOne`, `FindOneAndUpdate`, `FindOneAndReplace` |
+| `OpDelete` | `Delete`, `DeleteOne`, `FindOneAndDelete` |
 | `OpCreateMany` | `CreateMany` |
+| `OpSaveMany` | `SaveMany` |
 | `OpUpdateMany` | `UpdateMany` |
 | `OpDeleteMany` | `DeleteMany` |
+| `OpAggregate` | `Pipeline.Execute`, `Pipeline.Cursor` |
+| `OpBulkWrite` | `Bulk.Execute` |
+
+## Modifying Filters and Pipelines
+
+The operation reads `op.Filter` (and `op.Pipeline` for aggregations) after the middleware chain has run, so middleware can replace them. This is how to scope every query to a tenant or hide soft-deleted documents without touching call sites:
+
+```go
+goodm.Use(func(ctx context.Context, op *goodm.OpInfo, next func(context.Context) error) error {
+    tenant, ok := tenantFromContext(ctx)
+    if !ok {
+        return next(ctx)
+    }
+    scope := bson.E{Key: "tenant", Value: tenant}
+    switch op.Operation {
+    case goodm.OpFind, goodm.OpUpdateMany, goodm.OpDeleteMany:
+        op.Filter = bson.D{scope, {Key: "$and", Value: bson.A{op.Filter}}}
+    case goodm.OpAggregate:
+        op.Pipeline = append([]bson.D{{{Key: "$match", Value: bson.D{scope}}}}, op.Pipeline...)
+    }
+    return next(ctx)
+})
+```
+
+`Update`, `UpdateFields`, and `Delete` always address the model by its `_id`; for them `op.Filter` is informational.
 
 ## Aborting Operations
 

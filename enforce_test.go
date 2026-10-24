@@ -168,11 +168,7 @@ func TestEnforce_CompoundUniqueMismatch_Rebuild(t *testing.T) {
 	if err := Register(&testUniqueCompound{}, "test_unique_compound"); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	defer func() {
-		registryMu.Lock()
-		delete(registry, "testUniqueCompound")
-		registryMu.Unlock()
-	}()
+	defer Unregister(&testUniqueCompound{})
 
 	coll := db.Collection("test_unique_compound")
 	_, err := coll.Indexes().CreateOne(ctx, mongo.IndexModel{
@@ -208,11 +204,7 @@ func TestEnforce_UniqueExistingForIndexField_Errors(t *testing.T) {
 	if err := Register(&testIndexedField{}, "test_indexed_field"); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	defer func() {
-		registryMu.Lock()
-		delete(registry, "testIndexedField")
-		registryMu.Unlock()
-	}()
+	defer Unregister(&testIndexedField{})
 
 	coll := db.Collection("test_indexed_field")
 	_, err := coll.Indexes().CreateOne(ctx, mongo.IndexModel{
@@ -482,11 +474,8 @@ func registerModel(t *testing.T, model interface{}, collection, registryKey stri
 	if err := Register(model, collection); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	t.Cleanup(func() {
-		registryMu.Lock()
-		delete(registry, registryKey)
-		registryMu.Unlock()
-	})
+	_ = registryKey // schemas are keyed by type; the model itself identifies the entry
+	t.Cleanup(func() { Unregister(model) })
 }
 
 func TestEnforce_StalePrepareUnique_OnIndexField_ClearedInPlace(t *testing.T) {
@@ -567,7 +556,7 @@ func TestHasDuplicateValues_UniqueIndexSemantics(t *testing.T) {
 	}
 	check := func(want bool, why string) {
 		t.Helper()
-		got, err := hasDuplicateValues(ctx, coll, keys)
+		got, err := hasDuplicateValues(ctx, coll, IndexDefinition{Keys: keys, Unique: true})
 		if err != nil {
 			t.Fatalf("hasDuplicateValues: %v", err)
 		}

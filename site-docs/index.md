@@ -93,15 +93,16 @@ func main() {
 
 | Feature | What it does |
 |---------|-------------|
-| **Schema Tags** | `unique`, `index`, `required`, `immutable`, `default`, `enum`, `min`, `max`, `ref` |
-| **CRUD** | `Create`, `FindOne`, `Find`, `FindCursor`, `Update`, `Delete` with full lifecycle |
-| **Raw Operations** | `UpdateOne`, `DeleteOne`, `UpdateMany`, `DeleteMany` for direct MongoDB access |
+| **Schema Tags** | `unique`, `index[=kind]`, `sparse`, `ttl`, `required`, `immutable`, `default`, `enum`, `min`, `max`, `ref` |
+| **CRUD** | `Create`, `FindOne`, `FindByID`, `Find`, `FindCursor`, `Count`, `Exists`, `Distinct`, `Update`, `UpdateFields`, `Delete` |
+| **Atomic** | `FindOneAndUpdate`, `FindOneAndReplace`, `FindOneAndDelete` with upsert |
+| **Raw Operations** | `UpdateOne`, `DeleteOne`, `UpdateMany`, `DeleteMany`, `NewBulk` for direct MongoDB access |
 | **Hooks** | `BeforeCreate`, `AfterCreate`, `BeforeSave`, `AfterSave`, `BeforeDelete`, `AfterDelete` |
 | **Validation** | Automatic on Create/Update: required, enum, min/max, immutable enforcement |
 | **Middleware** | Global and per-model middleware chains wrapping all operations |
 | **Population** | Resolve `ref=` fields by fetching referenced documents |
 | **Aggregation** | Fluent pipeline builder with `Match`, `Group`, `Sort`, `Lookup`, and more |
-| **Bulk** | `CreateMany` with hooks/validation, `UpdateMany`/`DeleteMany` passthrough |
+| **Bulk** | `CreateMany` and `SaveMany` with hooks/validation, `NewBulk` builder, `UpdateMany`/`DeleteMany` passthrough |
 | **Transactions** | `WithTransaction` wraps operations in a MongoDB session transaction |
 | **CLI** | `goodm discover` (introspect DB), `goodm migrate` (sync indexes), `goodm inspect` (view schemas) |
 

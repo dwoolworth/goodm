@@ -38,18 +38,19 @@ The `bson` tag controls the database field name, and the Go field name is the al
 
 **Why goodm skips them (for now):** Soft deletes require implicit query modification on every find operation, which conflicts with goodm's principle of being explicit and predictable. The transparent filtering can lead to surprising behavior when working directly with MongoDB tools or the raw driver.
 
-If you need soft deletes, implement them with a `BeforeDelete` hook that sets a timestamp and cancels the delete, plus middleware that injects the filter on reads:
+If you need soft deletes, build them from the primitives goodm already has: a method that marks the document instead of calling `Delete`, and middleware that replaces the filter on reads (middleware may modify `op.Filter` and `op.Pipeline`; the operation reads them after the chain runs):
 
 ```go
-func (u *User) BeforeDelete(ctx context.Context) error {
-    u.DeletedAt = time.Now()
-    goodm.Update(ctx, u)
-    return fmt.Errorf("soft delete applied") // cancel the hard delete
+func (u *User) SoftDelete(ctx context.Context) error {
+    return goodm.UpdateFields(ctx, u, bson.M{"deleted_at": time.Now()})
 }
 
-goodm.Use(func(ctx context.Context, op *goodm.OpInfo, next func(context.Context) error) error {
-    if op.Operation == goodm.OpFind {
-        // Add deletedAt filter to queries
+goodm.UseFor("User", func(ctx context.Context, op *goodm.OpInfo, next func(context.Context) error) error {
+    if op.Operation == goodm.OpFind && !includeDeleted(ctx) {
+        op.Filter = bson.D{
+            {Key: "deleted_at", Value: nil},
+            {Key: "$and", Value: bson.A{op.Filter}},
+        }
     }
     return next(ctx)
 })
@@ -100,7 +101,9 @@ Nested structs are parsed recursively during registration. All `goodm` tags on i
 
 **Leaf types:** `time.Time`, `bson.ObjectID`, and `bson.Decimal128` are structs in Go but serialize as atomic BSON values. goodm treats them as leaf types and never recurses into their fields.
 
-**What's deferred:** `ref=` tags inside subdocuments are parsed and stored but `Populate()` only operates on top-level fields. Dotted-path indexes (`unique`/`index` on inner fields) are parsed but not acted on by `Enforce()`. Both are future enhancements.
+**Dotted-path indexes:** `unique`, `index`, `sparse`, and `ttl` tags on inner fields create dotted-path indexes (`address.city_1`) through `Enforce` and `Migrate` like any other.
+
+**What's deferred:** `ref=` tags inside subdocuments are parsed and stored but `Populate()` only operates on top-level fields.
 
 ## Design Principles
 

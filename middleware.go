@@ -3,6 +3,8 @@ package goodm
 import (
 	"context"
 	"sync"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 // OpType identifies the kind of CRUD operation being performed.
@@ -10,21 +12,30 @@ type OpType string
 
 const (
 	OpCreate     OpType = "create"
-	OpFind       OpType = "find"
+	OpFind       OpType = "find" // FindOne, Find, FindCursor, FindByID, Count, Exists, Distinct
 	OpUpdate     OpType = "update"
 	OpDelete     OpType = "delete"
 	OpCreateMany OpType = "create_many"
 	OpUpdateMany OpType = "update_many"
 	OpDeleteMany OpType = "delete_many"
+	OpSaveMany   OpType = "save_many"
+	OpAggregate  OpType = "aggregate"
+	OpBulkWrite  OpType = "bulk_write"
 )
 
 // OpInfo provides context about the current operation to middleware.
+//
+// Filter and Pipeline are read by the operation after the middleware chain
+// runs, so middleware may replace them (for example to scope every query to a
+// tenant or to hide soft-deleted documents). Filter is informational for
+// Update and Delete, which always address the model by its _id.
 type OpInfo struct {
 	Operation  OpType
 	Collection string
 	ModelName  string
 	Model      interface{} // the model being operated on, or nil
 	Filter     interface{} // the query filter, if applicable
+	Pipeline   []bson.D    // the aggregation stages, for OpAggregate
 }
 
 // MiddlewareFunc is a function that wraps a CRUD operation.
@@ -47,7 +58,8 @@ func Use(fns ...MiddlewareFunc) {
 }
 
 // UseFor registers middleware for a specific model name (the Go struct name).
-// Per-model middleware executes after global middleware.
+// Per-model middleware executes after global middleware. If two registered
+// models share a struct name, both receive the middleware.
 func UseFor(modelName string, fns ...MiddlewareFunc) {
 	mwMu.Lock()
 	defer mwMu.Unlock()

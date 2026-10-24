@@ -22,7 +22,7 @@ func init() {
 
 ## Base Model
 
-`goodm.Model` provides four fields automatically:
+`goodm.Model` provides four fields automatically. Embedding it is the common case, but any struct with an `_id` field can be a model; see [Custom ID Types](#custom-id-types).
 
 | Field | BSON | Type | Behavior |
 |-------|------|------|----------|
@@ -39,18 +39,40 @@ Tags are specified in the `goodm` struct tag, comma-separated:
 
 ### `unique`
 
-Creates a unique index on this field. Enforced at the database level.
+Creates a unique index on this field. Enforced at the database level. A write that violates it returns a `*DuplicateKeyError` (`errors.Is(err, goodm.ErrDuplicateKey)`).
 
 ```go
 Email string `bson:"email" goodm:"unique"`
 ```
 
-### `index`
+### `index` / `index=kind`
 
-Creates a non-unique index on this field.
+Creates a non-unique index on this field. A bare `index` is ascending; give a kind for other index types:
 
 ```go
-Category string `bson:"category" goodm:"index"`
+Category string    `bson:"category" goodm:"index"`          // ascending
+Score    int       `bson:"score"    goodm:"index=-1"`       // descending
+Tenant   string    `bson:"tenant"   goodm:"index=hashed"`   // hashed
+Body     string    `bson:"body"     goodm:"index=text"`     // text
+Location bson.D    `bson:"loc"      goodm:"index=2dsphere"` // geospatial
+```
+
+Tags on fields inside subdocuments create dotted-path indexes (`address.city_1`), including for slices of structs (multikey).
+
+### `sparse`
+
+Makes the field's index sparse: documents missing the field are left out, so a `unique,sparse` index allows any number of documents without the field.
+
+```go
+Slug string `bson:"slug" goodm:"unique,sparse"`
+```
+
+### `ttl=duration`
+
+Creates a TTL index that expires documents once the field's date is older than the duration. Accepts a Go duration (`24h`, `30m`) or a number of seconds. `ttl=0` expires documents at the time stored in the field.
+
+```go
+ExpiresAt time.Time `bson:"expires_at" goodm:"ttl=24h"`
 ```
 
 ### `required`
@@ -87,11 +109,18 @@ Status string `bson:"status" goodm:"enum=draft|published|archived"`
 
 ### `min=N` / `max=N`
 
-Numeric boundaries for int/float fields. Validated on Create and Update.
+Bounds on numeric values (ints and floats, compared as numbers) or on the length of strings, slices, and maps. Validated on Create, Update, SaveMany, and the values passed to UpdateFields. Bounds may be fractional (`min=0.5`).
 
 ```go
-Age   int `bson:"age"   goodm:"min=13,max=120"`
-Price int `bson:"price" goodm:"min=0"`
+Age   int     `bson:"age"   goodm:"min=13,max=120"`
+Price float64 `bson:"price" goodm:"min=0"`
+Bio   string  `bson:"bio"   goodm:"max=500"`
+```
+
+Bounds apply to the zero value too: `min=1` rejects `0`. For an optional bounded field use a pointer; a nil pointer is treated as absent and is not checked.
+
+```go
+Rating *int `bson:"rating" goodm:"min=1,max=5"` // nil is fine, 0 is not
 ```
 
 ### `ref=collection`
@@ -111,20 +140,59 @@ Email string `bson:"email" goodm:"unique,required,index"`
 SKU   string `bson:"sku"   goodm:"unique,required,immutable"`
 ```
 
-## Compound Indexes
+## Indexes()
 
-For multi-field indexes, implement the `Indexable` interface:
+Field tags cover single-field indexes. For compound indexes, custom names, partial filters, and collations, implement the `Indexable` interface:
 
 ```go
 func (u *User) Indexes() []goodm.CompoundIndex {
     return []goodm.CompoundIndex{
-        goodm.NewCompoundIndex("email", "role"),           // non-unique
-        goodm.NewUniqueCompoundIndex("tenant", "username"), // unique
+        goodm.NewCompoundIndex("tenant", "-created_at"),     // tenant asc, created_at desc
+        goodm.NewUniqueCompoundIndex("tenant", "username"),  // unique
+        {
+            Fields:        []string{"email"},
+            Unique:        true,
+            Name:          "active_email",
+            PartialFilter: bson.D{{Key: "deleted_at", Value: nil}},
+        },
+        {
+            Fields:    []string{"name"},
+            Collation: &options.Collation{Locale: "en", Strength: 2}, // case-insensitive
+        },
+        {
+            Fields:             []string{"last_seen"},
+            ExpireAfterSeconds: goodm.TTL(30 * 24 * time.Hour),
+        },
     }
 }
 ```
 
-Compound indexes are created by `Enforce()` alongside single-field indexes.
+Each entry in `Fields` is a bson path with an optional marker:
+
+| Entry | Key |
+|-------|-----|
+| `"email"` | `{email: 1}` |
+| `"-created_at"` | `{created_at: -1}` |
+| `"title:text"` | `{title: "text"}` |
+| `"tenant:hashed"` | `{tenant: "hashed"}` |
+| `"loc:2dsphere"` | `{loc: "2dsphere"}` |
+
+`CompoundIndex` options:
+
+| Field | Effect |
+|-------|--------|
+| `Unique` | Unique index |
+| `Sparse` | Skip documents missing every key |
+| `Name` | Override MongoDB's default name (`email_1_role_-1`) |
+| `ExpireAfterSeconds` | TTL in seconds; build with `goodm.TTL(d)` |
+| `PartialFilter` | `bson.D`/`bson.M` filter restricting the index |
+| `Collation` | `*options.Collation` for string comparison |
+
+Despite the name a `CompoundIndex` may list a single field, which is how you attach these options to one field.
+
+### Index definitions
+
+Tags and `Indexes()` resolve to one list of `IndexDefinition` values via `schema.IndexDefinitions()`. `Enforce`, `Migrate`, and the CLI all work from that list, so an index means the same thing everywhere. An existing index with the expected name but different keys, uniqueness, sparseness, TTL, partial filter, or collation is a mismatch; see `EnforceOptions.IndexMismatchPolicy`.
 
 ## Collection Options (Read/Write Concern)
 
@@ -202,7 +270,7 @@ func init() {
 }
 ```
 
-`Register` parses the struct tags, detects hook and interface implementations, and stores the schema in an internal registry. The registry is used by all CRUD operations to:
+`Register` parses the struct tags, detects hook and interface implementations, and stores the schema in an internal registry keyed by the struct's type. The registry is used by all CRUD operations to:
 
 - Look up the collection name for a model type
 - Validate fields on write operations
@@ -210,18 +278,39 @@ func init() {
 - Detect compound indexes (`Indexable`)
 - Apply per-schema collection options (`Configurable`)
 
+Because schemas are keyed by type, two packages may each register a struct named `User`. Registering the same type twice is an error. `goodm.Unregister(&User{})` removes a schema again, which is handy in tests.
+
+## Custom ID Types
+
+The `_id` field is whichever struct field carries `bson:"_id"` (a field named `ID` is the fallback), found through embedded structs. When that field is a `bson.ObjectID`, `Create` generates a value if it is zero. Any other type works, but you must set it yourself before `Create` or in a `BeforeCreate` hook; a zero `_id` of a non-ObjectID type is rejected rather than inserted as an empty key.
+
+```go
+type Setting struct {
+    ID        string    `bson:"_id"`
+    Value     string    `bson:"value" goodm:"required"`
+    UpdatedAt time.Time `bson:"updated_at"`
+}
+```
+
+Timestamps and versioning are applied when the struct has `CreatedAt`, `UpdatedAt`, and `Version` fields (as `goodm.Model` provides) and skipped otherwise.
+
 ## Inspecting Schemas
 
 Retrieve registered schemas programmatically:
 
 ```go
-// Get a specific schema
+// By type (never ambiguous)
+schema, ok := goodm.SchemaOf(&User{})
+
+// By struct name; ok is false if the name is unregistered or ambiguous
 schema, ok := goodm.Get("User")
 
-// Get all registered schemas
-all := goodm.GetAll()
-for name, schema := range all {
-    fmt.Printf("%s -> %s\n", name, schema.Collection)
+// All registered schemas, sorted by collection name
+for _, schema := range goodm.GetAll() {
+    fmt.Printf("%s -> %s\n", schema.QualifiedName(), schema.Collection)
+    for _, idx := range schema.IndexDefinitions() {
+        fmt.Printf("  index %s %v\n", idx.Name, idx.Keys)
+    }
 }
 ```
 
