@@ -56,7 +56,9 @@ func bulkResultFrom(res *mongo.BulkWriteResult) *BulkResult {
 // stops at the first failure; set CreateOptions.Unordered to insert
 // everything that can be. An AfterCreate hook that returns an error is
 // reported for its item in the *BulkError, after the other hooks have run;
-// the document stays inserted.
+// the document stays inserted. Inside a transaction any write failure aborts
+// the transaction, so CreateMany reports every item as not inserted and runs
+// no AfterCreate.
 //
 // Performance: hooks and validation run per-model. For large batches where
 // you don't need the ODM lifecycle, use Bulk or the driver's InsertMany directly.
@@ -102,12 +104,31 @@ func CreateMany(ctx context.Context, models interface{}, opts ...CreateOptions) 
 		if insertErr != nil {
 			items, wcErr, fatal := splitBulkWriteError(insertErr, schema)
 			if fatal != nil {
+				if inTransaction(ctx) {
+					abortTransaction(ctx)
+				}
 				return fmt.Errorf("goodm: insert many failed: %w", fatal)
 			}
 			bulkErr = &BulkError{Collection: schema.Collection, Errors: items, WriteConcernError: wcErr, Result: &BulkResult{}}
 			if wcErr != nil {
 				// The server may or may not have applied the inserts; nothing
 				// can be reported as created.
+				return bulkErr
+			}
+			if inTransaction(ctx) {
+				// The failure aborted the transaction, so no item will commit:
+				// report every other item as not inserted and run no hooks.
+				abortTransaction(ctx)
+				first := items[0].Index
+				for i := 0; i < rv.Len(); i++ {
+					if bulkErr.Failed(i) {
+						continue
+					}
+					bulkErr.Errors = append(bulkErr.Errors, BulkWriteError{Index: i,
+						Message: fmt.Sprintf("not inserted: transaction aborted by item %d", first),
+						Err:     fmt.Errorf("goodm: not inserted: transaction aborted by item %d: %v", first, items[0].Err)})
+				}
+				sort.Slice(bulkErr.Errors, func(a, b int) bool { return bulkErr.Errors[a].Index < bulkErr.Errors[b].Index })
 				return bulkErr
 			}
 		}
@@ -198,11 +219,11 @@ func elemModel(v reflect.Value) interface{} {
 // have run, and does not undo the save.
 //
 // Inside a transaction (goodm's WithTransaction or one started on the
-// session by the driver) the first failure aborts the transaction on the
-// server, so SaveMany stops there, restores every model's version, runs no
-// AfterSave, and reports every item as not saved. With a session that has no
-// transaction running, items are sent one at a time and failures do not stop
-// the batch.
+// session by the driver) the first failure of any kind ends the batch:
+// SaveMany aborts the transaction, restores every model's version, runs no
+// AfterSave, and reports every item as not saved. A failed resolution read
+// inside a transaction does the same. With a session that has no transaction
+// running, items are sent one at a time and failures do not stop the batch.
 //
 // Each document is replaced with its own conditional request, so every
 // replacement's matched count is known exactly and every failure is
@@ -303,11 +324,14 @@ func SaveMany(ctx context.Context, models interface{}, opts ...UpdateOptions) er
 		if len(out.unresolved) > 0 {
 			if err := resolveUnmatched(ctx, coll, schema, items, ids, out.unresolved, out.failures, scope); err != nil {
 				if out.inTxn {
-					// A failed read inside the transaction means it will not
-					// commit; nothing in the batch can be reported as saved.
+					// The batch cannot be trusted without the read, so abort
+					// the transaction; nothing in it can be reported as saved.
+					// The read error is wrapped so its labels (e.g. the
+					// driver's transient-transaction label) stay visible.
+					abortTransaction(ctx)
 					for i := range items {
 						setModelVersion(items[i], oldVersions[i])
-						out.failures[i] = fmt.Errorf("goodm: not saved: transaction failed while resolving the batch: %v", err)
+						out.failures[i] = fmt.Errorf("goodm: not saved: transaction aborted after the batch could not be resolved: %w", err)
 					}
 					return &BulkError{Collection: schema.Collection, Errors: out.itemErrors(), Result: &BulkResult{}, WriteConcernError: out.wcErr}
 				}
@@ -371,17 +395,29 @@ type replaceResult struct {
 	unknown           bool  // the server may have applied the write
 }
 
-// ErrNotAttempted marks items SaveMany did not send because the context was
-// done or the transaction had already been aborted by an earlier item. It
-// wraps the cause, so errors.Is(err, context.Canceled) also works.
+// ErrNotAttempted marks items SaveMany or CreateMany did not send because the
+// context was done or an earlier item aborted the transaction. In the context
+// case the context error is wrapped too, so errors.Is(err, context.Canceled)
+// works; in the transaction case the message names the aborting item.
 var ErrNotAttempted = errors.New("goodm: not attempted")
+
+// abortTransaction aborts the transaction on the session in ctx after a batch
+// failure, so a caller who commits anyway cannot persist items that were
+// reported as not saved. It runs even if ctx is already done.
+func abortTransaction(ctx context.Context) {
+	if sess := mongo.SessionFromContext(ctx); sess != nil {
+		_ = sess.AbortTransaction(context.WithoutCancel(ctx))
+	}
+}
 
 // inTransaction reports whether ctx carries a session with a transaction in
 // progress, whether it was started by goodm's WithTransaction or by the
 // driver directly. The driver exposes no query for this, so it is probed with
 // StartTransaction, which is purely local: it fails with ErrTransactInProgress
 // when a transaction is running, and otherwise starts one that is aborted
-// again locally before any operation is sent.
+// again locally before any operation is sent. (The probe assumes the session
+// has not been ended; using an ended session is a caller bug the driver
+// would otherwise report on the first operation.)
 func inTransaction(ctx context.Context) bool {
 	sess := mongo.SessionFromContext(ctx)
 	if sess == nil {
@@ -424,12 +460,15 @@ func saveManyReplace(ctx context.Context, coll *mongo.Collection, schema *Schema
 	out.inTxn = hasSession && inTransaction(ctx)
 	switch {
 	case out.inTxn:
-		// One server error aborts the transaction, so stop there. Earlier
-		// items will not commit; they are reported with the cause described
-		// but not wrapped, so only the failing item matches its error type.
+		// A server error aborts the transaction; a client-side error (marshal,
+		// context) does not, so abort it explicitly either way. Then stop:
+		// earlier items will not commit. They are reported with the cause
+		// described but not wrapped, so only the failing item matches its
+		// error type.
 		for i := range items {
 			replace(i)
 			if results[i].err != nil {
+				abortTransaction(ctx)
 				out.aborted = true
 				for j := i + 1; j < n; j++ {
 					results[j] = replaceResult{err: fmt.Errorf("%w: transaction aborted by item %d", ErrNotAttempted, i)}

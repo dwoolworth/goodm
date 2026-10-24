@@ -746,3 +746,100 @@ func TestSaveMany_PlainSession_IsNotATransaction(t *testing.T) {
 		t.Errorf("Update after a plain-session SaveMany: %v", err)
 	}
 }
+
+type testBadMarshal struct {
+	Model `bson:",inline"`
+	Name  string `bson:"name"`
+	Bad   badValue
+}
+
+type badValue struct{ fail bool }
+
+func (b badValue) MarshalBSONValue() (byte, []byte, error) {
+	if b.fail {
+		return 0, nil, errors.New("marshal boom")
+	}
+	typ, data, err := bson.MarshalValue("ok")
+	return byte(typ), data, err
+}
+
+func (b *badValue) UnmarshalBSONValue(byte, []byte) error { return nil }
+
+func TestSaveMany_ClientSideFailureInTransaction_AbortsIt(t *testing.T) {
+	ctx, db, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testBadMarshal{}, "test_bad_marshal", "")
+	docs := []*testBadMarshal{{Name: "a"}, {Name: "b"}}
+	if err := CreateMany(ctx, docs); err != nil {
+		t.Fatal(err)
+	}
+
+	sess, err := db.Client().StartSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.EndSession(ctx)
+	if err := sess.StartTransaction(); err != nil {
+		t.Fatal(err)
+	}
+	sessCtx := mongo.NewSessionContext(ctx, sess)
+
+	docs[0].Name = "a2"
+	docs[1].Bad = badValue{fail: true} // fails in the driver, never reaches the server
+	err = SaveMany(sessCtx, docs)
+	var be *BulkError
+	if !errors.As(err, &be) || len(be.Errors) != 2 || docs[0].Version != 0 {
+		t.Fatalf("expected both items reported and versions restored, got %v (v0=%d)", err, docs[0].Version)
+	}
+	// The caller commits anyway: the commit must fail and item 0 must not persist.
+	if err := sess.CommitTransaction(ctx); err == nil {
+		t.Error("commit after SaveMany aborted the transaction must fail")
+	}
+	var fresh testBadMarshal
+	if err := FindByID(ctx, docs[0].ID, &fresh); err != nil || fresh.Name != "a" || fresh.Version != 0 {
+		t.Errorf("item 0 must not have been persisted: %+v %v", fresh, err)
+	}
+}
+
+func TestCreateMany_InTransaction_FailureReportsNothingInserted(t *testing.T) {
+	ctx, db, cleanup := setupTestDB(t)
+	defer cleanup()
+	if err := Enforce(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	seedUsers(t, ctx, 1) // u0@test.com exists
+
+	hooked := []*testHookUser{{Email: "a@test.com", Name: "A"}, {Email: "u0@test.com", Name: "Dup"}, {Email: "b@test.com", Name: "B"}}
+	// test_hook_users needs a unique index for the duplicate to fail.
+	if _, err := db.Collection("test_hook_users").Indexes().CreateOne(ctx, mongo.IndexModel{Keys: bson.D{{Key: "email", Value: 1}}, Options: options.Index().SetUnique(true)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Create(ctx, &testHookUser{Email: "u0@test.com", Name: "existing"}); err != nil {
+		t.Fatal(err)
+	}
+	var be *BulkError
+	err := WithTransaction(ctx, func(ctx context.Context) error {
+		err := CreateMany(ctx, hooked, CreateOptions{Unordered: true})
+		if !errors.As(err, &be) {
+			t.Fatalf("expected a BulkError, got %v", err)
+		}
+		return err
+	})
+	if err == nil {
+		t.Fatal("transaction must fail")
+	}
+	if len(be.Errors) != 3 || be.Result.InsertedCount != 0 {
+		t.Errorf("every item must be reported as not inserted with nothing counted: %+v %+v", be.Errors, be.Result)
+	}
+	for i, h := range hooked {
+		for _, e := range h.Events {
+			if e == "after_create" {
+				t.Errorf("item %d: AfterCreate must not run in an aborted transaction", i)
+			}
+		}
+	}
+	n, _ := Count(ctx, bson.D{{Key: "email", Value: "a@test.com"}}, &testHookUser{})
+	if n != 0 {
+		t.Error("nothing may have been committed")
+	}
+}

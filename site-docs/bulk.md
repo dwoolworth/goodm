@@ -27,7 +27,7 @@ err := goodm.CreateMany(ctx, users)
 // Error: "goodm: item 1: validation error on email: field is required"
 ```
 
-Write failures such as duplicate keys come back as a `*BulkError`. The insert is ordered by default, so it stops at the first failure. Set `Unordered` to insert everything that can be inserted. An `AfterCreate` hook that returns an error is reported for its item in the same `*BulkError` after the other hooks have run; the document stays inserted.
+Write failures such as duplicate keys come back as a `*BulkError`. The insert is ordered by default, so it stops at the first failure. Set `Unordered` to insert everything that can be inserted. An `AfterCreate` hook that returns an error is reported for its item in the same `*BulkError` after the other hooks have run; the document stays inserted. Inside a transaction any write failure aborts the transaction, so `CreateMany` aborts it explicitly, reports every item as not inserted, and runs no `AfterCreate`.
 
 ```go
 err := goodm.CreateMany(ctx, users, goodm.CreateOptions{Unordered: true})
@@ -70,9 +70,9 @@ If any model fails its immutable check, `BeforeSave` hook, or validation, or the
 | `ErrNotAttempted` | The context was done before the item was sent (the context error is wrapped too), or an earlier item aborted the transaction. |
 | error marked "saved, but AfterSave failed" | The document was saved and keeps its new version; the hook's error is reported after the other hooks have run. |
 
-Models that succeeded are saved regardless of failures elsewhere in the batch; failed models keep their old version. A replacement that matched nothing is resolved by reading the document from the primary: still present means `ErrVersionConflict`, gone means `ErrNotFound`. Two writers racing from the same version therefore always see exactly one success and one conflict. If that resolution read itself fails, only the items it was resolving are reported as unknown; the items already known to be saved keep their new version.
+Models that succeeded are saved regardless of failures elsewhere in the batch; failed models keep their old version. A replacement that matched nothing is resolved by reading the document from the primary: still present means `ErrVersionConflict`, gone means `ErrNotFound`. Two writers racing from the same version therefore always see exactly one success and one conflict. If that resolution read itself fails outside a transaction, only the items it was resolving are reported as unknown; the items already known to be saved keep their new version. Inside a transaction the batch cannot be trusted without the read, so the transaction is aborted and every item is reported as not saved.
 
-Inside a transaction, whether started by `goodm.WithTransaction` or on the session by the driver, the first failing item aborts the transaction on the server, so `SaveMany` stops there, restores every model's version, runs no `AfterSave`, and reports every item in the `*BulkError` (the items before the failure as "not saved", the ones after it as `ErrNotAttempted`). A session with no transaction running only makes the items run one at a time.
+Inside a transaction, whether started by `goodm.WithTransaction` or on the session by the driver, the first failure of any kind ends the batch: `SaveMany` aborts the transaction (a server error has already aborted it; a client-side error such as a marshal failure or a cancelled context has not, so `SaveMany` does it), restores every model's version, runs no `AfterSave`, and reports every item in the `*BulkError` (the items before the failure as "not saved", the ones after it as `ErrNotAttempted`). A caller using a driver-managed transaction will find its commit rejected afterwards. A session with no transaction running only makes the items run one at a time.
 
 Of `UpdateOptions` only `DB` is used. Because replacements run on several goroutines outside a transaction, custom BSON marshalers on the model may run concurrently.
 
@@ -209,7 +209,7 @@ type BulkWriteError struct {
 | Operation | Hooks | Validation | Immutable Check | Versioning | DB Calls |
 |-----------|-------|-----------|----------------|-----------|----------|
 | `CreateMany` | Yes (per model) | Yes (per model) | No | Sets 0 | 1 InsertMany |
-| `SaveMany` | Yes (per model) | Yes (per model) | Yes (1 query) | Per-document version filter | 1 ReplaceOne per document, up to 8 concurrent (+1 read to resolve misses) |
+| `SaveMany` | Yes (per model) | Yes (per model) | Yes (1 query) | Per-document version filter | 1 ReplaceOne per document, up to 8 concurrent (sequential when a session is in the context; +1 read to resolve misses) |
 | `UpdateMany` | No | No | No | No | 1 UpdateMany |
 | `DeleteMany` | No | No | N/A | No | 1 DeleteMany |
 | `Bulk` | No | No | No | No | 1 BulkWrite |
