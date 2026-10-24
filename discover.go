@@ -41,9 +41,15 @@ type DiscoveredIndex struct {
 }
 
 // SingleFieldTag reports whether the index can be expressed entirely by tags
-// on one field: one key and no option that only Indexes() can declare.
+// on one field: one key, MongoDB's default name, and no option that only
+// Indexes() can declare.
 func (idx DiscoveredIndex) SingleFieldTag() bool {
-	return len(idx.Keys) == 1 && !idx.HasPartialFilter && !idx.HasCollation
+	return len(idx.Keys) == 1 && !idx.HasPartialFilter && !idx.HasCollation && idx.Name == idx.DerivedName()
+}
+
+// DerivedName is the name goodm would give an index with these keys.
+func (idx DiscoveredIndex) DerivedName() string {
+	return compoundIndexName(CompoundIndex{Fields: idx.Keys})
 }
 
 // DiscoveredCollection holds the discovery results for a single collection.

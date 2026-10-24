@@ -61,7 +61,8 @@ func renderIndexEntry(idx DiscoveredIndex) string {
 		}
 		fmt.Fprintf(&b, "// TODO: index %q has %s that discover cannot reproduce; set PartialFilter/Collation here.\n", idx.Name, strings.Join(missing, " and "))
 	}
-	simple := !idx.Sparse && idx.ExpireAfterSeconds == nil && !idx.HasPartialFilter && !idx.HasCollation
+	customName := idx.Name != "" && idx.Name != idx.DerivedName()
+	simple := !idx.Sparse && idx.ExpireAfterSeconds == nil && !idx.HasPartialFilter && !idx.HasCollation && !customName
 	switch {
 	case simple && idx.Unique:
 		fmt.Fprintf(&b, "goodm.NewUniqueCompoundIndex(%s),", joinFields(idx.Keys))
@@ -74,6 +75,9 @@ func renderIndexEntry(idx DiscoveredIndex) string {
 		}
 		if idx.Sparse {
 			b.WriteString(", Sparse: true")
+		}
+		if customName {
+			fmt.Fprintf(&b, ", Name: %q", idx.Name)
 		}
 		if idx.ExpireAfterSeconds != nil {
 			fmt.Fprintf(&b, ", ExpireAfterSeconds: goodm.TTL(%d * time.Second)", *idx.ExpireAfterSeconds)
@@ -162,12 +166,23 @@ func GenerateModel(coll DiscoveredCollection, opts GenerateOptions) ([]byte, err
 		})
 	}
 
-	// Indexes that tags cannot express: compound, or single-key with a
-	// partial filter or collation. Everything else became a field tag above.
+	// Indexes that tags cannot express: compound, single-key with options
+	// or a custom name, or single-key on a path that is not a generated
+	// field (a dotted path, or a field absent from the sample). Everything
+	// else became a field tag above.
+	generated := map[string]bool{}
+	for _, f := range fields {
+		generated[f.BSONName] = true
+	}
 	var indexEntries []string
 	for _, idx := range coll.Indexes {
-		if idx.Name == "_id_" || idx.SingleFieldTag() {
+		if idx.Name == "_id_" {
 			continue
+		}
+		if idx.SingleFieldTag() {
+			if field, _ := parseIndexField(idx.Keys[0]); generated[field] {
+				continue
+			}
 		}
 		if idx.ExpireAfterSeconds != nil {
 			needsTime = true

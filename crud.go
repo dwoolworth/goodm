@@ -471,10 +471,10 @@ func Update(ctx context.Context, model interface{}, opts ...UpdateOptions) error
 
 	// Middleware may replace info.Filter (e.g. to scope by tenant); it is
 	// ANDed with the _id and version filters of every read and write below.
+	base := bson.D{{Key: "_id", Value: id}}
 	info := &OpInfo{
 		Operation: OpUpdate, Collection: schema.Collection,
-		ModelName: schema.ModelName, Model: model,
-		Filter: bson.D{{Key: "_id", Value: id}},
+		ModelName: schema.ModelName, Model: model, Filter: base,
 	}
 	return runMiddleware(ctx, info, func(ctx context.Context) error {
 		db, err := getDB(opt.DB)
@@ -483,7 +483,7 @@ func Update(ctx context.Context, model interface{}, opts ...UpdateOptions) error
 		}
 
 		coll := getCollection(db, schema)
-		scope := info.Filter
+		scope := middlewareScope(info, base)
 
 		if err := checkImmutableFields(ctx, coll, scope, id, model, schema); err != nil {
 			return err
@@ -554,13 +554,39 @@ func buildVersionFilter(id interface{}, oldVersion int) bson.D {
 	}
 }
 
-// andFilter ANDs a middleware-supplied scope filter into filter. A nil scope
-// leaves filter unchanged.
+// andFilter ANDs a middleware-supplied scope filter into filter. A nil,
+// typed-nil, or empty scope leaves filter unchanged.
 func andFilter(scope interface{}, filter bson.D) interface{} {
-	if scope == nil {
+	if isEmptyFilter(scope) {
 		return filter
 	}
 	return bson.D{{Key: "$and", Value: bson.A{scope, filter}}}
+}
+
+// isEmptyFilter reports whether a filter value is nil, a typed nil, or an
+// empty document.
+func isEmptyFilter(f interface{}) bool {
+	if f == nil {
+		return true
+	}
+	v := reflect.ValueOf(f)
+	switch v.Kind() {
+	case reflect.Slice, reflect.Map:
+		return v.IsNil() || v.Len() == 0
+	case reflect.Pointer, reflect.Interface:
+		return v.IsNil()
+	}
+	return false
+}
+
+// middlewareScope returns the filter middleware left in info, or nil when it
+// is still the base filter the operation started with, so an untouched
+// operation keeps its plain _id query.
+func middlewareScope(info *OpInfo, base bson.D) interface{} {
+	if reflect.DeepEqual(info.Filter, base) {
+		return nil
+	}
+	return info.Filter
 }
 
 // checkUpdateConflict disambiguates between a missing (or out-of-scope)
@@ -604,14 +630,15 @@ func UpdateFields(ctx context.Context, model interface{}, fields bson.M, opts ..
 		return fmt.Errorf("goodm: cannot update document with zero ID")
 	}
 
-	if err := validateUpdateFields(schema, fields); err != nil {
+	values, err := prepareUpdateFields(schema, fields)
+	if err != nil {
 		return err
 	}
 
+	base := bson.D{{Key: "_id", Value: id}}
 	info := &OpInfo{
 		Operation: OpUpdate, Collection: schema.Collection,
-		ModelName: schema.ModelName, Model: model,
-		Filter: bson.D{{Key: "_id", Value: id}},
+		ModelName: schema.ModelName, Model: model, Filter: base,
 	}
 	return runMiddleware(ctx, info, func(ctx context.Context) error {
 		var optDB *mongo.Database
@@ -623,17 +650,18 @@ func UpdateFields(ctx context.Context, model interface{}, fields bson.M, opts ..
 			return err
 		}
 
-		// Work on a copy so the caller's map is left untouched.
-		set := make(bson.M, len(fields)+1)
-		for k, v := range fields {
-			set[k] = v
+		// Send the converted values (not the caller's map, which is left
+		// untouched) so the stored document matches what the model will hold.
+		set := make(bson.M, len(values)+1)
+		for k, v := range values {
+			set[k] = v.Interface()
 		}
 		now := time.Now()
 		set["updated_at"] = now
 		oldVersion, _ := getModelVersion(model)
 
 		coll := getCollection(db, schema)
-		result, err := coll.UpdateOne(ctx, andFilter(info.Filter, bson.D{{Key: "_id", Value: id}}), bson.D{
+		result, err := coll.UpdateOne(ctx, andFilter(middlewareScope(info, base), base), bson.D{
 			{Key: "$set", Value: set},
 			{Key: "$inc", Value: bson.D{{Key: "__v", Value: 1}}},
 		})
@@ -647,45 +675,108 @@ func UpdateFields(ctx context.Context, model interface{}, fields bson.M, opts ..
 		// Reflect the changes back onto the struct
 		setUpdatedAt(model, now)
 		setModelVersion(model, oldVersion+1)
-		applyFieldsToModel(model, fields)
+		applyFieldsToModel(model, values)
 
 		return nil
 	})
 }
 
-// validateUpdateFields checks that every key in fields is a known, mutable,
-// non-managed schema field and that its value satisfies the field's rules.
-func validateUpdateFields(schema *Schema, fields bson.M) error {
+// prepareUpdateFields checks that every key in fields is a known, mutable,
+// non-managed schema field, converts each value to the field's Go type, and
+// validates it. The returned map holds the converted values, which are what
+// is sent to the database and copied onto the model, so the two agree.
+func prepareUpdateFields(schema *Schema, fields bson.M) (map[string]reflect.Value, error) {
 	var errs ValidationErrors
+	out := make(map[string]reflect.Value, len(fields))
 	for name, val := range fields {
 		if managedFields[name] {
-			return fmt.Errorf("goodm: cannot set managed field %q via UpdateFields", name)
+			return nil, fmt.Errorf("goodm: cannot set managed field %q via UpdateFields", name)
 		}
 		fs, immutable, isElement := resolveFieldPath(schema, name)
 		if fs == nil {
-			return fmt.Errorf("goodm: unknown field %q in %s", name, schema.ModelName)
+			return nil, fmt.Errorf("goodm: unknown field %q in %s", name, schema.ModelName)
 		}
 		if immutable {
-			return ValidationErrors{{Field: name, Message: "field is immutable and cannot be changed"}}
+			return nil, ValidationErrors{{Field: name, Message: "field is immutable and cannot be changed"}}
 		}
-		errs = append(errs, validateFieldValue(fs, val, name, isElement)...)
+		target := fs.goType
+		if isElement {
+			target = target.Elem()
+		}
+		v, err := convertFieldValue(val, target)
+		if err != nil {
+			errs = append(errs, ValidationError{Field: name, Message: fmt.Sprintf("cannot assign %T to %s: %v", val, target, err)})
+			continue
+		}
+		if isElement {
+			errs = append(errs, validateSliceElement(v, fs, name)...)
+		} else {
+			errs = append(errs, validateOneField(v, fs, name)...)
+		}
+		out[name] = v
 	}
 	if len(errs) > 0 {
-		return errs
+		return nil, errs
 	}
-	return nil
+	return out, nil
+}
+
+// convertFieldValue converts a caller-supplied value to the Go type of the
+// field it is set on. A value of the right type is used as is; anything else
+// (bson.M, bson.D, a struct of another type, a wider number) is converted by
+// the same BSON round trip the driver applies when the stored document is
+// read back, so a value the field cannot hold is rejected here instead of
+// being stored and then lost. nil becomes the zero value.
+func convertFieldValue(val interface{}, t reflect.Type) (reflect.Value, error) {
+	ptr := reflect.New(t)
+	if val == nil {
+		return ptr.Elem(), nil
+	}
+	rv := reflect.ValueOf(val)
+	if rv.Type().AssignableTo(t) {
+		return rv, nil
+	}
+	raw, err := bson.Marshal(bson.D{{Key: "v", Value: val}})
+	if err != nil {
+		return reflect.Value{}, err
+	}
+	if err := bson.Raw(raw).Lookup("v").Unmarshal(ptr.Interface()); err != nil {
+		return reflect.Value{}, err
+	}
+	return ptr.Elem(), nil
+}
+
+// validateSliceElement validates one element of a slice field: a subdocument
+// element is validated by its inner fields; scalar elements have no rules.
+func validateSliceElement(v reflect.Value, fs *FieldSchema, path string) []ValidationError {
+	if len(fs.SubFields) == 0 {
+		return nil
+	}
+	if v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return nil
+		}
+		v = v.Elem()
+	}
+	if v.Kind() != reflect.Struct {
+		return nil
+	}
+	return validateFields(v, fs.SubFields, path)
 }
 
 // resolveFieldPath walks a dotted bson path through the schema. A numeric
-// segment after a slice field selects one element. It returns the leaf
-// field, whether the leaf or any ancestor is immutable, and whether the path
-// ends on a slice element rather than the slice itself; the field is nil if
+// segment after a slice or array field selects one element. It returns the
+// leaf field, whether the leaf or any ancestor is immutable, and whether the
+// path ends on an element rather than the field itself; the field is nil if
 // the path is unknown.
 func resolveFieldPath(schema *Schema, path string) (field *FieldSchema, immutable, isElement bool) {
 	fields := schema.Fields
 	var leaf *FieldSchema
 	for _, seg := range strings.Split(path, ".") {
-		if _, err := strconv.Atoi(seg); err == nil && leaf != nil && !isElement && isSliceField(leaf) {
+		if n, err := strconv.Atoi(seg); err == nil && leaf != nil && !isElement && isSliceField(leaf) {
+			if n < 0 {
+				return nil, false, false
+			}
 			isElement = true
 			continue
 		}
@@ -712,152 +803,24 @@ func resolveFieldPath(schema *Schema, path string) (field *FieldSchema, immutabl
 
 // isSliceField reports whether a schema field holds a slice or array.
 func isSliceField(fs *FieldSchema) bool {
-	return fs.IsSlice || strings.HasPrefix(fs.Type, "[]")
+	if fs.goType == nil {
+		return fs.IsSlice || strings.HasPrefix(fs.Type, "[]")
+	}
+	k := fs.goType.Kind()
+	return k == reflect.Slice || k == reflect.Array
 }
 
-// indirectValue follows interfaces and non-nil pointers to the concrete value.
-func indirectValue(v reflect.Value) reflect.Value {
-	for v.IsValid() && (v.Kind() == reflect.Interface || v.Kind() == reflect.Pointer) {
-		if v.IsNil() {
-			return reflect.Value{}
-		}
-		v = v.Elem()
-	}
-	return v
-}
-
-// validateFieldValue checks one value against a field's required, enum, min,
-// max, and subdocument rules. Subdocument values may be Go structs, bson.M,
-// bson.D, or any map with string keys; slices of those for slice fields.
-// isElement means the value is one element of a slice field.
-func validateFieldValue(fs *FieldSchema, val interface{}, path string, isElement bool) []ValidationError {
-	rv := indirectValue(reflect.ValueOf(val))
-	if !rv.IsValid() {
-		if fs.Required {
-			return []ValidationError{{Field: path, Message: "field is required"}}
-		}
-		return nil
-	}
-
-	if len(fs.SubFields) > 0 {
-		if fs.IsSlice && !isElement {
-			return validateSubdocSlice(fs, rv, path)
-		}
-		return validateSubdocValue(fs.SubFields, rv, path)
-	}
-	if isElement {
-		return nil // an element of a scalar slice has no per-element rules
-	}
-
-	var errs []ValidationError
-	if fs.Required && rv.IsZero() {
-		errs = append(errs, ValidationError{Field: path, Message: "field is required"})
-	}
-	if len(fs.Enum) > 0 && !rv.IsZero() {
-		if err := validateEnum(rv, fs.Enum, path); err != nil {
-			errs = append(errs, *err)
-		}
-	}
-	if fs.Min != nil {
-		if err := validateMin(rv, *fs.Min, path); err != nil {
-			errs = append(errs, *err)
-		}
-	}
-	if fs.Max != nil {
-		if err := validateMax(rv, *fs.Max, path); err != nil {
-			errs = append(errs, *err)
-		}
-	}
-	return errs
-}
-
-// validateSubdocSlice validates a value set on a []struct field: its length
-// against min/max and each element as a subdocument.
-func validateSubdocSlice(fs *FieldSchema, rv reflect.Value, path string) []ValidationError {
-	if rv.Kind() != reflect.Slice && rv.Kind() != reflect.Array {
-		return []ValidationError{{Field: path, Message: fmt.Sprintf("expected an array of subdocuments, got %s", rv.Type())}}
-	}
-	var errs []ValidationError
-	if fs.Min != nil {
-		if err := validateMin(rv, *fs.Min, path); err != nil {
-			errs = append(errs, *err)
-		}
-	}
-	if fs.Max != nil {
-		if err := validateMax(rv, *fs.Max, path); err != nil {
-			errs = append(errs, *err)
-		}
-	}
-	for i := 0; i < rv.Len(); i++ {
-		elem := indirectValue(rv.Index(i))
-		if !elem.IsValid() {
-			continue
-		}
-		errs = append(errs, validateSubdocValue(fs.SubFields, elem, fmt.Sprintf("%s[%d]", path, i))...)
-	}
-	return errs
-}
-
-// validateSubdocValue validates one subdocument given as a struct, bson.D,
-// bson.M, or string-keyed map.
-func validateSubdocValue(fields []FieldSchema, rv reflect.Value, path string) []ValidationError {
-	switch {
-	case rv.Kind() == reflect.Struct:
-		return validateFields(rv, fields, path)
-	case rv.Kind() == reflect.Map && rv.Type().Key().Kind() == reflect.String:
-		get := func(name string) (interface{}, bool) {
-			v := rv.MapIndex(reflect.ValueOf(name).Convert(rv.Type().Key()))
-			if !v.IsValid() {
-				return nil, false
-			}
-			return v.Interface(), true
-		}
-		return validateSubdocFields(fields, get, path)
-	case rv.Type() == reflect.TypeOf(bson.D{}):
-		doc := rv.Interface().(bson.D)
-		get := func(name string) (interface{}, bool) {
-			for _, e := range doc {
-				if e.Key == name {
-					return e.Value, true
-				}
-			}
-			return nil, false
-		}
-		return validateSubdocFields(fields, get, path)
-	default:
-		return []ValidationError{{Field: path, Message: fmt.Sprintf("expected a subdocument, got %s", rv.Type())}}
-	}
-}
-
-// validateSubdocFields applies each field's rules to the value looked up by
-// bson name. Missing fields fail only when required.
-func validateSubdocFields(fields []FieldSchema, get func(string) (interface{}, bool), path string) []ValidationError {
-	var errs []ValidationError
-	for i := range fields {
-		fs := &fields[i]
-		fieldPath := path + "." + fs.BSONName
-		val, ok := get(fs.BSONName)
-		if !ok {
-			if fs.Required {
-				errs = append(errs, ValidationError{Field: fieldPath, Message: "field is required"})
-			}
-			continue
-		}
-		errs = append(errs, validateFieldValue(fs, val, fieldPath, false)...)
-	}
-	return errs
-}
-
-// applyFieldsToModel reflects $set values back onto the Go struct so the caller
-// sees the updated state without a re-read. Dotted paths are followed through
-// nested structs, pointers, and slice indices; values that cannot be assigned
-// are skipped.
-func applyFieldsToModel(model interface{}, fields bson.M) {
+// applyFieldsToModel copies the converted values onto the Go struct so the
+// caller sees the updated state without a re-read. Dotted paths are followed
+// through nested structs, pointers, and slice indices; a path that cannot be
+// reached on the current model (e.g. an index past the end of a slice) is
+// skipped.
+func applyFieldsToModel(model interface{}, values map[string]reflect.Value) {
 	root := reflect.ValueOf(model)
 	if root.Kind() == reflect.Pointer {
 		root = root.Elem()
 	}
-	for path, val := range fields {
+	for path, val := range values {
 		target := root
 		ok := true
 		for _, seg := range strings.Split(path, ".") {
@@ -866,10 +829,10 @@ func applyFieldsToModel(model interface{}, fields bson.M) {
 				break
 			}
 		}
-		if !ok || !target.CanSet() {
+		if !ok || !target.CanSet() || !val.Type().AssignableTo(target.Type()) {
 			continue
 		}
-		assignValue(target, val)
+		target.Set(val)
 	}
 }
 
@@ -929,23 +892,6 @@ func fieldByBSONName(v reflect.Value, name string) reflect.Value {
 		}
 	}
 	return reflect.Value{}
-}
-
-// assignValue sets val onto target when it is assignable or convertible.
-func assignValue(target reflect.Value, val interface{}) {
-	if val == nil {
-		target.Set(reflect.Zero(target.Type()))
-		return
-	}
-	rv := reflect.ValueOf(val)
-	switch {
-	case rv.Type().AssignableTo(target.Type()):
-		target.Set(rv)
-	case rv.Type().ConvertibleTo(target.Type()) && rv.Kind() != reflect.String && target.Kind() != reflect.String:
-		target.Set(rv.Convert(target.Type()))
-	case rv.Kind() == reflect.String && target.Kind() == reflect.String:
-		target.SetString(rv.String())
-	}
 }
 
 // UpdateOne performs a partial update on a single document matching filter.
@@ -1277,10 +1223,10 @@ func Delete(ctx context.Context, model interface{}, opts ...DeleteOptions) error
 		return fmt.Errorf("goodm: cannot delete document with zero ID")
 	}
 
+	base := bson.D{{Key: "_id", Value: id}}
 	info := &OpInfo{
 		Operation: OpDelete, Collection: schema.Collection,
-		ModelName: schema.ModelName, Model: model,
-		Filter: bson.D{{Key: "_id", Value: id}},
+		ModelName: schema.ModelName, Model: model, Filter: base,
 	}
 	return runMiddleware(ctx, info, func(ctx context.Context) error {
 		var opt DeleteOptions
@@ -1300,7 +1246,7 @@ func Delete(ctx context.Context, model interface{}, opts ...DeleteOptions) error
 		}
 
 		coll := getCollection(db, schema)
-		result, err := coll.DeleteOne(ctx, andFilter(info.Filter, bson.D{{Key: "_id", Value: id}}), deleteOneOptions(opt))
+		result, err := coll.DeleteOne(ctx, andFilter(middlewareScope(info, base), base), deleteOneOptions(opt))
 		if err != nil {
 			return fmt.Errorf("goodm: delete failed: %w", err)
 		}

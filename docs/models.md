@@ -282,7 +282,7 @@ Because schemas are keyed by type, two packages may each register a struct named
 
 ## Custom ID Types
 
-The `_id` field is the struct field tagged `bson:"_id"`, found through embedded structs; `Register` rejects a model that has none. A field merely named `ID` is not enough, because the driver would store it as `id`. When the `_id` field is a `bson.ObjectID`, `Create` generates a value if it is zero. Any other type works, but you must set it yourself before `Create` or in a `BeforeCreate` hook; a zero `_id` of a non-ObjectID type is rejected rather than inserted as an empty key.
+The `_id` field is the struct field tagged `bson:"_id"`, found directly or through embedded structs tagged `bson:",inline"`; `Register` rejects a model that has none, and in particular one that embeds `goodm.Model` without the inline tag, because the driver would store its `_id` as a nested document. A field merely named `ID` is not enough, because the driver would store it as `id`. When the `_id` field is a `bson.ObjectID`, `Create` generates a value if it is zero. Any other type works, but you must set it yourself before `Create` or in a `BeforeCreate` hook; a zero `_id` of a non-ObjectID type is rejected rather than inserted as an empty key.
 
 ```go
 type Setting struct {

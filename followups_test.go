@@ -3,12 +3,14 @@ package goodm
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/session"
 )
 
 // --- UpdateFields with non-struct subdocument values (previously panicked) ---
@@ -325,7 +327,7 @@ func TestDiscover_IndexKindsAndOptions(t *testing.T) {
 		`goodm:"index=-1,required"`,
 		`goodm:"index,ttl=3600,required"`,
 		`goodm:"unique,sparse,required"`,
-		`goodm.NewCompoundIndex("body:text", "title:text")`,
+		`{Fields: []string{"body:text", "title:text"}, Name: "title_text_body_text"},`,
 		`{Fields: []string{"email"}, Unique: true},`,
 		`TODO: index "email_1" has a partial filter`,
 	} {
@@ -335,5 +337,235 @@ func TestDiscover_IndexKindsAndOptions(t *testing.T) {
 	}
 	if strings.Contains(code, "_fts") {
 		t.Errorf("text index must not leak internal keys:\n%s", code)
+	}
+}
+
+// --- second-round review findings ---
+
+type testArrayField struct {
+	Model  `bson:",inline"`
+	Coords [2]float64 `bson:"coords"`
+	Score  int        `bson:"score"`
+	Nested struct {
+		Inner []testOrderItem `bson:"inner"`
+	} `bson:"nested"`
+}
+
+func TestUpdateFields_ConversionIsValidatedNotPanicking(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testArrayField{}, "test_array_field", "")
+
+	m := &testArrayField{Coords: [2]float64{1, 2}, Score: 1}
+	if err := Create(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+
+	var ve ValidationErrors
+	// short slice into an array: previously passed validation, wrote, then
+	// panicked. It now converts to the padded array the field can hold, and
+	// that is what is stored and reflected.
+	if err := UpdateFields(ctx, m, bson.M{"coords": []float64{1}}); err != nil || m.Coords != [2]float64{1, 0} {
+		t.Errorf("short slice for an array: err=%v coords=%v", err, m.Coords)
+	}
+	var stored testArrayField
+	if err := FindByID(ctx, m.ID, &stored); err != nil || stored.Coords != [2]float64{1, 0} {
+		t.Errorf("stored array should be the converted value: %v %v", stored.Coords, err)
+	}
+	// struct of a different type: previously panicked in validation
+	if err := UpdateFields(ctx, m, bson.M{"nested": struct{ Inner int }{3}}); !errors.As(err, &ve) {
+		t.Errorf("mismatched struct must be a validation error, got %v", err)
+	}
+	// a float that the int field cannot hold
+	if err := UpdateFields(ctx, m, bson.M{"score": 5.7}); !errors.As(err, &ve) {
+		t.Errorf("5.7 into an int must be a validation error, got %v", err)
+	}
+	// an integral float is fine and is reflected as an int
+	if err := UpdateFields(ctx, m, bson.M{"score": 7.0}); err != nil || m.Score != 7 {
+		t.Errorf("7.0 into an int: %v score=%d", err, m.Score)
+	}
+	// bson.D for a []struct field must not be accepted as elements
+	if err := UpdateFields(ctx, m, bson.M{"nested.inner": bson.D{{Key: "name", Value: "x"}, {Key: "quantity", Value: 1}}}); !errors.As(err, &ve) {
+		t.Errorf("bson.D for a slice field must be a validation error, got %v", err)
+	}
+	// a struct of another type with required fields missing
+	if err := UpdateFields(ctx, m, bson.M{"nested.inner": []struct{}{{}}}); !errors.As(err, &ve) {
+		t.Errorf("elements missing required fields must be rejected, got %v", err)
+	}
+	// array element path works
+	if err := UpdateFields(ctx, m, bson.M{"coords.1": 9.5}); err != nil || m.Coords[1] != 9.5 {
+		t.Errorf("array element: %v coords=%v", err, m.Coords)
+	}
+	if err := UpdateFields(ctx, m, bson.M{"coords.-1": 1.0}); err == nil {
+		t.Error("negative index must be rejected")
+	}
+	// nil for a slice tagged min=1 fails like an empty slice
+	o := &testOrder{Name: "o", Address: testAddress{Street: "s", City: "c"}, Items: []testOrderItem{{Name: "a", Quantity: 1}}}
+	if err := Create(ctx, o); err != nil {
+		t.Fatal(err)
+	}
+	if err := UpdateFields(ctx, o, bson.M{"items.0.quantity": nil}); !errors.As(err, &ve) {
+		t.Errorf("nil for a min=1 field must be a validation error, got %v", err)
+	}
+}
+
+func TestUpdateFields_MapValuesAreReflectedOntoModel(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	o := &testOrder{Name: "o", Address: testAddress{Street: "1 St", City: "Old"}, Items: []testOrderItem{{Name: "w", Quantity: 1}}}
+	if err := Create(ctx, o); err != nil {
+		t.Fatal(err)
+	}
+	err := UpdateFields(ctx, o, bson.M{
+		"address": bson.M{"street": "2 St", "city": "New"},
+		"items":   bson.A{bson.M{"name": "a", "quantity": 3}, bson.M{"name": "b", "quantity": 4}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o.Address.City != "New" || len(o.Items) != 2 || o.Items[1].Quantity != 4 {
+		t.Fatalf("map values not reflected onto the model: %+v %+v", o.Address, o.Items)
+	}
+	// A following Update must not undo them.
+	o.Name = "renamed"
+	if err := Update(ctx, o); err != nil {
+		t.Fatal(err)
+	}
+	var fresh testOrder
+	if err := FindByID(ctx, o.ID, &fresh); err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Address.City != "New" || len(fresh.Items) != 2 || fresh.Name != "renamed" {
+		t.Errorf("Update after UpdateFields lost the map-shaped changes: %+v", fresh)
+	}
+}
+
+func TestRegister_RejectsModelEmbeddedWithoutInline(t *testing.T) {
+	type noInline struct {
+		Model
+		Name string `bson:"name"`
+	}
+	err := Register(&noInline{}, "no_inline")
+	if err == nil {
+		Unregister(&noInline{})
+		t.Fatal("embedding goodm.Model without bson:\",inline\" must be rejected")
+	}
+	if !strings.Contains(err.Error(), "inline") {
+		t.Errorf("error should explain the inline tag: %v", err)
+	}
+}
+
+func TestWithTransaction_CallbackErrorIsNotMistakenForNesting(t *testing.T) {
+	ctx, db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	sess, err := db.Client().StartSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.EndSession(ctx)
+	sessCtx := mongo.NewSessionContext(ctx, sess)
+
+	calls := 0
+	u := &testUser{Email: "nest@test.com", Name: "N"}
+	err = WithTransaction(sessCtx, func(ctx context.Context) error {
+		calls++
+		if err := Create(ctx, u); err != nil {
+			return err
+		}
+		// A callback that itself reports the driver's in-progress error must
+		// not make goodm think it is nested and rerun it outside a transaction.
+		return fmt.Errorf("wrapped: %w", session.ErrTransactInProgress)
+	})
+	if err == nil {
+		t.Fatal("expected the callback error")
+	}
+	if calls != 1 {
+		t.Errorf("callback ran %d times, want 1", calls)
+	}
+	if ok, _ := Exists(ctx, bson.D{{Key: "email", Value: "nest@test.com"}}, &testUser{}); ok {
+		t.Error("the write must have been rolled back")
+	}
+}
+
+func TestMiddleware_TypedNilScopeIsIgnored(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	u := seedUsers(t, ctx, 1)[0]
+
+	Use(func(ctx context.Context, op *OpInfo, next func(context.Context) error) error {
+		if op.Operation == OpUpdate || op.Operation == OpDelete {
+			var f bson.D
+			op.Filter = f
+		}
+		return next(ctx)
+	})
+	u.Age = 5
+	if err := Update(ctx, u); err != nil {
+		t.Errorf("typed nil scope on Update: %v", err)
+	}
+	if err := UpdateFields(ctx, u, bson.M{"age": 6}); err != nil {
+		t.Errorf("typed nil scope on UpdateFields: %v", err)
+	}
+	if err := Delete(ctx, u); err != nil {
+		t.Errorf("typed nil scope on Delete: %v", err)
+	}
+}
+
+type testSharedConflict struct {
+	Model `bson:",inline"`
+	B     string `bson:"b" goodm:"index"` // testSharedB declares b unique
+	Kind  string `bson:"kind"`
+}
+
+func TestPlanMigration_ConflictingDefinitionsAreAnError(t *testing.T) {
+	ctx, db, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testSharedB{}, "test_shared", "")
+	registerModel(t, &testSharedConflict{}, "test_shared", "")
+
+	sb, _ := SchemaOf(&testSharedB{})
+	sc, _ := SchemaOf(&testSharedConflict{})
+	if _, err := PlanMigration(ctx, db, []*Schema{sb, sc}); err == nil || !strings.Contains(err.Error(), "defined differently") {
+		t.Fatalf("expected a conflict error, got %v", err)
+	}
+}
+
+func TestDiscover_CustomNamesAndDottedPaths(t *testing.T) {
+	ctx, db, cleanup := setupTestDB(t)
+	defer cleanup()
+	coll := db.Collection("disc2")
+	if _, err := coll.InsertOne(ctx, bson.D{{Key: "title", Value: "t"}, {Key: "addr", Value: bson.D{{Key: "city", Value: "c"}}}}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := coll.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{{Key: "title", Value: 1}}, Options: options.Index().SetName("custom_title")},
+		{Keys: bson.D{{Key: "addr.city", Value: 1}}},
+		{Keys: bson.D{{Key: "missing", Value: -1}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found, err := Discover(ctx, db, DiscoverOptions{Collections: []string{"disc2"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, err := GenerateModel(found[0], GenerateOptions{PackageName: "models", EmbedModel: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := string(src)
+	for _, want := range []string{
+		`{Fields: []string{"title"}, Name: "custom_title"},`,
+		`goodm.NewCompoundIndex("addr.city"),`,
+		`goodm.NewCompoundIndex("-missing"),`,
+	} {
+		if !strings.Contains(code, want) {
+			t.Errorf("generated code missing %q:\n%s", want, code)
+		}
+	}
+	if strings.Contains(code, `goodm:"index"`) {
+		t.Errorf("a custom-named index must not become a plain tag:\n%s", code)
 	}
 }

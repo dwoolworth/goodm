@@ -41,7 +41,10 @@ func Register(model interface{}, collection string) error {
 	schema.Fields = parseFields(t, nil)
 	schema.idField = findIDField(t)
 	if schema.idField == nil {
-		return fmt.Errorf("goodm: model %s has no field tagged bson:\"_id\" (embed goodm.Model or tag an ID field)", schema.QualifiedName())
+		if embedsModelWithoutInline(t) {
+			return fmt.Errorf("goodm: model %s embeds goodm.Model without the bson:\",inline\" tag, so its _id would be stored nested; embed it as goodm.Model with the tag bson:\",inline\"", schema.QualifiedName())
+		}
+		return fmt.Errorf("goodm: model %s has no field tagged bson:\"_id\" (embed goodm.Model with bson:\",inline\" or tag an ID field)", schema.QualifiedName())
 	}
 
 	// Check for Indexable interface (compound indexes)
@@ -203,6 +206,7 @@ func parseFields(t reflect.Type, seen map[reflect.Type]bool) []FieldSchema {
 		fs.Name = f.Name
 		fs.BSONName = bsonName
 		fs.Type = internal.TypeName(f.Type)
+		fs.goType = f.Type
 
 		// Determine underlying type (deref pointers, unwrap slices)
 		fieldType := f.Type
@@ -231,32 +235,50 @@ func parseFields(t reflect.Type, seen map[reflect.Type]bool) []FieldSchema {
 	return result
 }
 
-// findIDField locates the struct field tagged bson:"_id", searching through
-// embedded structs. Returns nil if there is none. A field merely named ID is
-// not accepted: the driver would store it under "id", not "_id".
+// findIDField locates the struct field tagged bson:"_id". Direct fields are
+// checked first, then embedded structs that the driver flattens: anonymous,
+// exported, and tagged bson:",inline". An embedded struct without the inline
+// tag is stored as a nested document, so an _id inside it is not the
+// document's _id and is deliberately not found. Returns nil if there is none.
 func findIDField(t reflect.Type) []int {
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
-		if !f.IsExported() && !f.Anonymous {
+		if !f.IsExported() {
 			continue
 		}
-		name, _ := ParseBSONTag(f.Tag.Get("bson"))
-		if name == "_id" {
+		if name, _ := ParseBSONTag(f.Tag.Get("bson")); name == "_id" {
 			return []int{i}
 		}
-		if f.Anonymous {
-			ft := f.Type
-			if ft.Kind() == reflect.Pointer {
-				ft = ft.Elem()
-			}
-			if ft.Kind() == reflect.Struct {
-				if inner := findIDField(ft); inner != nil {
-					return append([]int{i}, inner...)
-				}
-			}
+	}
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if !f.Anonymous || !f.IsExported() || !bsonTagInline(f.Tag.Get("bson")) {
+			continue
+		}
+		ft := f.Type
+		if ft.Kind() == reflect.Pointer {
+			ft = ft.Elem()
+		}
+		if ft.Kind() != reflect.Struct {
+			continue
+		}
+		if inner := findIDField(ft); inner != nil {
+			return append([]int{i}, inner...)
 		}
 	}
 	return nil
+}
+
+// embedsModelWithoutInline reports whether t embeds goodm.Model without the
+// bson:",inline" tag, the most likely cause of a missing _id.
+func embedsModelWithoutInline(t reflect.Type) bool {
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if f.Anonymous && f.Type == reflect.TypeOf(Model{}) && !bsonTagInline(f.Tag.Get("bson")) {
+			return true
+		}
+	}
+	return false
 }
 
 // detectHooks checks which hook interfaces a model implements.

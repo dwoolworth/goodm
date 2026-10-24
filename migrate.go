@@ -3,7 +3,9 @@ package goodm
 import (
 	"context"
 	"fmt"
+	"reflect"
 
+	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
@@ -76,12 +78,17 @@ func PlanMigration(ctx context.Context, db *mongo.Database, schemas []*Schema) (
 		delete(existing, "_id_")
 
 		expected := make(map[string]bool)
+		declared := map[string]indexOrigin{}
 		for _, schema := range group {
 			for _, def := range schema.IndexDefinitions() {
 				def := def
-				if expected[def.Name] {
+				if prev, seen := declared[def.Name]; seen {
+					if !indexDefinitionsEqual(prev.def, def) {
+						return plan, fmt.Errorf("migration: index %s on %s is defined differently by %s and %s", def.Name, collection, prev.schema.QualifiedName(), schema.QualifiedName())
+					}
 					continue
 				}
+				declared[def.Name] = indexOrigin{schema: schema, def: def}
 				expected[def.Name] = true
 				spec, ok := existing[def.Name]
 				if !ok {
@@ -117,18 +124,49 @@ func PlanMigration(ctx context.Context, db *mongo.Database, schemas []*Schema) (
 			}
 		}
 
+		// Drift is judged against every field any model of the collection declares.
+		known := map[string]bool{}
 		for _, schema := range group {
-			for _, d := range DetectDrift(ctx, db, schema, DefaultDriftSampleSize) {
-				plan.Actions = append(plan.Actions, MigrationAction{
-					Type:        ActionFieldDrift,
-					Collection:  collection,
-					Description: fmt.Sprintf("Extra field: %s", d.Field),
-				})
+			for f := range knownFields(schema) {
+				known[f] = true
 			}
+		}
+		for _, d := range detectDriftIn(ctx, db, collection, known, DefaultDriftSampleSize) {
+			plan.Actions = append(plan.Actions, MigrationAction{
+				Type:        ActionFieldDrift,
+				Collection:  collection,
+				Description: fmt.Sprintf("Extra field: %s", d.Field),
+			})
 		}
 	}
 
 	return plan, nil
+}
+
+// indexOrigin records which schema first declared an index name.
+type indexOrigin struct {
+	schema *Schema
+	def    IndexDefinition
+}
+
+// indexDefinitionsEqual reports whether two definitions describe the same index.
+func indexDefinitionsEqual(a, b IndexDefinition) bool {
+	if !indexKeysEqual(a.Keys, b.Keys) || a.Unique != b.Unique || a.Sparse != b.Sparse || !ttlEqual(a.ExpireAfterSeconds, b.ExpireAfterSeconds) {
+		return false
+	}
+	pa, errA := toBsonMapOrNil(a.PartialFilter)
+	pb, errB := toBsonMapOrNil(b.PartialFilter)
+	if errA != nil || errB != nil || !reflect.DeepEqual(pa, pb) {
+		return false
+	}
+	return reflect.DeepEqual(a.Collation, b.Collation)
+}
+
+func toBsonMapOrNil(v interface{}) (bson.M, error) {
+	if v == nil {
+		return nil, nil
+	}
+	return toBsonMap(v)
 }
 
 // describeIndexOptions renders the notable options of a definition for plan output.

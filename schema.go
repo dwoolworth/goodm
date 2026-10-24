@@ -37,7 +37,12 @@ type FieldSchema struct {
 	Immutable bool          // cannot be changed after creation
 	SubFields []FieldSchema // inner fields for struct/[]struct subdocuments
 	IsSlice   bool          // true if field is []struct or []*struct
+
+	goType reflect.Type // the Go type of the field, used to convert values set via UpdateFields
 }
+
+// GoType returns the Go type of the field.
+func (f *FieldSchema) GoType() reflect.Type { return f.goType }
 
 // isLeafType returns true for struct types that serialize as atomic BSON values
 // and should NOT be recursed into for subdocument parsing.

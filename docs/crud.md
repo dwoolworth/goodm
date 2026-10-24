@@ -164,7 +164,7 @@ func UpdateFields(ctx context.Context, model interface{}, fields bson.M, opts ..
 
 Partial `$set` of named fields on the document identified by the model's ID, without optimistic locking (last write wins). Use it when concurrent writers touch disjoint fields, such as progress counters or heartbeats. It sets `updated_at`, increments `__v`, and reflects the new values onto the struct.
 
-Each value is validated against the field's schema (`required`, `enum`, `min`, `max`), immutable fields are rejected, and dotted paths into subdocuments and array elements are allowed. Subdocument values may be Go structs, `bson.M`, `bson.D`, or slices of those; their inner fields are validated by bson name. The map you pass is not modified.
+Each value is first converted to the field's Go type by the same BSON round trip the driver applies when reading the document back, then validated against the field's schema (`required`, `enum`, `min`, `max`). A value the field cannot hold (a fractional number for an `int`, a document for a string, a `bson.D` for a `[]struct`) is a `ValidationError`. Subdocument values may be Go structs, `bson.M`, `bson.D`, or slices of those; keys the schema does not declare are dropped, as `Update` drops them. The converted value is what is stored and what is copied onto the model, so the two always agree. Immutable fields are rejected, dotted paths into subdocuments and array elements are allowed, and the map you pass is not modified.
 
 ```go
 err := goodm.UpdateFields(ctx, task, bson.M{

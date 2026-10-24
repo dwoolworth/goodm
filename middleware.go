@@ -27,8 +27,9 @@ const (
 //
 // Filter and Pipeline are read by the operation after the middleware chain
 // runs, so middleware may replace them (for example to scope every query to a
-// tenant or to hide soft-deleted documents). Filter is informational for
-// Update and Delete, which always address the model by its _id.
+// tenant or to hide soft-deleted documents). Update, UpdateFields, Delete, and
+// SaveMany AND a replaced Filter with the _id (and version) filters they
+// build themselves, so a document outside the scope is reported as not found.
 type OpInfo struct {
 	Operation  OpType
 	Collection string

@@ -58,12 +58,21 @@ func WithTransaction(ctx context.Context, fn func(ctx context.Context) error, op
 	}
 
 	if sess := mongo.SessionFromContext(ctx); sess != nil {
-		_, err := sess.WithTransaction(ctx, callback, txnOpts...)
-		if errors.Is(err, session.ErrTransactInProgress) {
+		// Decide whether a transaction is already running before calling fn,
+		// so an error fn itself returns can never be mistaken for nesting.
+		// StartTransaction is purely local until the first operation, and
+		// AbortTransaction on a transaction in that state is local too.
+		switch err := sess.StartTransaction(txnOpts...); {
+		case errors.Is(err, session.ErrTransactInProgress):
 			// Nested call: join the transaction already running on this session.
 			return fn(ctx)
+		case err != nil:
+			return fmt.Errorf("goodm: failed to start transaction: %w", err)
 		}
-		if err != nil {
+		if err := sess.AbortTransaction(ctx); err != nil {
+			return fmt.Errorf("goodm: failed to reset transaction state: %w", err)
+		}
+		if _, err := sess.WithTransaction(ctx, callback, txnOpts...); err != nil {
 			return fmt.Errorf("goodm: transaction failed: %w", err)
 		}
 		return nil

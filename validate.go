@@ -22,7 +22,8 @@ func Validate(model interface{}, schema *Schema) []ValidationError {
 func validateFields(v reflect.Value, fields []FieldSchema, pathPrefix string) []ValidationError {
 	var errs []ValidationError
 
-	for _, fs := range fields {
+	for i := range fields {
+		fs := &fields[i]
 		fv := v.FieldByName(fs.Name)
 		if !fv.IsValid() {
 			continue
@@ -32,43 +33,49 @@ func validateFields(v reflect.Value, fields []FieldSchema, pathPrefix string) []
 		if pathPrefix != "" {
 			fieldPath = pathPrefix + "." + fs.BSONName
 		}
-
-		// Required: field must be non-zero
-		if fs.Required && fv.IsZero() {
-			errs = append(errs, ValidationError{
-				Field:   fieldPath,
-				Message: "field is required",
-			})
-		}
-
-		// Enum: value must be in the allowed set. A zero value is treated as
-		// unset here; combine with required to reject it.
-		if len(fs.Enum) > 0 && !fv.IsZero() {
-			if err := validateEnum(fv, fs.Enum, fieldPath); err != nil {
-				errs = append(errs, *err)
-			}
-		}
-
-		// Min/Max apply to every present value, including the zero value: a
-		// field tagged min=1 must reject 0. Only a nil pointer counts as absent.
-		if (fs.Min != nil || fs.Max != nil) && !isNilPointer(fv) {
-			if fs.Min != nil {
-				if err := validateMin(fv, *fs.Min, fieldPath); err != nil {
-					errs = append(errs, *err)
-				}
-			}
-			if fs.Max != nil {
-				if err := validateMax(fv, *fs.Max, fieldPath); err != nil {
-					errs = append(errs, *err)
-				}
-			}
-		}
-
-		// Recurse into subdocuments
-		errs = append(errs, validateSubFields(fv, fs, fieldPath)...)
+		errs = append(errs, validateOneField(fv, fs, fieldPath)...)
 	}
 
 	return errs
+}
+
+// validateOneField applies a field's rules to a value of the field's Go type.
+func validateOneField(fv reflect.Value, fs *FieldSchema, fieldPath string) []ValidationError {
+	var errs []ValidationError
+
+	// Required: field must be non-zero
+	if fs.Required && fv.IsZero() {
+		errs = append(errs, ValidationError{
+			Field:   fieldPath,
+			Message: "field is required",
+		})
+	}
+
+	// Enum: value must be in the allowed set. A zero value is treated as
+	// unset here; combine with required to reject it.
+	if len(fs.Enum) > 0 && !fv.IsZero() {
+		if err := validateEnum(fv, fs.Enum, fieldPath); err != nil {
+			errs = append(errs, *err)
+		}
+	}
+
+	// Min/Max apply to every present value, including the zero value: a
+	// field tagged min=1 must reject 0. Only a nil pointer counts as absent.
+	if (fs.Min != nil || fs.Max != nil) && !isNilPointer(fv) {
+		if fs.Min != nil {
+			if err := validateMin(fv, *fs.Min, fieldPath); err != nil {
+				errs = append(errs, *err)
+			}
+		}
+		if fs.Max != nil {
+			if err := validateMax(fv, *fs.Max, fieldPath); err != nil {
+				errs = append(errs, *err)
+			}
+		}
+	}
+
+	// Recurse into subdocuments
+	return append(errs, validateSubFields(fv, *fs, fieldPath)...)
 }
 
 // validateEnum checks that fv is one of the allowed enum values.
