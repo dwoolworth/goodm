@@ -89,12 +89,54 @@ err := goodm.Populate(ctx, post, goodm.Refs{
 })
 ```
 
+## Nested References
+
+A ref inside a subdocument is named by its dotted path of bson names. The path may pass through struct fields, pointer fields (a nil pointer yields nothing), and slices of subdocuments:
+
+```go
+type LineItem struct {
+    ProductID bson.ObjectID `bson:"product" goodm:"ref=products"`
+    Qty       int           `bson:"qty"`
+}
+
+type Shipping struct {
+    CarrierID bson.ObjectID `bson:"carrier" goodm:"ref=carriers"`
+}
+
+type Order struct {
+    goodm.Model `bson:",inline"`
+    Items       []LineItem `bson:"items"`
+    Ship        Shipping   `bson:"ship"`
+}
+
+carrier := &Carrier{}
+var products []Product
+err := goodm.Populate(ctx, order, goodm.Refs{
+    "ship.carrier":  carrier,   // one ref: a struct pointer
+    "items.product": &products, // every item's ref: a slice pointer
+})
+```
+
+When the path crosses a slice without naming an element, the refs of every element are collected (distinct, zero ids and nil elements skipped) and fetched in one `$in` query, so the target must be a pointer to a slice; a struct pointer is an error. A numeric segment selects one element instead, and then a struct pointer is fine:
+
+```go
+first := &Product{}
+err := goodm.Populate(ctx, order, goodm.Refs{"items.0.product": first})
+```
+
+An index past the end of the slice populates nothing. The same paths work with `BatchPopulate`:
+
+```go
+var products []Product
+err := goodm.BatchPopulate(ctx, orders, "items.product", &products)
+```
+
 ## Behavior
 
 - **Zero refs** are skipped — if the `ObjectID` field is zero, the target struct is left untouched.
 - **Empty/nil array refs** are skipped — the target slice is left empty.
 - **Dangling refs** (ID points to a nonexistent document) are skipped silently. The target struct remains at its zero value.
-- **Missing field** or **no ref tag** returns an error immediately.
+- **Missing field**, **no ref tag**, or a **path through a field that is not a subdocument** returns an error immediately.
 
 ## Options
 
