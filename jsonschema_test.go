@@ -2,6 +2,7 @@ package goodm
 
 import (
 	"errors"
+	"net/url"
 	"testing"
 	"time"
 
@@ -113,14 +114,14 @@ func TestJSONSchemaShape(t *testing.T) {
 		{[]string{"name", "maxLength"}, int64(64)},
 		{[]string{"role", "enum"}, bson.A{"admin", "user", ""}},
 		{[]string{"level", "bsonType"}, bson.A{"int", "long"}},
-		{[]string{"level", "enum"}, bson.A{int64(1), int64(2), int64(3), 0}},
+		{[]string{"level", "enum"}, bson.A{int64(1), int64(2), int64(3), int64(0)}},
 		{[]string{"level", "minimum"}, 1.0},
 		{[]string{"level", "maximum"}, 3.0},
 		{[]string{"ratio", "bsonType"}, "double"},
 		{[]string{"ratio", "maximum"}, 1.0},
 		{[]string{"count", "bsonType"}, "int"},
 		{[]string{"count", "minimum"}, 0.0},
-		{[]string{"big", "bsonType"}, "long"},
+		{[]string{"big", "bsonType"}, bson.A{"int", "long"}},
 		{[]string{"big", "minimum"}, 10.0},
 		{[]string{"flag", "bsonType"}, "bool"},
 		{[]string{"when", "bsonType"}, "date"},
@@ -154,7 +155,7 @@ func TestJSONSchemaShape(t *testing.T) {
 		{[]string{"m", "bsonType"}, bson.A{"object", "null"}},
 		{[]string{"dec", "bsonType"}, "decimal"},
 		{[]string{"fixed", "bsonType"}, "array"},
-		{[]string{"fixed", "items", "bsonType"}, "long"},
+		{[]string{"fixed", "items", "bsonType"}, bson.A{"int", "long"}},
 		{[]string{"ptr_lines", "items", "bsonType"}, bson.A{"object", "null"}},
 		{[]string{"nested", "additionalProperties", "bsonType"}, "object"},
 	}
@@ -296,17 +297,28 @@ func TestDocumentValidationErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// goodm's own validation runs first and agrees with the validator, so
-	// trigger the server through what it does not check: UpdateFields
-	// stores nil as null, which an int field's bsonType rejects.
+	// goodm's own validation agrees with the validator, so make the
+	// validator stricter than the struct (age at least 5): writes goodm
+	// accepts then fail at the server.
 	u := &testUser{Email: "v@x.com", Name: "V", Age: 1}
 	if err := Create(ctx, u); err != nil {
 		t.Fatal(err)
 	}
-	err := UpdateFields(ctx, u, bson.M{"age": nil})
+	many := []*testUser{{Email: "m1@x.com", Name: "M", Age: 1}, {Email: "m2@x.com", Name: "M", Age: 1}}
+	for _, m := range many {
+		if err := Create(ctx, m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	strict := bson.D{{Key: "$jsonSchema", Value: bson.D{{Key: "properties", Value: bson.D{{Key: "age", Value: bson.D{{Key: "minimum", Value: 5}}}}}}}}
+	cmd := bson.D{{Key: "collMod", Value: "test_users"}, {Key: "validator", Value: strict}}
+	if err := db.RunCommand(ctx, cmd).Err(); err != nil {
+		t.Fatal(err)
+	}
+	err := UpdateFields(ctx, u, bson.M{"age": 2})
 	var dve *DocumentValidationError
 	if !errors.Is(err, ErrDocumentValidation) || !errors.As(err, &dve) {
-		t.Fatalf("UpdateFields null int = %v", err)
+		t.Fatalf("UpdateFields = %v", err)
 	}
 	if dve.Collection != "test_users" {
 		t.Errorf("collection = %q", dve.Collection)
@@ -321,20 +333,6 @@ func TestDocumentValidationErrors(t *testing.T) {
 		t.Errorf("failed UpdateFields changed the model: %+v", u)
 	}
 
-	// Replace paths: make the validator stricter than the struct (age at
-	// least 5) so Update and SaveMany of a model goodm accepts fail at the
-	// server.
-	many := []*testUser{{Email: "m1@x.com", Name: "M", Age: 1}, {Email: "m2@x.com", Name: "M", Age: 1}}
-	for _, m := range many {
-		if err := Create(ctx, m); err != nil {
-			t.Fatal(err)
-		}
-	}
-	strict := bson.D{{Key: "$jsonSchema", Value: bson.D{{Key: "properties", Value: bson.D{{Key: "age", Value: bson.D{{Key: "minimum", Value: 5}}}}}}}}
-	cmd := bson.D{{Key: "collMod", Value: "test_users"}, {Key: "validator", Value: strict}}
-	if err := db.RunCommand(ctx, cmd).Err(); err != nil {
-		t.Fatal(err)
-	}
 	u.Age = 2
 	err = Update(ctx, u)
 	if !errors.Is(err, ErrDocumentValidation) {
@@ -421,5 +419,149 @@ func TestDocumentValidationErrors(t *testing.T) {
 	}
 	if err := UpdateFields(ctx, zero, bson.M{"role": "root"}); !errors.Is(err, ErrDocumentValidation) && err == nil {
 		t.Errorf("enum violation accepted: %v", err)
+	}
+}
+
+// jsStatus encodes itself as a string, so the schema cannot type it.
+type jsStatus int
+
+func (s jsStatus) MarshalBSONValue() (byte, []byte, error) {
+	t, data, err := bson.MarshalValue(map[jsStatus]string{0: "off", 1: "on"}[s])
+	return byte(t), data, err
+}
+
+func (s *jsStatus) UnmarshalBSONValue(t byte, data []byte) error {
+	var str string
+	if err := bson.UnmarshalValue(bson.Type(t), data, &str); err != nil {
+		return err
+	}
+	if str == "on" {
+		*s = 1
+	} else {
+		*s = 0
+	}
+	return nil
+}
+
+// jsEdge gathers every shape the first review found a goodm-accepted write
+// could fail its own validator with.
+type jsEdge struct {
+	Model   `bson:",inline"`
+	Nick    *string         `bson:"nick"            goodm:"enum=a|b"`
+	Tags    []*string       `bson:"tags"            goodm:"enum=a|b"`
+	Fixed   [2]string       `bson:"fixed"           goodm:"enum=a|b"`
+	Status  jsStatus        `bson:"status"`
+	Site    url.URL         `bson:"site"`
+	Code    bson.JavaScript `bson:"code"`
+	Small   int64           `bson:"small,minsize"`
+	USmall  uint32          `bson:"usmall,minsize"`
+	Name    string          `bson:"name"            goodm:"min=3"`
+	Ratio   float32         `bson:"ratio"           goodm:"enum=0.1|0.2"`
+	Huge    string          `bson:"huge"            goodm:"max=Inf"`
+	Plain   string          `bson:"plain"`
+	When    *time.Time      `bson:"when,omitempty"  goodm:"required"`
+	Version int64           `bson:"ver"`
+}
+
+type jsVersion64 struct {
+	ID        bson.ObjectID `bson:"_id,omitempty"`
+	CreatedAt time.Time     `bson:"created_at"`
+	UpdatedAt time.Time     `bson:"updated_at"`
+	Version   int64         `bson:"__v"`
+	Name      string        `bson:"name"`
+}
+
+func TestValidatorAcceptsEveryGoodmWrite(t *testing.T) {
+	ctx, db, cleanup := setupTestDB(t)
+	defer cleanup()
+	if err := Register(&jsEdge{}, "js_edges"); err != nil {
+		t.Fatal(err)
+	}
+	defer Unregister(&jsEdge{})
+	if err := Register(&jsVersion64{}, "js_v64"); err != nil {
+		t.Fatal(err)
+	}
+	defer Unregister(&jsVersion64{})
+
+	s, _ := SchemaOf(&jsEdge{})
+	props := lookup(t, s.JSONSchema(), "properties").(bson.D)
+	if status := lookup(t, props, "status").(bson.D); len(status) != 0 {
+		t.Errorf("self-marshaling type constrained: %v", status)
+	}
+	if got := lookup(t, props, "site", "bsonType"); got != "string" {
+		t.Errorf("url.URL = %v", got)
+	}
+	if got := lookup(t, props, "code", "bsonType"); got != "javascript" {
+		t.Errorf("JavaScript = %v", got)
+	}
+	if got := lookup(t, props, "small", "bsonType"); !bsonValuesEqual(got, bson.A{"int", "long"}) {
+		t.Errorf("int64 = %v", got)
+	}
+	if got := lookup(t, props, "nick", "enum"); !bsonValuesEqual(got, bson.A{"a", "b", "", nil}) {
+		t.Errorf("pointer enum = %v", got)
+	}
+	if got := lookup(t, props, "tags", "items", "enum"); !bsonValuesEqual(got, bson.A{"a", "b", nil}) {
+		t.Errorf("pointer element enum = %v", got)
+	}
+	if got := lookup(t, props, "fixed", "items", "enum"); !bsonValuesEqual(got, bson.A{"a", "b", ""}) {
+		t.Errorf("array element enum = %v", got)
+	}
+	if got := lookup(t, props, "ratio", "enum"); !bsonValuesEqual(got, bson.A{float64(float32(0.1)), float64(float32(0.2)), 0.0}) {
+		t.Errorf("float32 enum = %v", got)
+	}
+	if huge := lookup(t, props, "huge").(bson.D); has(huge, "maxLength") {
+		t.Errorf("infinite bound emitted: %v", huge)
+	}
+
+	if err := Enforce(ctx, db, EnforceOptions{Validator: ValidatorApply}); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now()
+	a := "a"
+	m := &jsEdge{
+		Tags:   []*string{&a, nil},
+		Status: 1,
+		Site:   url.URL{Scheme: "https", Host: "x"},
+		Code:   "function(){}",
+		Small:  7,
+		USmall: 7,
+		Name:   "ééé", // 3 characters, 6 bytes
+		Ratio:  0.1,
+		When:   &now,
+	}
+	if err := Create(ctx, m); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := UpdateFields(ctx, m, bson.M{"plain": nil, "nick": nil, "name": "ééé"}); err != nil {
+		t.Fatalf("UpdateFields nil: %v", err)
+	}
+	var stored bson.M
+	if err := db.Collection("js_edges").FindOne(ctx, bson.D{{Key: "_id", Value: m.ID}}).Decode(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored["plain"] != "" || stored["nick"] != nil {
+		t.Errorf("nil stored as %#v / %#v", stored["plain"], stored["nick"])
+	}
+	m.Small = 1 << 40
+	if err := Update(ctx, m); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	// goodm's own checks moved to match the server.
+	m.Name = "éé"
+	if err := Create(ctx, &jsEdge{Name: "éé", When: &now}); err == nil {
+		t.Error("two characters accepted for min=3")
+	}
+	zero := time.Time{}.In(time.FixedZone("X", 3600))
+	if err := Create(ctx, &jsEdge{Name: "abc", When: &zero}); err == nil {
+		t.Error("required *time.Time at the zero instant accepted")
+	}
+
+	// A managed __v of type int64 survives an upsert through FindOneAndUpdate.
+	var v64 jsVersion64
+	err := FindOneAndUpdate(ctx, bson.D{{Key: "name", Value: "up"}}, bson.M{"$set": bson.M{"name": "up"}}, &v64, FindOneAndUpdateOptions{Upsert: true})
+	if err != nil {
+		t.Fatalf("upsert with int64 __v: %v", err)
 	}
 }

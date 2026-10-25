@@ -1,7 +1,9 @@
 package goodm
 
 import (
+	"encoding/json"
 	"math"
+	"net/url"
 	"reflect"
 	"strconv"
 	"time"
@@ -70,6 +72,19 @@ func fieldSchema(fs *FieldSchema) bson.D {
 	return doc
 }
 
+var (
+	valueMarshalerType = reflect.TypeOf((*bson.ValueMarshaler)(nil)).Elem()
+	marshalerType      = reflect.TypeOf((*bson.Marshaler)(nil)).Elem()
+)
+
+// encodesItself reports whether values of t choose their own BSON encoding,
+// which the schema cannot predict.
+func encodesItself(t reflect.Type) bool {
+	pt := reflect.PointerTo(t)
+	return t.Implements(valueMarshalerType) || pt.Implements(valueMarshalerType) ||
+		t.Implements(marshalerType) || pt.Implements(marshalerType)
+}
+
 // typeSchema maps a Go type to its bsonType (and items/properties for
 // arrays and objects). fs supplies the parsed subfields of struct types.
 func typeSchema(t reflect.Type, fs *FieldSchema) bson.D {
@@ -82,15 +97,38 @@ func typeSchema(t reflect.Type, fs *FieldSchema) bson.D {
 		return bsonTypes("decimal")
 	case reflect.TypeOf(bson.Timestamp{}):
 		return bsonTypes("timestamp")
-	case reflect.TypeOf(bson.Binary{}):
+	case reflect.TypeOf(bson.Binary{}), reflect.TypeOf(bson.Vector{}):
 		return bsonTypes("binData")
 	case reflect.TypeOf(bson.Regex{}):
 		return bsonTypes("regex")
+	case reflect.TypeOf(bson.JavaScript("")):
+		return bsonTypes("javascript")
+	case reflect.TypeOf(bson.Symbol("")):
+		return bsonTypes("symbol")
+	case reflect.TypeOf(bson.CodeWithScope{}):
+		return bsonTypes("javascriptWithScope")
+	case reflect.TypeOf(bson.DBPointer{}):
+		return bsonTypes("dbPointer")
+	case reflect.TypeOf(bson.MinKey{}):
+		return bsonTypes("minKey")
+	case reflect.TypeOf(bson.MaxKey{}):
+		return bsonTypes("maxKey")
+	case reflect.TypeOf(bson.Null{}):
+		return bsonTypes("null")
+	case reflect.TypeOf(bson.Undefined{}):
+		return bsonTypes("undefined")
+	case reflect.TypeOf(url.URL{}):
+		return bsonTypes("string")
+	case reflect.TypeOf(json.Number("")):
+		return bsonTypes("long", "double")
 	case reflect.TypeOf(bson.D{}), reflect.TypeOf(bson.M{}), reflect.TypeOf(bson.Raw{}):
 		return bsonTypes("object", "null")
 	case reflect.TypeOf(bson.A{}):
 		return bsonTypes("array", "null")
 	case reflect.TypeOf(bson.RawValue{}):
+		return bson.D{}
+	}
+	if t.Kind() != reflect.Pointer && encodesItself(t) {
 		return bson.D{}
 	}
 
@@ -104,16 +142,16 @@ func typeSchema(t reflect.Type, fs *FieldSchema) bson.D {
 		return bsonTypes("string")
 	case reflect.Bool:
 		return bsonTypes("bool")
-	case reflect.Int:
-		return bsonTypes("int", "long") // encoded as int32 when it fits
 	case reflect.Int8, reflect.Int16, reflect.Int32:
 		return bsonTypes("int")
-	case reflect.Int64:
-		return bsonTypes("long")
+	case reflect.Int, reflect.Int64:
+		// An int is encoded as int32 when it fits; a 64-bit kind is too
+		// under bson:",minsize" or a client's IntMinSize option.
+		return bsonTypes("int", "long")
 	case reflect.Uint8, reflect.Uint16:
 		return append(bsonTypes("int"), bson.E{Key: "minimum", Value: 0.0})
 	case reflect.Uint, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-		return append(bsonTypes("long"), bson.E{Key: "minimum", Value: 0.0})
+		return append(bsonTypes("int", "long"), bson.E{Key: "minimum", Value: 0.0})
 	case reflect.Float32, reflect.Float64:
 		return bsonTypes("double")
 	case reflect.Slice:
@@ -197,8 +235,11 @@ func allowNull(doc bson.D) bson.D {
 // server would otherwise reject every document. goodm's Validate treats a
 // zero value as unset and lets it through unless the field is required, and
 // a field without omitempty is written as its zero value, so the zero value
-// is allowed too for a scalar field that is not required. Elements of a
-// slice are all checked by Validate, so they get no such allowance.
+// is allowed too for a scalar field that is not required, and for the
+// elements of a fixed-size array (whose zero value is all zero elements).
+// Validate skips nil pointers, which are written as null, so a pointer
+// field or element allows null. Elements of a slice are all checked, so
+// they get no zero allowance.
 func applyEnum(doc *bson.D, fs *FieldSchema, t reflect.Type) {
 	if len(fs.Enum) == 0 {
 		return
@@ -206,20 +247,25 @@ func applyEnum(doc *bson.D, fs *FieldSchema, t reflect.Type) {
 	target := *doc
 	elem := baseType(t)
 	allowZero := !fs.Required
+	allowNil := t.Kind() == reflect.Pointer
 	if elem.Kind() == reflect.Slice || elem.Kind() == reflect.Array {
+		allowNil = elem.Elem().Kind() == reflect.Pointer
+		allowZero = elem.Kind() == reflect.Array
 		elem = baseType(elem.Elem())
 		target = itemsOf(*doc)
 		if target == nil {
 			return
 		}
-		allowZero = false
 	}
 	values := enumValues(fs.Enum, elem)
 	if values == nil {
 		return
 	}
 	if allowZero {
-		values = append(values, reflect.Zero(elem).Interface())
+		values = append(values, enumZero(elem))
+	}
+	if allowNil {
+		values = append(values, nil)
 	}
 	target = append(target, bson.E{Key: "enum", Value: values})
 	if elem != baseType(t) {
@@ -227,6 +273,20 @@ func applyEnum(doc *bson.D, fs *FieldSchema, t reflect.Type) {
 	} else {
 		*doc = target
 	}
+}
+
+// enumZero is the zero value of an enum field's kind, in the type the enum
+// values use.
+func enumZero(t reflect.Type) interface{} {
+	switch t.Kind() {
+	case reflect.String:
+		return ""
+	case reflect.Bool:
+		return false
+	case reflect.Float32, reflect.Float64:
+		return 0.0
+	}
+	return int64(0)
 }
 
 // enumValues converts tag values to the field's kind.
@@ -243,7 +303,13 @@ func enumValues(enum []string, t reflect.Type) bson.A {
 				return nil
 			}
 			values = append(values, n)
-		case reflect.Float32, reflect.Float64:
+		case reflect.Float32:
+			f, err := strconv.ParseFloat(s, 32)
+			if err != nil {
+				return nil
+			}
+			values = append(values, float64(float32(f))) // the stored double
+		case reflect.Float64:
 			f, err := strconv.ParseFloat(s, 64)
 			if err != nil {
 				return nil
@@ -293,7 +359,11 @@ func applyBounds(doc *bson.D, fs *FieldSchema, t reflect.Type) {
 // setBound appends a bound, replacing one the type schema already set (an
 // unsigned integer's minimum 0) and rounding length bounds inward to whole
 // numbers so they match goodm's comparison of a length against the bound.
+// A bound that is not finite constrains nothing and is left out.
 func setBound(doc bson.D, key string, bound float64, integral, isMin bool) bson.D {
+	if math.IsNaN(bound) || math.IsInf(bound, 0) {
+		return doc
+	}
 	var value interface{} = bound
 	if integral {
 		n := math.Floor(bound)
