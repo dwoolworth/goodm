@@ -56,11 +56,22 @@ type EnforceOptions struct {
 	DriftSampleSize     int                 // documents to sample for drift detection (default 100)
 	OnDriftWarning      func(d DriftError)  // called for each drift when policy is DriftWarn
 	IndexMismatchPolicy IndexMismatchPolicy // how to handle existing indexes whose options don't match the schema
+
+	// Validator says whether to apply or verify each collection's validator,
+	// derived from Schema.JSONSchema. ValidationLevel and ValidationAction
+	// are the server settings to use with it; empty means "strict" and
+	// "error". A collection registered for more than one model is an error
+	// under any policy but ValidatorIgnore.
+	Validator        ValidatorPolicy
+	ValidationLevel  string
+	ValidationAction string
 }
 
 // Enforce ensures that all registered schemas are reflected in the database.
-// It creates missing indexes and optionally detects schema drift based on the
-// provided options. If no options are provided, drift detection is skipped.
+// It creates missing indexes, optionally sets or verifies collection
+// validators, and optionally detects schema drift based on the provided
+// options. If no options are provided, validators are left alone and drift
+// detection is skipped.
 func Enforce(ctx context.Context, db *mongo.Database, opts ...EnforceOptions) error {
 	var opt EnforceOptions
 	if len(opts) > 0 {
@@ -72,6 +83,9 @@ func Enforce(ctx context.Context, db *mongo.Database, opts ...EnforceOptions) er
 
 	for _, schema := range schemas {
 		if err := enforceSchema(ctx, db, schema, opt.IndexMismatchPolicy, probe); err != nil {
+			return err
+		}
+		if err := enforceValidator(ctx, db, schema, opt, otherSchemasForCollection(schema)); err != nil {
 			return err
 		}
 

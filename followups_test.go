@@ -654,7 +654,8 @@ func TestUpdateFields_ConversionWhitelist(t *testing.T) {
 	if err := UpdateFields(ctx, m, bson.M{"score": int64(math.MaxInt64)}); err != nil {
 		t.Errorf("int64 into int on a 64-bit platform: %v", err)
 	}
-	// nil stores null and leaves the model at the zero value.
+	// nil for a field that cannot hold one stores the zero value the
+	// model is left with, so the two agree and a validator sees an int.
 	if err := UpdateFields(ctx, u, bson.M{"age": nil}); err != nil || u.Age != 0 {
 		t.Errorf("nil: %v age=%d", err, u.Age)
 	}
@@ -662,8 +663,8 @@ func TestUpdateFields_ConversionWhitelist(t *testing.T) {
 	if err := DB().Collection("test_users").FindOne(ctx, bson.D{{Key: "_id", Value: u.ID}}).Decode(&raw); err != nil {
 		t.Fatal(err)
 	}
-	if v, ok := raw["age"]; !ok || v != nil {
-		t.Errorf("nil should be stored as null, got %v", raw["age"])
+	if v, ok := raw["age"]; !ok || v != int32(0) {
+		t.Errorf("nil for an int should be stored as 0, got %#v", raw["age"])
 	}
 }
 
@@ -852,7 +853,7 @@ func TestUpdateFields_ConverterEdgeCases(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Pointer chains ending in nil must not panic and must store null.
+	// Pointer chains ending in nil must not panic and must store the zero value.
 	var nilInt *int64
 	if err := UpdateFields(ctx, m, bson.M{"count": &nilInt}); err != nil || m.Count != 0 {
 		t.Errorf("nil pointer chain: %v count=%d", err, m.Count)

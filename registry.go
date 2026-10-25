@@ -171,6 +171,20 @@ func schemaForCollection(collection string) (*Schema, bool) {
 	return list[0], true
 }
 
+// otherSchemasForCollection returns the schemas registered for s's
+// collection other than s itself.
+func otherSchemasForCollection(s *Schema) []*Schema {
+	registryMu.RLock()
+	defer registryMu.RUnlock()
+	var others []*Schema
+	for _, x := range byColl[s.Collection] {
+		if x != s {
+			others = append(others, x)
+		}
+	}
+	return others
+}
+
 // modelType unwraps pointers and slices to reach the underlying struct type
 // of a model value. Returns nil if the value is not struct-based.
 func modelType(model interface{}) reflect.Type {

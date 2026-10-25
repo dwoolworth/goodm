@@ -834,9 +834,11 @@ func prepareUpdateFields(schema *Schema, model interface{}, fields bson.M) (valu
 			errs = append(errs, validateOneField(v, fs, name)...)
 		}
 		values[name] = v
-		if isNilValue(val) {
+		if isNilValue(val) && isNilableKind(target.Kind()) {
 			stored[name] = nil
 		} else {
+			// A nil for a field that cannot hold one stores the zero value
+			// the model now holds, not null.
 			stored[name] = v.Interface()
 		}
 	}
@@ -844,6 +846,16 @@ func prepareUpdateFields(schema *Schema, model interface{}, fields bson.M) (valu
 		return nil, nil, errs
 	}
 	return values, stored, nil
+}
+
+// isNilableKind reports whether values of the kind can be nil, and so are
+// stored as null when nil.
+func isNilableKind(k reflect.Kind) bool {
+	switch k {
+	case reflect.Pointer, reflect.Slice, reflect.Map, reflect.Interface:
+		return true
+	}
+	return false
 }
 
 // isNilValue reports whether val is nil or a typed nil pointer/interface.

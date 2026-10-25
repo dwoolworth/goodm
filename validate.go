@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"reflect"
 	"strconv"
+	"unicode/utf8"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 // Validate checks a model instance against its schema.
@@ -48,7 +51,7 @@ func validateOneField(fv reflect.Value, fs *FieldSchema, fieldPath string) []Val
 	var errs []ValidationError
 
 	// Required: field must be non-zero
-	if fs.Required && fv.IsZero() {
+	if fs.Required && isZeroField(fv) {
 		errs = append(errs, ValidationError{
 			Field:   fieldPath,
 			Message: "field is required",
@@ -80,6 +83,26 @@ func validateOneField(fv reflect.Value, fs *FieldSchema, fieldPath string) []Val
 
 	// Recurse into subdocuments
 	return append(errs, validateSubFields(fv, *fs, fieldPath)...)
+}
+
+var zeroerType = reflect.TypeOf((*bson.Zeroer)(nil)).Elem()
+
+// isZeroField reports whether a field value is zero as the driver sees it:
+// the Go zero value, or a value whose static type has an IsZero method that
+// says so (such as a non-nil *time.Time pointing at the zero time), which
+// omitempty omits. As in the driver, the method is looked up on the field's
+// declared type, so an interface field is judged by whether it is nil.
+func isZeroField(v reflect.Value) bool {
+	if v.IsZero() {
+		return true
+	}
+	if v.Kind() == reflect.Pointer && v.IsNil() {
+		return true
+	}
+	if v.Type().Implements(zeroerType) && v.CanInterface() {
+		return v.Interface().(bson.Zeroer).IsZero()
+	}
+	return false
 }
 
 // validateEnum checks that fv is one of the allowed enum values.
@@ -166,10 +189,13 @@ func derefValue(v reflect.Value) reflect.Value {
 	return v
 }
 
-// lengthOf returns the length of strings, slices, arrays, and maps.
+// lengthOf returns the length of strings (in characters, as the server's
+// minLength/maxLength count them), slices, arrays, and maps.
 func lengthOf(v reflect.Value) (int, bool) {
 	switch v.Kind() {
-	case reflect.String, reflect.Slice, reflect.Array, reflect.Map:
+	case reflect.String:
+		return utf8.RuneCountInString(v.String()), true
+	case reflect.Slice, reflect.Array, reflect.Map:
 		return v.Len(), true
 	}
 	return 0, false

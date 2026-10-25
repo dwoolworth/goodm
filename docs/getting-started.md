@@ -138,6 +138,17 @@ goodm.Enforce(ctx, db, goodm.EnforceOptions{
 })
 ```
 
+`Enforce` can also install each model's schema as the collection's `$jsonSchema`
+validator, so writes that bypass goodm are checked by the server too:
+
+```go
+goodm.Enforce(ctx, db, goodm.EnforceOptions{
+    Validator: goodm.ValidatorApply, // or ValidatorVerify to only check
+})
+```
+
+See [Validation](validation.md#server-side-validation) for how tags map to the schema.
+
 ## Error Handling
 
 goodm provides typed errors:
