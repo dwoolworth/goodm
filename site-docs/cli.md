@@ -115,6 +115,7 @@ Display all registered model schemas.
 ```bash
 goodm inspect
 goodm inspect --diff --db myapp
+goodm inspect --json-schema
 ```
 
 **Flags:**
@@ -122,6 +123,7 @@ goodm inspect --diff --db myapp
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--diff` | `false` | Compare schemas against live database |
+| `--json-schema` | `false` | Print each model's `$jsonSchema` validator as JSON instead of the tree |
 | `--uri` | `mongodb://localhost:27017` | MongoDB connection URI |
 | `--db` | (required with `--diff`) | Database name |
 
@@ -133,7 +135,7 @@ Shows each registered model with:
 - Indexes (single and compound)
 - Hooks
 
-With `--diff`, also reports schema drift.
+With `--diff`, also reports schema drift. With `--json-schema`, prints the collection validator `Enforce` derives from each model (see [Validation](validation.md#server-side-validation)).
 
 ### goodm version
 

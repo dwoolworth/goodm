@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strings"
 
+	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
@@ -25,7 +26,78 @@ var (
 	// index. The returned error is a *DuplicateKeyError carrying the index and
 	// field names.
 	ErrDuplicateKey = errors.New("goodm: duplicate key")
+
+	// ErrDocumentValidation is matched by errors.Is for any write the
+	// server rejected under the collection's validator (see
+	// Schema.JSONSchema and EnforceOptions.Validator). The returned error is
+	// a *DocumentValidationError carrying the server's details.
+	ErrDocumentValidation = errors.New("goodm: document failed collection validation")
 )
+
+// DocumentValidationError is returned when the server rejects a write under
+// the collection's validator. Details is the server's errInfo document
+// (MongoDB 5.0+), which names the failing rules.
+type DocumentValidationError struct {
+	Collection string
+	Details    bson.Raw
+	Err        error // the driver error
+}
+
+func (e *DocumentValidationError) Error() string {
+	msg := "goodm: document failed collection validation"
+	if e.Collection != "" {
+		msg += " on " + e.Collection
+	}
+	if len(e.Details) > 0 {
+		return msg + ": " + e.Details.String()
+	}
+	if e.Err != nil {
+		return msg + ": " + e.Err.Error()
+	}
+	return msg
+}
+
+// Is reports ErrDocumentValidation.
+func (e *DocumentValidationError) Is(target error) bool { return target == ErrDocumentValidation }
+
+// Unwrap returns the driver error.
+func (e *DocumentValidationError) Unwrap() error { return e.Err }
+
+// codeDocumentValidationFailure is the server error code for a write
+// rejected by a collection validator.
+const codeDocumentValidationFailure = 121
+
+// documentValidationDetails reports whether err is a validator rejection
+// and returns the server's errInfo if it sent one.
+func documentValidationDetails(err error) (bson.Raw, bool) {
+	var we mongo.WriteException
+	if errors.As(err, &we) {
+		for _, e := range we.WriteErrors {
+			if e.Code == codeDocumentValidationFailure {
+				return e.Details, true
+			}
+		}
+		return nil, false
+	}
+	var cmdErr mongo.CommandError
+	if errors.As(err, &cmdErr) && cmdErr.Code == codeDocumentValidationFailure {
+		if info, err := cmdErr.Raw.LookupErr("errInfo"); err == nil {
+			if doc, ok := info.DocumentOK(); ok {
+				return doc, true
+			}
+		}
+		return nil, true
+	}
+	return nil, false
+}
+
+func newDocumentValidationError(err error, schema *Schema, details bson.Raw) *DocumentValidationError {
+	dve := &DocumentValidationError{Details: details, Err: err}
+	if schema != nil {
+		dve.Collection = schema.Collection
+	}
+	return dve
+}
 
 // DriftError indicates a field exists in the database but not in the schema.
 type DriftError struct {
@@ -204,6 +276,9 @@ func translateWriteError(err error, schema *Schema, context string) error {
 	if mongo.IsDuplicateKeyError(err) {
 		return newDuplicateKeyError(err, schema, err.Error())
 	}
+	if details, ok := documentValidationDetails(err); ok {
+		return newDocumentValidationError(err, schema, details)
+	}
 	return fmt.Errorf("goodm: %s: %w", context, err)
 }
 
@@ -278,9 +353,12 @@ func translateWriteErrors(errs []mongo.BulkWriteError, schema *Schema) []BulkWri
 // translateBulkItem converts one driver per-operation write error.
 func translateBulkItem(we mongo.WriteError, schema *Schema) BulkWriteError {
 	item := BulkWriteError{Index: we.Index, Code: we.Code, Message: we.Message}
-	if isDuplicateKeyCode(we.Code) {
+	switch {
+	case isDuplicateKeyCode(we.Code):
 		item.Err = newDuplicateKeyError(we, schema, we.Message)
-	} else {
+	case we.Code == codeDocumentValidationFailure:
+		item.Err = newDocumentValidationError(we, schema, we.Details)
+	default:
 		// Wrap the driver error so its code and labels stay reachable.
 		item.Err = fmt.Errorf("goodm: write error: %w", we)
 	}

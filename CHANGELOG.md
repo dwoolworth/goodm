@@ -7,6 +7,9 @@ All notable changes to this project will be documented in this file.
 ### Added
 - **Change streams.** `Watch(ctx, &Model{})` opens a change stream on the model's collection and returns a `*ChangeStream` whose `Next`/`TryNext`/`Each` deliver `ChangeEvent` values: operation type, resume token, cluster and wall time, namespace, document key, full document, pre-image, and update description. `ChangeEvent.Decode` unmarshals the full document into a model and records it as the merge base, so a model decoded from an event can be saved with `WithRetry`; `DecodeBefore`, `DecodeID`, and `ObjectID` read the pre-image and key. `WatchOptions` covers the pipeline, full-document and pre-image modes (`FullDocument` defaults to `options.UpdateLookup`), `ResumeAfter`/`StartAfter`/`StartAtOperationTime`, batch size, max await time, collation, and expanded events. Middleware runs under the new `OpWatch` and may replace `OpInfo.Pipeline`. `ErrNoFullDocument` is returned when an event carries no document to decode.
 
+### Fixed
+- `goodm migrate` did not list planned index rebuilds, so they were applied without appearing in the plan or its summary; rebuilds are now shown with `~` and counted.
+
 ## [0.7.1] - 2026-10-24
 
 ### Fixed

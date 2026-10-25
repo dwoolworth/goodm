@@ -9,18 +9,20 @@ import (
 
 	"github.com/dwoolworth/goodm"
 	"github.com/spf13/cobra"
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 var (
-	diffFlag bool
-	mongoURI string
-	dbName   string
+	diffFlag       bool
+	jsonSchemaFlag bool
+	mongoURI       string
+	dbName         string
 )
 
 var inspectCmd = &cobra.Command{
 	Use:   "inspect",
 	Short: "Inspect registered model schemas",
-	Long:  "Display all registered model schemas with fields, indexes, and relations. Use --diff to compare against a live MongoDB instance.",
+	Long:  "Display all registered model schemas with fields, indexes, and relations. Use --diff to compare against a live MongoDB instance, or --json-schema to print each model's $jsonSchema validator.",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		schemas := goodm.GetAll()
 		if len(schemas) == 0 {
@@ -29,6 +31,12 @@ var inspectCmd = &cobra.Command{
 		}
 
 		for _, schema := range schemas {
+			if jsonSchemaFlag {
+				if err := printJSONSchema(schema); err != nil {
+					return err
+				}
+				continue
+			}
 			printSchema(schema)
 
 			if diffFlag {
@@ -44,8 +52,21 @@ var inspectCmd = &cobra.Command{
 
 func init() {
 	inspectCmd.Flags().BoolVar(&diffFlag, "diff", false, "Compare schemas against live MongoDB")
+	inspectCmd.Flags().BoolVar(&jsonSchemaFlag, "json-schema", false, "Print each model's $jsonSchema validator as JSON")
 	inspectCmd.Flags().StringVar(&mongoURI, "uri", "mongodb://localhost:27017", "MongoDB connection URI")
 	inspectCmd.Flags().StringVar(&dbName, "db", "", "MongoDB database name (required with --diff)")
+}
+
+// printJSONSchema prints the collection validator derived from the schema,
+// as a document ready for collMod or createCollection.
+func printJSONSchema(schema *goodm.Schema) error {
+	validator := bson.D{{Key: "$jsonSchema", Value: schema.JSONSchema()}}
+	out, err := bson.MarshalExtJSONIndent(validator, false, false, "", "  ")
+	if err != nil {
+		return fmt.Errorf("%s: %w", schema.ModelName, err)
+	}
+	fmt.Printf("// %s (collection: %s)\n%s\n", schema.ModelName, schema.Collection, out)
+	return nil
 }
 
 func printSchema(schema *goodm.Schema) {

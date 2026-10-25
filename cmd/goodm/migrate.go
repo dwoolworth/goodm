@@ -65,17 +65,18 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 		collectionActions[action.Collection] = append(collectionActions[action.Collection], action)
 	}
 
-	createCount, dropCount, warnCount := 0, 0, 0
+	createCount, rebuildCount, dropCount, warnCount := 0, 0, 0, 0
 	for _, collName := range collectionOrder {
 		fmt.Printf("%s:\n", collName)
-		c, d, w := displayPlanActions(collectionActions[collName])
+		c, r, d, w := displayPlanActions(collectionActions[collName])
 		createCount += c
+		rebuildCount += r
 		dropCount += d
 		warnCount += w
 		fmt.Println()
 	}
 
-	fmt.Printf("Summary: %d to create, %d to drop, %d warning(s)\n", createCount, dropCount, warnCount)
+	fmt.Printf("Summary: %d to create, %d to rebuild, %d to drop, %d warning(s)\n", createCount, rebuildCount, dropCount, warnCount)
 
 	if migrateDryRun {
 		fmt.Println("Run without --dry-run to apply.")
@@ -105,16 +106,19 @@ func runMigrate(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func displayPlanActions(actions []goodm.MigrationAction) (created, dropped, warned int) {
+func displayPlanActions(actions []goodm.MigrationAction) (created, rebuilt, dropped, warned int) {
 	if len(actions) == 0 {
 		fmt.Println("  ✓ No changes needed")
-		return 0, 0, 0
+		return 0, 0, 0, 0
 	}
 	for _, action := range actions {
 		switch action.Type {
 		case goodm.ActionCreateIndex:
 			fmt.Printf("  + %s\n", action.Description)
 			created++
+		case goodm.ActionRebuildIndex:
+			fmt.Printf("  ~ %s\n", action.Description)
+			rebuilt++
 		case goodm.ActionDropIndex:
 			fmt.Printf("  - %s\n", action.Description)
 			dropped++
