@@ -218,7 +218,8 @@ type reviewNode struct {
 
 type testTree struct {
 	Model `bson:",inline"`
-	Root  reviewNode `bson:"root"`
+	Root  reviewNode      `bson:"root"`
+	Pair  [2]testLineItem `bson:"pair"`
 }
 
 func TestPopulatePathContract(t *testing.T) {
@@ -297,5 +298,13 @@ func TestPopulatePathContract(t *testing.T) {
 	}
 	if err := BatchPopulate(ctx, []*testTree{tree}, "root.kids.kids.ref", &got); err != nil || len(got) != 1 {
 		t.Errorf("batch recursive: %v %d", err, len(got))
+	}
+
+	// A fixed-size array of subdocuments is not a path element, as Register
+	// does not treat it as a subdocument list.
+	for _, bad := range []string{"pair.product", "pair.0.product"} {
+		if err := Populate(ctx, tree, Refs{bad: &got}); err == nil {
+			t.Errorf("array path %q accepted", bad)
+		}
 	}
 }

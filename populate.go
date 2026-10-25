@@ -172,7 +172,7 @@ func subFieldsOf(f *FieldSchema) []FieldSchema {
 	if t == nil {
 		return nil
 	}
-	if t.Kind() == reflect.Slice || t.Kind() == reflect.Array {
+	if t.Kind() == reflect.Slice { // as parseFields: a fixed-size array is not a subdocument list
 		t = t.Elem()
 	}
 	if t.Kind() == reflect.Pointer {
@@ -244,7 +244,7 @@ func (c *idCollector) collect(v reflect.Value, steps []refStep) error {
 		fv = fv.Elem()
 	}
 	switch fv.Kind() {
-	case reflect.Slice, reflect.Array:
+	case reflect.Slice:
 		if step.index >= 0 {
 			if step.index >= fv.Len() {
 				return nil
