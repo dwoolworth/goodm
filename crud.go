@@ -194,7 +194,7 @@ func Create(ctx context.Context, model interface{}, opts ...CreateOptions) error
 		if _, err := coll.InsertOne(ctx, model); err != nil {
 			return translateWriteError(err, schema, "insert failed")
 		}
-		setModelBaseFromModel(schema, model)
+		recordBaseAfterWrite(ctx, schema, model, nil)
 
 		// AfterCreate hook
 		if hook, ok := model.(AfterCreate); ok {
@@ -572,17 +572,10 @@ func Update(ctx context.Context, model interface{}, opts ...UpdateOptions) error
 		if len(opt.Unset) > 0 {
 			// The stored document lacks the unset fields: zero them on the
 			// model (a later Update then writes their zero value, or omits
-			// them if they are omitempty) and record the written document,
-			// which lacks them, as the base.
+			// them if they are omitempty).
 			zeroUnsetFields(model, opt.Unset)
-			if written, err := buildReplacement(model, opt.Unset); err == nil {
-				if raw, err := bson.Marshal(written); err == nil {
-					setModelBase(schema, model, raw)
-				}
-			}
-		} else {
-			setModelBaseFromModel(schema, model)
 		}
+		recordBaseAfterWrite(ctx, schema, model, opt.Unset)
 
 		// AfterSave hook
 		if hook, ok := model.(AfterSave); ok {
@@ -752,7 +745,11 @@ func UpdateFields(ctx context.Context, model interface{}, fields bson.M, opts ..
 		setUpdatedAt(model, now)
 		setModelVersion(model, oldVersion+1)
 		applyFieldsToModel(model, values)
-		advanceBaseAfterUpdateFields(schema, model, values, now, oldVersion+1)
+		if inTransaction(ctx) {
+			setModelBase(schema, model, nil)
+		} else {
+			advanceBaseAfterUpdateFields(schema, model, values, now, oldVersion+1)
+		}
 
 		return nil
 	})
@@ -2259,6 +2256,27 @@ func embeddedModel(schema *Schema, model interface{}) *Model {
 		return nil
 	}
 	return cur.Addr().Interface().(*Model)
+}
+
+// recordBaseAfterWrite records the written document as the model's merge
+// base, unless the write ran inside a transaction: until that commits the
+// write is not stored state, and a base from a transaction that later aborts
+// would be merged against as if it were. Inside a transaction the base is
+// cleared instead, so a later conflict reports ErrVersionConflict.
+func recordBaseAfterWrite(ctx context.Context, schema *Schema, model interface{}, unset []string) {
+	if inTransaction(ctx) {
+		setModelBase(schema, model, nil)
+		return
+	}
+	if len(unset) == 0 {
+		setModelBaseFromModel(schema, model)
+		return
+	}
+	if written, err := buildReplacement(model, unset); err == nil {
+		if raw, err := bson.Marshal(written); err == nil {
+			setModelBase(schema, model, raw)
+		}
+	}
 }
 
 // setModelBase records raw as the model's last known stored state.

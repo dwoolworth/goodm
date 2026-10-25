@@ -56,6 +56,10 @@ goodm.WithTransaction(outerCtx, func(ctx context.Context) error {
 
 If the context already carries a session with a transaction in progress, a nested `WithTransaction` runs its callback inside that transaction instead of starting a second one, and ignores its own options. An error from the inner callback therefore aborts the whole outer transaction, and the inner writes are never committed on their own. This lets helpers that wrap themselves in `WithTransaction` be composed freely. A context that carries a session without an active transaction gets a transaction started on that session. A snapshot session (one started with `SetSnapshot(true)`) cannot run transactions, so `WithTransaction` returns an error for it instead of running the callback outside a transaction.
 
+## Models After an Aborted Transaction
+
+A write inside a transaction advances the model in memory (version, timestamps) before the transaction commits. If the transaction aborts, goodm cannot roll the model back, so a model saved inside an aborted transaction must be reloaded before it is saved again; otherwise its version may match a document another writer has since committed. goodm does not record a `WithRetry` merge base for writes made inside a transaction, so a conflict on such a model is reported as `ErrVersionConflict` rather than merged against uncommitted state.
+
 ## Batch Operations
 
 A `SaveMany` or `CreateMany` error inside the callback must be returned, not ignored. When the server rejected a write, the transaction is already aborted, and returning nil makes the driver retry the callback until its two-minute limit instead of failing fast. See [Bulk Operations](bulk.md) for how each batch operation reports its items inside a transaction.

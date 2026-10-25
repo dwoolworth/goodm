@@ -12,11 +12,13 @@ import (
 	"github.com/dwoolworth/goodm/internal"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 )
 
 // saveWithRetry attempts a versioned save, optionally retrying with a 3-way
-// field-level merge when a version conflict occurs. Without retries it still
-// refreshes the model's version on conflict to prevent cascading failures.
+// field-level merge when a version conflict occurs. On conflict the model
+// keeps its stale version, so a further save conflicts until it is reloaded.
 func saveWithRetry(ctx context.Context, coll *mongo.Collection, schema *Schema, model interface{}, opt UpdateOptions, id interface{}, scope interface{}) error {
 	// The merge base is the document as last loaded or saved through goodm,
 	// not the model as it is now: the model already carries the caller's
@@ -28,6 +30,14 @@ func saveWithRetry(ctx context.Context, coll *mongo.Collection, schema *Schema, 
 			base, err = normalizeBase(schema, raw)
 			if err != nil {
 				return fmt.Errorf("goodm: failed to decode merge base: %w", err)
+			}
+			// The base must describe this very document at the version the
+			// model is about to save from; otherwise the model was refreshed
+			// by other means (a cursor decode, a raw unmarshal) and the base
+			// is stale. Merging against a stale base reverts changes.
+			if ver, _ := getModelVersion(model); versionIn(base) != int64(ver) || idKey(base["_id"]) != idKey(id) {
+				base = nil
+				setModelBase(schema, model, nil)
 			}
 		}
 	}
@@ -104,9 +114,11 @@ func attemptSave(ctx context.Context, coll *mongo.Collection, schema *Schema, mo
 // Fields the caller asked to unset count as removals on the caller's side.
 // It returns the re-read state in map form, the base for a further round.
 func mergeFromDB(ctx context.Context, coll *mongo.Collection, schema *Schema, model interface{}, base bson.M, id interface{}, scope interface{}, unset []string) (bson.M, error) {
-	// Re-read the current document from the database.
+	// Re-read the current document from the primary: a lagging secondary
+	// could look older than a committed base and cause a false conflict.
 	fresh := reflect.New(reflect.TypeOf(model).Elem()).Interface()
-	if err := coll.FindOne(ctx, andFilter(scope, bson.D{{Key: "_id", Value: id}})).Decode(fresh); err != nil {
+	primary := coll.Database().Collection(coll.Name(), options.Collection().SetReadPreference(readpref.Primary()))
+	if err := primary.FindOne(ctx, andFilter(scope, bson.D{{Key: "_id", Value: id}})).Decode(fresh); err != nil {
 		if errors.Is(err, mongo.ErrNoDocuments) {
 			return nil, ErrNotFound
 		}

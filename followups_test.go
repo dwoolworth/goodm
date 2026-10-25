@@ -2188,3 +2188,98 @@ func TestUpdate_CombinesOptionsAndZeroesUnset(t *testing.T) {
 		t.Errorf("note must not come back with its old value, got %q", v.StringValue())
 	}
 }
+
+func TestWithRetry_StaleBaseFromRawDecodeIsIgnored(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testMergeShape{}, "test_merge_shape", "")
+	m := &testMergeShape{Note: "queued"}
+	if err := Create(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	var mine testMergeShape
+	if err := FindByID(ctx, m.ID, &mine); err != nil { // base at v0
+		t.Fatal(err)
+	}
+	var other testMergeShape
+	if err := FindByID(ctx, m.ID, &other); err != nil {
+		t.Fatal(err)
+	}
+	other.Note = "running"
+	if err := Update(ctx, &other); err != nil { // v1
+		t.Fatal(err)
+	}
+	// Refresh mine by a cursor decode: model at v1, base still v0.
+	cur, err := FindCursor(ctx, bson.D{{Key: "_id", Value: m.ID}}, &testMergeShape{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cur.Next(ctx) || cur.Decode(&mine) != nil {
+		t.Fatal("cursor decode")
+	}
+	_ = cur.Close(ctx)
+	other.Note = "queued"
+	if err := Update(ctx, &other); err != nil { // v2
+		t.Fatal(err)
+	}
+	mine.Count = 7
+	if err := Update(ctx, &mine, WithRetry(1)); !errors.Is(err, ErrVersionConflict) {
+		t.Fatalf("a stale base must not be merged against, got %v", err)
+	}
+	var fresh testMergeShape
+	if err := FindByID(ctx, m.ID, &fresh); err != nil || fresh.Note != "queued" || fresh.Count != 0 {
+		t.Fatalf("the other writer's re-queue must stand: %+v %v", fresh, err)
+	}
+}
+
+func TestWritesInTransaction_RecordNoBase(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testMergeShape{}, "test_merge_shape", "")
+	m := &testMergeShape{Name: "t0"}
+	if err := Create(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	schema, _ := SchemaOf(&testMergeShape{})
+	var mine testMergeShape
+	if err := FindByID(ctx, m.ID, &mine); err != nil {
+		t.Fatal(err)
+	}
+	_ = WithTransaction(ctx, func(ctx context.Context) error {
+		mine.Name = "mine"
+		if err := Update(ctx, &mine); err != nil {
+			return err
+		}
+		if modelBase(schema, &mine) != nil {
+			t.Error("an Update inside a transaction must not record a base")
+		}
+		return errors.New("abort")
+	})
+	// Two other writers commit after the abort.
+	for i, name := range []string{"w1", "w2"} {
+		var w testMergeShape
+		if err := FindByID(ctx, m.ID, &w); err != nil {
+			t.Fatal(err)
+		}
+		w.Note = name
+		if err := Update(ctx, &w); err != nil {
+			t.Fatalf("writer %d: %v", i, err)
+		}
+	}
+	mine.Name = "mine"
+	if err := Update(ctx, &mine, WithRetry(3)); !errors.Is(err, ErrVersionConflict) {
+		t.Fatalf("no base after an aborted transaction means a conflict, got %v", err)
+	}
+	var fresh testMergeShape
+	if err := FindByID(ctx, m.ID, &fresh); err != nil || fresh.Name != "t0" || fresh.Note != "w2" {
+		t.Fatalf("nothing of ours may have landed: %+v %v", fresh, err)
+	}
+	// Created inside a committed transaction: no base either, by design.
+	c := &testMergeShape{Name: "c"}
+	if err := WithTransaction(ctx, func(ctx context.Context) error { return Create(ctx, c) }); err != nil {
+		t.Fatal(err)
+	}
+	if modelBase(schema, c) != nil {
+		t.Error("Create inside a transaction must not record a base")
+	}
+}

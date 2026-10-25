@@ -252,10 +252,7 @@ func SaveMany(ctx context.Context, models interface{}, opts ...UpdateOptions) er
 		return err
 	}
 
-	var opt UpdateOptions
-	if len(opts) > 0 {
-		opt = opts[0]
-	}
+	opt := mergeUpdateOptions(opts)
 	db, err := getDB(opt.DB)
 	if err != nil {
 		return err
@@ -358,7 +355,7 @@ func SaveMany(ctx context.Context, models interface{}, opts ...UpdateOptions) er
 			if _, failed := out.failures[i]; failed {
 				continue
 			}
-			setModelBaseFromModel(schema, model)
+			recordBaseAfterWrite(ctx, schema, model, nil)
 			if hook, ok := model.(AfterSave); ok {
 				if err := hook.AfterSave(ctx); err != nil {
 					out.failures[i] = fmt.Errorf("goodm: saved, but AfterSave failed: %w", err)
