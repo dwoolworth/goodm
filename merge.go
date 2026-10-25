@@ -12,7 +12,6 @@ import (
 	"github.com/dwoolworth/goodm/internal"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 // saveWithRetry attempts a versioned save, optionally retrying with a 3-way
@@ -42,10 +41,12 @@ func saveWithRetry(ctx context.Context, coll *mongo.Collection, schema *Schema, 
 			return err
 		}
 
-		// Version conflict — can we retry with merge?
+		// Version conflict — can we retry with merge? Without a base, or out
+		// of retries, the model keeps its stale version so that a further
+		// save conflicts again until the caller reloads or merges; refreshing
+		// the version here would let the next plain Update overwrite the
+		// other writer's changes.
 		if base == nil || attempt >= opt.MaxRetries {
-			// No retry: refresh version so next caller Update() can succeed.
-			refreshModelVersion(ctx, coll, model, id, scope)
 			return ErrVersionConflict
 		}
 
@@ -124,6 +125,14 @@ func mergeFromDB(ctx context.Context, coll *mongo.Collection, schema *Schema, mo
 		return nil, err
 	}
 
+	// A base newer than the stored document was recorded by a write that
+	// never committed (a rolled-back transaction); merging against it would
+	// take the caller's own rolled-back values for the stored state. Drop it.
+	if baseVersion, theirVersion := versionIn(base), versionIn(theirs); baseVersion > theirVersion {
+		setModelBase(schema, model, nil)
+		return nil, ErrVersionConflict
+	}
+
 	ourChanges := diffFields(base, ours)
 	theirChanges := diffFields(base, theirs)
 
@@ -198,19 +207,6 @@ func buildMergedDoc(theirs, ours bson.M, ourChanges []string) bson.M {
 	return merged
 }
 
-// refreshModelVersion does a best-effort read of the document's current version
-// and updates the model struct so the next Update() call won't cascade-fail.
-func refreshModelVersion(ctx context.Context, coll *mongo.Collection, model interface{}, id interface{}, scope interface{}) {
-	var doc struct {
-		Version int `bson:"__v"`
-	}
-	err := coll.FindOne(ctx, andFilter(scope, bson.D{{Key: "_id", Value: id}}),
-		options.FindOne().SetProjection(bson.D{{Key: "__v", Value: 1}})).Decode(&doc)
-	if err == nil {
-		setModelVersion(model, doc.Version)
-	}
-}
-
 // snapshotModel marshals a model to bson.M.
 func snapshotModel(model interface{}) (bson.M, error) {
 	return toBsonMap(model)
@@ -256,6 +252,19 @@ func diffFields(base, modified bson.M) []string {
 		}
 	}
 	return changed
+}
+
+// versionIn returns the __v stored in a decoded document map, or -1.
+func versionIn(doc bson.M) int64 {
+	switch v := doc["__v"].(type) {
+	case int32:
+		return int64(v)
+	case int64:
+		return v
+	case float64:
+		return int64(v)
+	}
+	return -1
 }
 
 // bsonValuesEqual compares two decoded BSON values structurally, treating

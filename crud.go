@@ -75,12 +75,40 @@ type UpdateOptions struct {
 
 // UnsetFields returns UpdateOptions that will remove the specified fields from
 // the MongoDB document. Field names should be bson names (e.g. "agent_id").
+// After a successful save the fields are zeroed on the model as well. Update
+// writes the whole struct, so a later Update stores the field's zero value
+// again unless the field is tagged omitempty.
 //
-// Example:
+// Several UpdateOptions values may be passed to one call and are combined:
 //
-//	goodm.Update(ctx, &server, goodm.UnsetFields("agent_id"))
+//	goodm.Update(ctx, &server, goodm.UnsetFields("agent_id"), goodm.WithRetry(2))
 func UnsetFields(fields ...string) UpdateOptions {
 	return UpdateOptions{Unset: fields}
+}
+
+// mergeUpdateOptions combines several UpdateOptions values: the first DB,
+// Hint, and Collation set win, Unset lists and ArrayFilters are concatenated,
+// MaxRetries is the largest given, and Upsert is set if any value sets it.
+func mergeUpdateOptions(opts []UpdateOptions) UpdateOptions {
+	var out UpdateOptions
+	for _, o := range opts {
+		if out.DB == nil {
+			out.DB = o.DB
+		}
+		if out.Hint == nil {
+			out.Hint = o.Hint
+		}
+		if out.Collation == nil {
+			out.Collation = o.Collation
+		}
+		out.Unset = append(out.Unset, o.Unset...)
+		out.ArrayFilters = append(out.ArrayFilters, o.ArrayFilters...)
+		if o.MaxRetries > out.MaxRetries {
+			out.MaxRetries = o.MaxRetries
+		}
+		out.Upsert = out.Upsert || o.Upsert
+	}
+	return out
 }
 
 // WithRetry returns UpdateOptions that will automatically retry on version
@@ -498,10 +526,7 @@ func Update(ctx context.Context, model interface{}, opts ...UpdateOptions) error
 		return fmt.Errorf("goodm: cannot update document with zero ID")
 	}
 
-	var opt UpdateOptions
-	if len(opts) > 0 {
-		opt = opts[0]
-	}
+	opt := mergeUpdateOptions(opts)
 
 	// Validate unset fields against the schema before proceeding.
 	if err := validateUnsetFields(schema, opt.Unset); err != nil {
@@ -545,7 +570,11 @@ func Update(ctx context.Context, model interface{}, opts ...UpdateOptions) error
 			return err
 		}
 		if len(opt.Unset) > 0 {
-			// The stored document lacks the unset fields; the base must too.
+			// The stored document lacks the unset fields: zero them on the
+			// model (a later Update then writes their zero value, or omits
+			// them if they are omitempty) and record the written document,
+			// which lacks them, as the base.
+			zeroUnsetFields(model, opt.Unset)
 			if written, err := buildReplacement(model, opt.Unset); err == nil {
 				if raw, err := bson.Marshal(written); err == nil {
 					setModelBase(schema, model, raw)
@@ -692,11 +721,7 @@ func UpdateFields(ctx context.Context, model interface{}, fields bson.M, opts ..
 		ModelName: schema.ModelName, Model: model, Filter: base,
 	}
 	return runMiddleware(ctx, info, func(ctx context.Context) error {
-		var optDB *mongo.Database
-		if len(opts) > 0 {
-			optDB = opts[0].DB
-		}
-		db, err := getDB(optDB)
+		db, err := getDB(mergeUpdateOptions(opts).DB)
 		if err != nil {
 			return err
 		}
@@ -1566,10 +1591,7 @@ func UpdateOne(ctx context.Context, filter interface{}, update interface{}, mode
 		ModelName: schema.ModelName, Model: model, Filter: filter,
 	}
 	return runMiddleware(ctx, info, func(ctx context.Context) error {
-		var opt UpdateOptions
-		if len(opts) > 0 {
-			opt = opts[0]
-		}
+		opt := mergeUpdateOptions(opts)
 		db, err := getDB(opt.DB)
 		if err != nil {
 			return err
@@ -2360,6 +2382,20 @@ func setModelVersion(model interface{}, version int) {
 // managedFields are internal fields that must not be unset or set directly.
 var managedFields = map[string]bool{
 	"_id": true, "created_at": true, "updated_at": true, "__v": true,
+}
+
+// zeroUnsetFields sets the fields stored under the given bson names to their
+// zero values on the model.
+func zeroUnsetFields(model interface{}, unset []string) {
+	v := reflect.ValueOf(model)
+	if v.Kind() == reflect.Pointer {
+		v = v.Elem()
+	}
+	for _, name := range unset {
+		if f := fieldByBSONName(v, name, false); f.IsValid() && f.CanSet() {
+			f.Set(reflect.Zero(f.Type()))
+		}
+	}
 }
 
 // validateUnsetFields checks that unset field names are valid schema fields,

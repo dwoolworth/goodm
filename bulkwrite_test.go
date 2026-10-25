@@ -230,15 +230,15 @@ func TestSaveMany_ClassifiesConflictsAndMissing(t *testing.T) {
 			t.Errorf("item %d not saved: %+v %v", i, fresh, err)
 		}
 	}
-	// The conflicting model's version was refreshed to the database's.
-	if users[1].Version != 1 {
-		t.Errorf("conflicting item should have version refreshed to 1, got %d", users[1].Version)
+	// The conflicting model keeps its stale version.
+	if users[1].Version != 0 {
+		t.Errorf("conflicting item must keep its stale version, got %d", users[1].Version)
 	}
 	var fresh testUser
 	if err := FindByID(ctx, users[1].ID, &fresh); err != nil || fresh.Age != 100 {
 		t.Errorf("conflicting write must not overwrite the other writer: %+v", fresh)
 	}
-	// Failed non-conflict items were rolled back.
+	// Failed items were rolled back.
 	if users[2].Version != 0 || users[3].Version != 0 {
 		t.Errorf("failed items should roll back their version: %d %d", users[2].Version, users[3].Version)
 	}
@@ -384,8 +384,8 @@ func TestSaveMany_IdenticalContentFromAnotherWriter_IsStillAConflict(t *testing.
 	if !errors.Is(err, ErrVersionConflict) {
 		t.Fatalf("a stale version must be a conflict regardless of content, got %v", err)
 	}
-	if mine.Version != 1 {
-		t.Errorf("conflicting model should have its version refreshed to 1, got %d", mine.Version)
+	if mine.Version != 0 {
+		t.Errorf("conflicting model must keep its stale version, got %d", mine.Version)
 	}
 }
 

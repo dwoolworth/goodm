@@ -208,8 +208,8 @@ func elemModel(v reflect.Value) interface{} {
 // contains the same _id twice, SaveMany returns before writing anything. After
 // the write, documents that were deleted or modified by another writer are
 // reported in a *BulkError with ErrNotFound or ErrVersionConflict per index
-// (the in-memory version of a conflicting model is refreshed from the
-// database, as Update does); unique index violations appear as
+// (a conflicting model keeps its stale version, as with Update, so it must be
+// reloaded before it is saved again); unique index violations appear as
 // *DuplicateKeyError. An item whose write concern was not met, or whose
 // request failed in transport or by context cancellation, is listed with that
 // error marked "outcome unknown": the server may have applied it, so its
@@ -606,8 +606,8 @@ func classifyReplaceError(err error, schema *Schema) replaceResult {
 }
 
 // resolveUnmatched classifies items whose replacement matched no document:
-// a document that still exists within scope is a version conflict (and the
-// model's version is refreshed from it); anything else is not found. The
+// a document that still exists within scope is a version conflict; anything
+// else is not found. The
 // read goes to the primary so it cannot observe a stale secondary, and the
 // documents are decoded into the model type so their _id values compare
 // with the models' through the same Go type.
@@ -643,29 +643,24 @@ func resolveUnmatched(ctx context.Context, coll *mongo.Collection, schema *Schem
 	}
 
 	for _, i := range unresolved {
-		v, exists := versions[idKey(ids[i])]
-		if !exists {
+		if _, exists := versions[idKey(ids[i])]; !exists {
 			failures[i] = ErrNotFound
 			continue
 		}
-		setModelVersion(items[i], v)
 		failures[i] = ErrVersionConflict
 	}
 	return nil
 }
 
-// rollbackVersions restores the pre-save version and UpdatedAt on failed
-// items. Items whose failure is a version conflict keep the version
-// resolveUnmatched refreshed from the database but get their UpdatedAt back.
+// rollbackVersions restores the pre-save version and UpdatedAt on every
+// failed item, so a conflicting model keeps its stale version and a further
+// save conflicts again until the caller reloads it.
 func rollbackVersions(items []interface{}, oldVersions []int, oldUpdated []time.Time, failures map[int]error) {
 	for i, model := range items {
-		failure, failed := failures[i]
-		if !failed {
+		if _, failed := failures[i]; !failed {
 			continue
 		}
-		if !errors.Is(failure, ErrVersionConflict) {
-			setModelVersion(model, oldVersions[i])
-		}
+		setModelVersion(model, oldVersions[i])
 		setUpdatedAt(model, oldUpdated[i])
 	}
 }
@@ -738,10 +733,7 @@ func UpdateMany(ctx context.Context, filter, update interface{}, model interface
 		return nil, err
 	}
 
-	var opt UpdateOptions
-	if len(opts) > 0 {
-		opt = opts[0]
-	}
+	opt := mergeUpdateOptions(opts)
 	db, err := getDB(opt.DB)
 	if err != nil {
 		return nil, err

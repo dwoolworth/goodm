@@ -12,6 +12,9 @@ All notable changes to this project will be documented in this file.
 - `goodm discover` typed date fields as `interface{}` because BSON dates decode as `bson.DateTime`; they are now `time.Time`.
 - A snapshot session passed to `WithTransaction` is documented to return an error.
 
+- **`ErrVersionConflict` no longer refreshes the model's version.** The refresh added in 0.5.0 let the next plain `Update` match the version filter and overwrite the other writer's changes. A conflicting model now keeps its stale version (in `Update` and `SaveMany`), so saving it again conflicts until it is reloaded or saved with `WithRetry`. A merge base recorded by a write inside a transaction that later aborted is detected (it is newer than the stored document) and discarded, returning `ErrVersionConflict` instead of merging against rolled-back state.
+- Several `UpdateOptions` values passed to one call are now combined (`UnsetFields(...)` with `WithRetry(n)`); previously only the first was used. After a successful save with `UnsetFields` the unset fields are zeroed on the model; a later `Update` writes their zero value unless they are tagged `omitempty`.
+
 ### Changed
 - The two internal filter-scoping helpers added by #8 and #9 are merged into one.
 
