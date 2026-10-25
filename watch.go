@@ -49,8 +49,14 @@ type WatchOptions struct {
 	StartAfter           bson.Raw
 	StartAtOperationTime *bson.Timestamp
 
-	BatchSize          int32              // events per batch
-	MaxAwaitTime       time.Duration      // how long the server waits for an event before returning an empty batch
+	BatchSize int32 // events per batch
+
+	// MaxAwaitTime is how long the server holds a request for events before
+	// answering with an empty batch; the server default is one second. Next
+	// and TryNext wait up to this long on an idle stream, so set it low to
+	// poll with TryNext. It must be shorter than the deadline of the
+	// context passed to Next and TryNext, or the driver fails the stream.
+	MaxAwaitTime       time.Duration
 	Collation          *options.Collation // collation for the pipeline's string comparisons
 	ShowExpandedEvents bool               // include DDL events such as createIndexes and modify (MongoDB 6.0+)
 }
@@ -161,10 +167,12 @@ type ChangeStream struct {
 
 // Watch opens a change stream on the model's collection. The model is used
 // for schema lookup (e.g. &User{}). It needs a replica set or sharded
-// cluster. Middleware runs under OpWatch and may replace OpInfo.Pipeline,
-// for example to prepend a $match on "fullDocument.tenant"; delete events
-// carry no full document, so such a scope drops them unless the stream asks
-// for pre-images (FullDocumentBeforeChange).
+// cluster, and cannot run inside a transaction. If ctx carries a session,
+// the stream is bound to it and fails once the session ends. Middleware
+// runs under OpWatch and may replace OpInfo.Pipeline, for example to
+// prepend a $match on "fullDocument.tenant"; delete events carry no full
+// document, so such a scope drops them unless the stream asks for
+// pre-images (FullDocumentBeforeChange).
 //
 //	stream, err := goodm.Watch(ctx, &Order{})
 //	if err != nil { ... }
@@ -215,7 +223,18 @@ func Watch(ctx context.Context, model interface{}, opts ...WatchOptions) (*Chang
 		stream = &ChangeStream{cs: cs, schema: schema}
 		return nil
 	})
-	return stream, err
+	if err != nil {
+		if stream != nil {
+			// A middleware failed after the stream was opened; do not leak
+			// the server cursor.
+			_ = stream.Close(ctx)
+		}
+		return nil, err
+	}
+	if stream == nil {
+		return nil, errors.New("goodm: watch was skipped by middleware")
+	}
+	return stream, nil
 }
 
 func (o WatchOptions) validate() error {
@@ -272,16 +291,18 @@ func (o WatchOptions) driverOptions() *options.ChangeStreamOptionsBuilder {
 // Next blocks until the next event is available and returns true, or returns
 // false when ctx is done, the stream failed, or the server ended it (after an
 // invalidate event, such as the collection being dropped). After a false
-// return, Err reports the failure, or nil if the stream simply ended.
+// return, Err reports the failure, or nil if the stream simply ended. A
+// failure is final, including one caused by ctx: open a new stream with
+// ResumeAfter to continue.
 func (s *ChangeStream) Next(ctx context.Context) bool {
 	return s.advance(ctx, false)
 }
 
-// TryNext returns the next event if one is already available and returns
-// true; it returns false without blocking when none is, when ctx is done, or
-// when the stream failed or ended. Check Err after a false return: when it
-// is nil and ID is not zero the stream is still open and TryNext may be
-// called again.
+// TryNext returns the next event and true if one arrives within the
+// stream's MaxAwaitTime (the server default is one second); it returns
+// false when none does, when ctx is done, or when the stream failed or
+// ended. Check Err after a false return: when it is nil and ID is not zero
+// the stream is still open and TryNext may be called again.
 func (s *ChangeStream) TryNext(ctx context.Context) bool {
 	return s.advance(ctx, true)
 }

@@ -248,6 +248,7 @@ for stream.Next(ctx) {
     ev := stream.Event()
     if ev.OperationType == "delete" {
         id, _ := ev.ObjectID()
+        log.Println("deleted", id)
         continue
     }
     var order Order

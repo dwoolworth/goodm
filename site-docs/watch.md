@@ -30,9 +30,9 @@ if err := stream.Err(); err != nil {
 }
 ```
 
-`Next` blocks until an event arrives, the context ends, the stream fails, or the server ends it. After `Next` returns false, `Err` reports the failure, or nil when the stream ended normally (see [Invalidation](#invalidation)). A stream that has failed stays failed; open a new one, resuming from the last token.
+`Next` blocks until an event arrives, the context ends, the stream fails, or the server ends it. After `Next` returns false, `Err` reports the failure, or nil when the stream ended normally (see [Invalidation](#invalidation)). A stream that has failed stays failed, including when its context ended it; open a new one, resuming from the last token.
 
-`TryNext` returns false immediately when no event is waiting; check `Err` and `ID` (zero once the server has closed the stream) to tell "nothing yet" from "ended".
+`TryNext` returns false when no event arrives within the stream's `MaxAwaitTime`, which the server defaults to one second; set it low to poll. Check `Err` and `ID` (zero once the server has closed the stream) to tell "nothing yet" from "ended". `MaxAwaitTime` must be shorter than the deadline of the context passed to `Next` or `TryNext`, or the driver fails the stream.
 
 `Each` runs a handler for every event:
 
@@ -150,6 +150,10 @@ type WatchOptions struct {
 ```
 
 The stream uses the model's `CollectionOptions` read preference and read concern. `stream.Driver()` returns the underlying `*mongo.ChangeStream` for anything the wrapper does not expose.
+
+A change stream cannot be opened inside a transaction; `Watch` returns the server's error. If the context carries a session (from `client.UseSession` or `mongo.NewSessionContext`), the stream is bound to it and fails once that session ends, so open long-lived streams with a plain context.
+
+`Watch` returns an error, and no stream, when middleware returns without calling `next`; if middleware fails after the stream was opened, the stream is closed before the error is returned.
 
 ## Invalidation
 

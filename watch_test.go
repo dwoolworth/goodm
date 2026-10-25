@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
@@ -434,4 +435,67 @@ func TestWatchErrors(t *testing.T) {
 	if _, ok := ev.ObjectID(); ok {
 		t.Error("ObjectID on an empty event must be false")
 	}
+}
+
+func TestWatchMiddlewareOutcomes(t *testing.T) {
+	ctx, db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	// Middleware that skips the operation: an error, not a nil stream.
+	Use(func(ctx context.Context, op *OpInfo, next func(context.Context) error) error {
+		if op.Operation == OpWatch {
+			return nil
+		}
+		return next(ctx)
+	})
+	s, err := Watch(ctx, &testUser{})
+	if err == nil || s != nil {
+		t.Fatalf("skipped watch = %v, %v", s, err)
+	}
+	ClearMiddleware()
+
+	// Middleware that fails after the stream opened: the cursor is closed.
+	before := openCursors(t, ctx, db)
+	Use(func(ctx context.Context, op *OpInfo, next func(context.Context) error) error {
+		if err := next(ctx); err != nil {
+			return err
+		}
+		if op.Operation == OpWatch {
+			return errors.New("audit sink down")
+		}
+		return nil
+	})
+	s, err = Watch(ctx, &testUser{})
+	if err == nil || s != nil {
+		t.Fatalf("failed-after watch = %v, %v", s, err)
+	}
+	ClearMiddleware()
+	if after := openCursors(t, ctx, db); after != before {
+		t.Errorf("open cursors on the namespace: %d before, %d after", before, after)
+	}
+}
+
+// openCursors counts idle cursors on the test database.
+func openCursors(t *testing.T, ctx context.Context, db *mongo.Database) int {
+	t.Helper()
+	pipeline := []bson.D{
+		{{Key: "$currentOp", Value: bson.D{{Key: "idleCursors", Value: true}}}},
+		{{Key: "$match", Value: bson.D{{Key: "type", Value: "idleCursor"}, {Key: "ns", Value: bson.D{{Key: "$regex", Value: "^" + db.Name() + "\\."}}}}}},
+		{{Key: "$count", Value: "n"}},
+	}
+	cursor, err := db.Client().Database("admin").Aggregate(ctx, pipeline)
+	if err != nil {
+		t.Skipf("currentOp not available: %v", err)
+	}
+	defer func() { _ = cursor.Close(ctx) }()
+	var out []struct {
+		N int `bson:"n"`
+	}
+	if err := cursor.All(ctx, &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out) == 0 {
+		return 0
+	}
+	return out[0].N
 }
