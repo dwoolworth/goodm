@@ -126,9 +126,13 @@ func main() {
 
 ## Requirements
 
-- Go 1.19+
-- MongoDB 4.0+ (6.0+ recommended)
-- Replica set required for transactions
+- Go 1.21+
+- MongoDB 4.0+ (6.0+ recommended; tested against 6.0, 7.0, and 8.0)
+- Replica set required for transactions and change streams
+
+## Release Notes
+
+See the [release notes](changelog.md) for what changed in each version, including behavior changes to watch for when upgrading.
 
 ## License
 
