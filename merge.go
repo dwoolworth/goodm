@@ -140,8 +140,10 @@ func mergeFromDB(ctx context.Context, coll *mongo.Collection, schema *Schema, mo
 	// record it as the base so that, if this round's retry also conflicts
 	// and retries run out, the model's version and base still agree and a
 	// later WithRetry can merge from here.
-	if raw, err := bson.Marshal(fresh); err == nil {
-		setModelBase(schema, model, raw)
+	if !inTransaction(ctx) {
+		if raw, err := bson.Marshal(fresh); err == nil {
+			setModelBase(schema, model, raw)
+		}
 	}
 
 	// A base newer than the stored document was recorded by a write that
