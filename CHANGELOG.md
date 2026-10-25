@@ -157,3 +157,15 @@ Tested against MongoDB 6.0.28, 7.0.45, and 8.0.34 running as single-node replica
 - Initial release: schema-driven ODM for MongoDB in Go.
 - CRUD operations with lifecycle hooks, validation, middleware, and population.
 - CLI with discover, migrate, and inspect commands.
+
+[0.8.0]: https://github.com/dwoolworth/goodm/releases/tag/v0.8.0
+[0.7.1]: https://github.com/dwoolworth/goodm/releases/tag/v0.7.1
+[0.7.0]: https://github.com/dwoolworth/goodm/releases/tag/v0.7.0
+[0.6.1]: https://github.com/dwoolworth/goodm/releases/tag/v0.6.1
+[0.6.0]: https://github.com/dwoolworth/goodm/releases/tag/v0.6.0
+[0.5.0]: https://github.com/dwoolworth/goodm/releases/tag/v0.5.0
+[0.4.0]: https://github.com/dwoolworth/goodm/releases/tag/v0.4.0
+[0.3.0]: https://github.com/dwoolworth/goodm/releases/tag/v0.3.0
+[0.2.0]: https://github.com/dwoolworth/goodm/releases/tag/v0.2.0
+[0.1.1]: https://github.com/dwoolworth/goodm/releases/tag/v0.1.1
+[0.1.0]: https://github.com/dwoolworth/goodm/releases/tag/v0.1.0

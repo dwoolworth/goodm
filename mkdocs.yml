@@ -59,6 +59,7 @@ nav:
   - CLI:
     - Commands: cli.md
   - Design Decisions: design-decisions.md
+  - Release Notes: changelog.md
 
 docs_dir: site-docs
 
