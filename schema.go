@@ -16,6 +16,12 @@ type CollectionOptions struct {
 	ReadPreference *readpref.ReadPref
 	ReadConcern    *readconcern.ReadConcern
 	WriteConcern   *writeconcern.WriteConcern
+
+	// SkipValidator makes Enforce leave this collection's validator alone
+	// under every ValidatorPolicy, for a model whose stored form the schema
+	// cannot describe (for example one using codecs registered on the
+	// client).
+	SkipValidator bool
 }
 
 // FieldSchema describes a single field parsed from struct tags.

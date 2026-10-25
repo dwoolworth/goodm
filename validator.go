@@ -80,7 +80,7 @@ func readCollectionValidation(ctx context.Context, db *mongo.Database, name stri
 // schema per the policy. shared names the other models registered for the
 // same collection, whose fields the schema does not describe.
 func enforceValidator(ctx context.Context, db *mongo.Database, schema *Schema, opt EnforceOptions, shared []*Schema) error {
-	if opt.Validator == ValidatorIgnore {
+	if opt.Validator == ValidatorIgnore || schema.CollOptions.SkipValidator {
 		return nil
 	}
 	if len(shared) > 0 {

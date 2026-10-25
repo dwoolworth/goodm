@@ -70,14 +70,20 @@ func Populate(ctx context.Context, model interface{}, refs Refs, opts ...Populat
 		return fmt.Errorf("goodm: Populate expects a pointer to a struct, got %T", model)
 	}
 
+	// Resolve every path and check every target before fetching anything,
+	// so a bad entry leaves no ref populated.
+	type job struct {
+		path    string
+		steps   []refStep
+		target  interface{}
+		toSlice bool
+	}
+	jobs := make([]job, 0, len(refs))
 	for path, target := range refs {
 		steps, many, err := resolveRefPath(schema, path)
 		if err != nil {
 			return err
 		}
-		leaf := steps[len(steps)-1].field
-		coll := collectionByName(db, leaf.Ref)
-
 		tv := reflect.ValueOf(target)
 		if tv.Kind() != reflect.Pointer || tv.IsNil() {
 			return fmt.Errorf("goodm: populate target for %q must be a non-nil pointer, got %T", path, target)
@@ -86,13 +92,17 @@ func Populate(ctx context.Context, model interface{}, refs Refs, opts ...Populat
 		if many && !toSlice {
 			return fmt.Errorf("goodm: ref %q can yield several ids; the target must be a pointer to a slice, got %T", path, target)
 		}
+		jobs = append(jobs, job{path: path, steps: steps, target: target, toSlice: toSlice})
+	}
 
+	for _, j := range jobs {
+		coll := collectionByName(db, j.steps[len(j.steps)-1].field.Ref)
 		c := idCollector{}
-		if err := c.collect(v, steps); err != nil {
-			return fmt.Errorf("goodm: ref %q: %w", path, err)
+		if err := c.collect(v, j.steps); err != nil {
+			return fmt.Errorf("goodm: ref %q: %w", j.path, err)
 		}
-		if toSlice {
-			if err := populateArrayRef(ctx, coll, c.ids, path, target); err != nil {
+		if j.toSlice {
+			if err := populateArrayRef(ctx, coll, c.ids, j.path, j.target); err != nil {
 				return err
 			}
 			continue
@@ -100,7 +110,7 @@ func Populate(ctx context.Context, model interface{}, refs Refs, opts ...Populat
 		if len(c.ids) == 0 {
 			continue // unset ref: leave the target untouched
 		}
-		if err := populateSingleRef(ctx, coll, c.ids[0], path, target); err != nil {
+		if err := populateSingleRef(ctx, coll, c.ids[0], j.path, j.target); err != nil {
 			return err
 		}
 	}

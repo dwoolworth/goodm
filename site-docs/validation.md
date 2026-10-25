@@ -6,7 +6,7 @@ goodm validates models automatically on `Create` and `Update`. Validation runs a
 
 ### Required
 
-Fields tagged `required` must be non-zero. Go's zero values are: `""` for strings, `0` for ints, `false` for bools, zero `bson.ObjectID`, zero `time.Time`.
+Fields tagged `required` must be non-zero. Go's zero values are: `""` for strings, `0` for ints, `false` for bools, zero `bson.ObjectID`, zero `time.Time`. A value whose own `IsZero` method reports zero also counts as missing (a non-nil `*time.Time` pointing at the zero time), as the driver's `omitempty` treats it.
 
 ```go
 Name string `bson:"name" goodm:"required"`
@@ -22,7 +22,7 @@ Status string `bson:"status" goodm:"enum=draft|published|archived"`
 
 ### Min / Max
 
-Fields tagged `min=N` or `max=N` are bounded: numbers (ints and floats) by value, strings, slices, and maps by length. Bounds may be fractional. The zero value is checked like any other, so `min=1` rejects `0`, `min=0` rejects `-0.5`, and a nil or empty slice has length 0; only a nil pointer counts as absent.
+Fields tagged `min=N` or `max=N` are bounded: numbers (ints and floats) by value, strings by length in characters (not bytes), slices and maps by length. Bounds may be fractional. The zero value is checked like any other, so `min=1` rejects `0`, `min=0` rejects `-0.5`, and a nil or empty slice has length 0; only a nil pointer counts as absent.
 
 ```go
 Age    int     `bson:"age"    goodm:"min=13,max=120"`
@@ -128,12 +128,19 @@ How the struct maps to the schema:
 | Go type | `bsonType` as the driver encodes it: integers `["int", "long"]` (32-bit kinds just `int`), floats `double`, `time.Time` `date`, `bson.ObjectID` `objectId`, `[]byte` `binData`, `url.URL` `string`, the `bson` primitive types their own types, structs `object` with their own `properties`, slices `array` with `items`, maps `object` with `additionalProperties`; unsigned integers get `minimum: 0` |
 | Pointers, slices, maps, `interface{}`, `bson.D`/`M`/`Raw` | Also allow `null`, because `UpdateFields` stores a nil as null |
 | Types with their own `MarshalBSON` or `MarshalBSONValue` | No constraint, since the schema cannot know what they write |
+| `[]byte` and `[N]byte` | `binData`; a slice or array of a named byte type is an `array`, as the driver stores it |
 | `required` | Listed in the object's `required` |
 | `enum=a\|b` | `enum` (on the `items` for a slice); numbers and bools are parsed. The field's zero value is allowed too unless it is `required`, because `Validate` treats a zero value as unset and a field without `omitempty` is written as its zero value; a pointer allows `null` |
 | `min`/`max` | `minimum`/`maximum` for numbers, `minLength`/`maxLength` for strings (counted in characters), `minItems`/`maxItems` for arrays, `minProperties`/`maxProperties` for maps |
 | `bson:"-"` fields | Omitted |
 
-Fields the struct does not declare are allowed, as drift detection treats them as warnings. The server only checks that a `required` field is present, while `Validate` also rejects its zero value, so goodm's own checks remain the stricter of the two: a document goodm writes always passes the validator it generated, with two exceptions. A `FindOneAndUpdate` upsert whose filter has no `_id` makes the server generate an ObjectID, which the validator of a model with another `_id` type rejects. And client `BSONOptions` that change how fields are named or encoded are not visible to the schema.
+Fields the struct does not declare are allowed, as drift detection treats them as warnings. The server only checks that a `required` field is present, while `Validate` also rejects its zero value, so goodm's own checks remain the stricter of the two: a document goodm writes always passes the validator it generated, with two exceptions. A `FindOneAndUpdate` upsert whose filter has no `_id` makes the server generate an ObjectID, which the validator of a model with another `_id` type rejects. And codecs registered on the client or database, and client `BSONOptions` that change how fields are named or encoded, are not visible to the schema. A model stored through such codecs should set `SkipValidator: true` in its `CollectionOptions`, which makes `Enforce` leave that collection's validator alone under every policy:
+
+```go
+func (p *Price) CollectionOptions() goodm.CollectionOptions {
+    return goodm.CollectionOptions{SkipValidator: true}
+}
+```
 
 A write the server rejects returns a `*DocumentValidationError`, matched by `errors.Is(err, goodm.ErrDocumentValidation)`, from every write path including the raw operations, `FindOneAndUpdate`, and the bulk operations (per item in the `*BulkError`). Its `Details` field holds the server's `errInfo` document, which names the failing rule and the value it saw:
 

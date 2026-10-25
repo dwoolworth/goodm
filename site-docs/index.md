@@ -98,12 +98,13 @@ func main() {
 | **Atomic** | `FindOneAndUpdate`, `FindOneAndReplace`, `FindOneAndDelete` with upsert |
 | **Raw Operations** | `UpdateOne`, `DeleteOne`, `UpdateMany`, `DeleteMany`, `NewBulk` for direct MongoDB access |
 | **Hooks** | `BeforeCreate`, `AfterCreate`, `BeforeSave`, `AfterSave`, `BeforeDelete`, `AfterDelete` |
-| **Validation** | Automatic on Create/Update: required, enum, min/max, immutable enforcement |
+| **Validation** | Automatic on Create/Update: required, enum, min/max, immutable enforcement; `Enforce` can install the same rules as a `$jsonSchema` collection validator |
 | **Middleware** | Global and per-model middleware chains wrapping all operations |
-| **Population** | Resolve `ref=` fields by fetching referenced documents |
+| **Population** | Resolve `ref=` fields, including refs inside subdocuments and slices, by fetching referenced documents |
 | **Aggregation** | Fluent pipeline builder with `Match`, `Group`, `Sort`, `Lookup`, and more |
 | **Bulk** | `CreateMany` and `SaveMany` with hooks/validation, `NewBulk` builder, `UpdateMany`/`DeleteMany` passthrough |
 | **Transactions** | `WithTransaction` wraps operations in a MongoDB session transaction |
+| **Change Streams** | `Watch` delivers typed change events with resume tokens, filtering, and pre-images |
 | **CLI** | `goodm discover` (introspect DB), `goodm migrate` (sync indexes), `goodm inspect` (view schemas) |
 
 ## How does goodm compare?

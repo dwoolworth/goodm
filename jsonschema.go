@@ -97,6 +97,7 @@ func constrainable(t reflect.Type) bool {
 var (
 	valueMarshalerType = reflect.TypeOf((*bson.ValueMarshaler)(nil)).Elem()
 	marshalerType      = reflect.TypeOf((*bson.Marshaler)(nil)).Elem()
+	byteType           = reflect.TypeOf(byte(0))
 )
 
 // encodesItself reports whether values of t choose their own BSON encoding,
@@ -177,12 +178,12 @@ func typeSchema(t reflect.Type, fs *FieldSchema) bson.D {
 	case reflect.Float32, reflect.Float64:
 		return bsonTypes("double")
 	case reflect.Slice:
-		if t.Elem().Kind() == reflect.Uint8 {
+		if t.Elem() == byteType { // only the exact byte type is stored as binData
 			return bsonTypes("binData", "null")
 		}
 		return allowNull(arraySchema(t.Elem(), fs))
 	case reflect.Array:
-		if t.Elem().Kind() == reflect.Uint8 {
+		if t.Elem() == byteType {
 			return bsonTypes("binData")
 		}
 		return arraySchema(t.Elem(), fs)
@@ -379,7 +380,7 @@ func applyBounds(doc *bson.D, fs *FieldSchema, t reflect.Type) {
 		minKey, maxKey = "minimum", "maximum"
 	case elem.Kind() == reflect.String:
 		minKey, maxKey, integral = "minLength", "maxLength", true
-	case (elem.Kind() == reflect.Slice || elem.Kind() == reflect.Array) && elem.Elem().Kind() != reflect.Uint8:
+	case (elem.Kind() == reflect.Slice || elem.Kind() == reflect.Array) && elem.Elem() != byteType:
 		minKey, maxKey, integral = "minItems", "maxItems", true
 	case elem.Kind() == reflect.Map:
 		minKey, maxKey, integral = "minProperties", "maxProperties", true
