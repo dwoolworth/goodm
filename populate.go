@@ -66,32 +66,36 @@ func Populate(ctx context.Context, model interface{}, refs Refs, opts ...Populat
 	if v.Kind() == reflect.Pointer {
 		v = v.Elem()
 	}
+	if !v.IsValid() || v.Kind() != reflect.Struct {
+		return fmt.Errorf("goodm: Populate expects a pointer to a struct, got %T", model)
+	}
 
 	for path, target := range refs {
-		steps, err := resolveRefPath(schema, path)
+		steps, many, err := resolveRefPath(schema, path)
 		if err != nil {
 			return err
 		}
 		leaf := steps[len(steps)-1].field
 		coll := collectionByName(db, leaf.Ref)
 
-		c := idCollector{}
-		if err := c.collect(v, steps); err != nil {
-			return fmt.Errorf("goodm: ref %q: %w", path, err)
-		}
-
 		tv := reflect.ValueOf(target)
 		if tv.Kind() != reflect.Pointer || tv.IsNil() {
 			return fmt.Errorf("goodm: populate target for %q must be a non-nil pointer, got %T", path, target)
 		}
-		if tv.Elem().Kind() == reflect.Slice {
+		toSlice := tv.Elem().Kind() == reflect.Slice
+		if many && !toSlice {
+			return fmt.Errorf("goodm: ref %q can yield several ids; the target must be a pointer to a slice, got %T", path, target)
+		}
+
+		c := idCollector{}
+		if err := c.collect(v, steps); err != nil {
+			return fmt.Errorf("goodm: ref %q: %w", path, err)
+		}
+		if toSlice {
 			if err := populateArrayRef(ctx, coll, c.ids, path, target); err != nil {
 				return err
 			}
 			continue
-		}
-		if c.many {
-			return fmt.Errorf("goodm: ref %q yields several ids; the target must be a pointer to a slice, got %T", path, target)
 		}
 		if len(c.ids) == 0 {
 			continue // unset ref: leave the target untouched
@@ -112,37 +116,72 @@ type refStep struct {
 }
 
 // resolveRefPath resolves a dotted path of bson names (with optional numeric
-// element segments) to the ref field it ends at.
-func resolveRefPath(schema *Schema, path string) ([]refStep, error) {
+// element segments) to the ref field it ends at. many reports whether the
+// path can hold more than one id: it crosses a slice without an index, or
+// ends at an array ref without one. That is a property of the path, so a
+// wrong target type is reported whatever the model holds.
+func resolveRefPath(schema *Schema, path string) (steps []refStep, many bool, err error) {
 	segs := strings.Split(path, ".")
 	fields := schema.Fields
-	var steps []refStep
-	for i, seg := range segs {
-		if n, err := strconv.Atoi(seg); err == nil && len(steps) > 0 && isSliceType(steps[len(steps)-1].field.goType) && steps[len(steps)-1].index < 0 {
-			if n < 0 {
-				return nil, fmt.Errorf("goodm: ref path %q has a negative index", path)
+	prev := "" // bson name of the last field resolved, for messages
+	for _, seg := range segs {
+		if len(steps) > 0 {
+			last := &steps[len(steps)-1]
+			if n, err := strconv.Atoi(seg); err == nil && isSliceType(last.field.goType) && last.index < 0 {
+				if n < 0 {
+					return nil, false, fmt.Errorf("goodm: ref path %q has a negative index", path)
+				}
+				last.index = n
+				continue
 			}
-			steps[len(steps)-1].index = n
-			continue
 		}
 		if fields == nil {
-			return nil, fmt.Errorf("goodm: field %q in ref path %q is not a subdocument", segs[i-1], path)
+			return nil, false, fmt.Errorf("goodm: field %q in ref path %q is not a subdocument", prev, path)
 		}
 		field := fieldIn(fields, seg)
 		if field == nil {
 			if len(segs) == 1 {
-				return nil, fmt.Errorf("goodm: field %q not found in schema for %s", path, schema.ModelName)
+				return nil, false, fmt.Errorf("goodm: field %q not found in schema for %s", path, schema.ModelName)
 			}
-			return nil, fmt.Errorf("goodm: field %q in ref path %q not found in schema for %s", seg, path, schema.ModelName)
+			return nil, false, fmt.Errorf("goodm: field %q in ref path %q not found in schema for %s", seg, path, schema.ModelName)
 		}
 		steps = append(steps, refStep{field: field, index: -1})
-		fields = field.SubFields
+		prev = field.BSONName
+		fields = subFieldsOf(field)
 	}
 	leaf := steps[len(steps)-1].field
 	if leaf.Ref == "" {
-		return nil, fmt.Errorf("goodm: field %q has no ref tag", path)
+		return nil, false, fmt.Errorf("goodm: field %q has no ref tag", path)
 	}
-	return steps, nil
+	for _, st := range steps {
+		if isSliceType(st.field.goType) && st.index < 0 {
+			many = true
+		}
+	}
+	return steps, many, nil
+}
+
+// subFieldsOf returns a field's subdocument fields. A self-recursive
+// subdocument type has none recorded (Register stops at the cycle), so they
+// are parsed from the type on demand.
+func subFieldsOf(f *FieldSchema) []FieldSchema {
+	if f.SubFields != nil {
+		return f.SubFields
+	}
+	t := f.goType
+	if t == nil {
+		return nil
+	}
+	if t.Kind() == reflect.Slice || t.Kind() == reflect.Array {
+		t = t.Elem()
+	}
+	if t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t.Kind() != reflect.Struct || isLeafType(t) {
+		return nil
+	}
+	return parseFields(t, nil)
 }
 
 func fieldIn(fields []FieldSchema, bsonName string) *FieldSchema {
@@ -154,6 +193,8 @@ func fieldIn(fields []FieldSchema, bsonName string) *FieldSchema {
 	return nil
 }
 
+// isSliceType reports whether a field holds a slice (an ObjectID is a byte
+// array, not a slice of anything indexable here).
 func isSliceType(t reflect.Type) bool {
 	if t == nil {
 		return false
@@ -161,16 +202,13 @@ func isSliceType(t reflect.Type) bool {
 	if t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
-	return t.Kind() == reflect.Slice || t.Kind() == reflect.Array
+	return t.Kind() == reflect.Slice
 }
 
 // idCollector gathers the distinct non-zero ObjectIDs found at a ref path.
-// many reports that the path can hold more than one id: it crosses a slice
-// of subdocuments without an index, or ends at an array ref.
 type idCollector struct {
 	ids  []bson.ObjectID
 	seen map[bson.ObjectID]bool
-	many bool
 }
 
 func (c *idCollector) add(id bson.ObjectID) {
@@ -213,7 +251,6 @@ func (c *idCollector) collect(v reflect.Value, steps []refStep) error {
 			}
 			return c.collectElem(fv.Index(step.index), rest)
 		}
-		c.many = true
 		for i := 0; i < fv.Len(); i++ {
 			if err := c.collectElem(fv.Index(i), rest); err != nil {
 				return err
@@ -258,7 +295,6 @@ func (c *idCollector) leaf(fv reflect.Value, step refStep) error {
 			}
 			return nil
 		}
-		c.many = true
 		for _, id := range x {
 			c.add(id)
 		}
@@ -348,7 +384,7 @@ func BatchPopulate(ctx context.Context, models interface{}, field string, result
 	if err != nil {
 		return err
 	}
-	steps, err := resolveRefPath(schema, field)
+	steps, _, err := resolveRefPath(schema, field)
 	if err != nil {
 		return err
 	}

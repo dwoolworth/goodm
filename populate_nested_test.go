@@ -210,3 +210,92 @@ func TestBatchPopulateNestedPaths(t *testing.T) {
 		t.Errorf("value slice: %v %d", err, len(got))
 	}
 }
+
+type reviewNode struct {
+	Ref  bson.ObjectID `bson:"ref" goodm:"ref=test_products"`
+	Kids []reviewNode  `bson:"kids"`
+}
+
+type testTree struct {
+	Model `bson:",inline"`
+	Root  reviewNode `bson:"root"`
+}
+
+func TestPopulatePathContract(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerInvoiceModels(t)
+	if err := Register(&testTree{}, "test_trees"); err != nil {
+		t.Fatal(err)
+	}
+	defer Unregister(&testTree{})
+
+	p := &testProduct{Name: "p"}
+	if err := Create(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	inv := &testInvoice{Name: "i", Ship: testShipTo{CarrierID: p.ID}}
+	if err := Create(ctx, inv); err != nil {
+		t.Fatal(err)
+	}
+
+	// A slice or nil model is an error, not a silent no-op.
+	var c testCarrier
+	if err := Populate(ctx, []*testInvoice{inv}, Refs{"ship.carrier": &c}); err == nil {
+		t.Error("slice model accepted")
+	}
+	if err := Populate(ctx, (*testInvoice)(nil), Refs{"ship.carrier": &c}); err == nil {
+		t.Error("nil model accepted")
+	}
+
+	// An ObjectID is not indexable.
+	for _, bad := range []string{"ship.carrier.0", "ship.backup.5", "name.0"} {
+		if err := Populate(ctx, inv, Refs{bad: &c}); err == nil {
+			t.Errorf("path %q accepted", bad)
+		}
+	}
+
+	// The target type is judged by the path, not by what the model holds:
+	// a struct target for a fan-out path fails even through a nil pointer
+	// or an empty slice.
+	var one testTag
+	if err := Populate(ctx, inv, Refs{"alt_ship.tags": &one}); err == nil || !strings.Contains(err.Error(), "several ids") {
+		t.Errorf("fan-out through nil pointer with struct target = %v", err)
+	}
+	if err := Populate(ctx, inv, Refs{"ship.tags": &one}); err == nil || !strings.Contains(err.Error(), "several ids") {
+		t.Errorf("empty array ref with struct target = %v", err)
+	}
+	if err := Populate(ctx, inv, Refs{"items.product": &testProduct{}}); err == nil {
+		t.Error("fan-out through empty slice with struct target accepted")
+	}
+	// A nil target is an error even for a zero ref.
+	if err := Populate(ctx, inv, Refs{"ship.backup": nil}); err == nil {
+		t.Error("nil target accepted for a zero ref")
+	}
+	// Error text names the field before an index.
+	err := Populate(ctx, inv, Refs{"ship.tags.0.1": &one})
+	if err == nil || !strings.Contains(err.Error(), `field "tags"`) {
+		t.Errorf("index error text = %v", err)
+	}
+
+	// A ref inside a self-recursive subdocument type is reachable.
+	tree := &testTree{Root: reviewNode{Kids: []reviewNode{{Ref: p.ID}, {Kids: []reviewNode{{Ref: p.ID}}}}}}
+	if err := Create(ctx, tree); err != nil {
+		t.Fatal(err)
+	}
+	var got []testProduct
+	if err := Populate(ctx, tree, Refs{"root.kids.ref": &got}); err != nil || len(got) != 1 {
+		t.Errorf("recursive path: %v %d", err, len(got))
+	}
+	got = nil
+	if err := Populate(ctx, tree, Refs{"root.kids.1.kids.0.ref": &got}); err != nil || len(got) != 1 {
+		t.Errorf("deep recursive path: %v %d", err, len(got))
+	}
+	var single testProduct
+	if err := Populate(ctx, tree, Refs{"root.kids.1.kids.0.ref": &single}); err != nil || single.ID != p.ID {
+		t.Errorf("deep indexed path: %v %v", err, single.ID)
+	}
+	if err := BatchPopulate(ctx, []*testTree{tree}, "root.kids.kids.ref", &got); err != nil || len(got) != 1 {
+		t.Errorf("batch recursive: %v %d", err, len(got))
+	}
+}

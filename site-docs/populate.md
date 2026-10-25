@@ -134,8 +134,9 @@ err := goodm.BatchPopulate(ctx, orders, "items.product", &products)
 ## Behavior
 
 - **Zero refs** are skipped — if the `ObjectID` field is zero, the target struct is left untouched.
-- **Empty/nil array refs** are skipped — the target slice is left empty.
-- **Dangling refs** (ID points to a nonexistent document) are skipped silently. The target struct remains at its zero value.
+- **Empty/nil array refs** are skipped — the target slice is left as it was.
+- **Dangling refs** (ID points to a nonexistent document) are skipped silently. The target struct remains at its zero value. Documents fetched for an array ref come back in the server's order, not the order of the ids.
+- **Targets** must be non-nil pointers, and a path that can yield several ids (an array ref, or a path through a slice without an index) needs a pointer to a slice. This is checked from the path before any lookup, so a wrong target type fails even when the field is empty.
 - **Missing field**, **no ref tag**, or a **path through a field that is not a subdocument** returns an error immediately.
 
 ## Options
