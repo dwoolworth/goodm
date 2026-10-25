@@ -67,9 +67,31 @@ func fieldSchema(fs *FieldSchema) bson.D {
 		return bson.D{}
 	}
 	doc := typeSchema(t, fs)
-	applyEnum(&doc, fs, t)
-	applyBounds(&doc, fs, t)
+	if constrainable(t) {
+		applyEnum(&doc, fs, t)
+		applyBounds(&doc, fs, t)
+	}
 	return doc
+}
+
+// constrainable reports whether enum and bounds from the tags describe the
+// stored value: not for a type that encodes itself or one the driver
+// encodes as something other than its Go kind, whose tag values are
+// compared by goodm in Go terms the server would not share.
+func constrainable(t reflect.Type) bool {
+	elem := baseType(t)
+	if elem.Kind() == reflect.Slice || elem.Kind() == reflect.Array {
+		elem = baseType(elem.Elem())
+	}
+	if encodesItself(elem) {
+		return false
+	}
+	switch elem {
+	case reflect.TypeOf(url.URL{}), reflect.TypeOf(json.Number("")), reflect.TypeOf(bson.JavaScript("")), reflect.TypeOf(bson.Symbol("")),
+		reflect.TypeOf(bson.DateTime(0)), reflect.TypeOf(bson.Timestamp{}), reflect.TypeOf(bson.Decimal128{}):
+		return false
+	}
+	return true
 }
 
 var (
@@ -267,12 +289,28 @@ func applyEnum(doc *bson.D, fs *FieldSchema, t reflect.Type) {
 	if allowNil {
 		values = append(values, nil)
 	}
+	values = dedupe(values) // the server rejects an enum with repeated values
 	target = append(target, bson.E{Key: "enum", Value: values})
 	if elem != baseType(t) {
 		*doc = setItems(*doc, target)
 	} else {
 		*doc = target
 	}
+}
+
+// dedupe removes repeated values from an enum list, keeping first
+// occurrences in order.
+func dedupe(values bson.A) bson.A {
+	seen := make(map[interface{}]bool, len(values))
+	out := values[:0]
+	for _, v := range values {
+		if seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
 }
 
 // enumZero is the zero value of an enum field's kind, in the type the enum

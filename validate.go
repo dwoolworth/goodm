@@ -85,9 +85,13 @@ func validateOneField(fv reflect.Value, fs *FieldSchema, fieldPath string) []Val
 	return append(errs, validateSubFields(fv, *fs, fieldPath)...)
 }
 
+var zeroerType = reflect.TypeOf((*bson.Zeroer)(nil)).Elem()
+
 // isZeroField reports whether a field value is zero as the driver sees it:
-// the Go zero value, or a value whose own IsZero method says so (such as a
-// non-nil *time.Time pointing at the zero time), which omitempty omits.
+// the Go zero value, or a value whose static type has an IsZero method that
+// says so (such as a non-nil *time.Time pointing at the zero time), which
+// omitempty omits. As in the driver, the method is looked up on the field's
+// declared type, so an interface field is judged by whether it is nil.
 func isZeroField(v reflect.Value) bool {
 	if v.IsZero() {
 		return true
@@ -95,10 +99,8 @@ func isZeroField(v reflect.Value) bool {
 	if v.Kind() == reflect.Pointer && v.IsNil() {
 		return true
 	}
-	if v.CanInterface() {
-		if z, ok := v.Interface().(bson.Zeroer); ok {
-			return z.IsZero()
-		}
+	if v.Type().Implements(zeroerType) && v.CanInterface() {
+		return v.Interface().(bson.Zeroer).IsZero()
 	}
 	return false
 }

@@ -1,6 +1,7 @@
 package goodm
 
 import (
+	"encoding/json"
 	"errors"
 	"net/url"
 	"testing"
@@ -461,6 +462,12 @@ type jsEdge struct {
 	Plain   string          `bson:"plain"`
 	When    *time.Time      `bson:"when,omitempty"  goodm:"required"`
 	Version int64           `bson:"ver"`
+	Flag    bool            `bson:"flag"  goodm:"enum=true|false"`
+	Level   int             `bson:"level" goodm:"enum=0|1|1"`
+	Mode    string          `bson:"mode"  goodm:"enum=a|"`
+	StEnum  jsStatus        `bson:"st"    goodm:"enum=0|1"`
+	Num     json.Number     `bson:"num"   goodm:"enum=1|2,min=1"`
+	Any     interface{}     `bson:"any"   goodm:"required"`
 }
 
 type jsVersion64 struct {
@@ -512,6 +519,26 @@ func TestValidatorAcceptsEveryGoodmWrite(t *testing.T) {
 	if huge := lookup(t, props, "huge").(bson.D); has(huge, "maxLength") {
 		t.Errorf("infinite bound emitted: %v", huge)
 	}
+	if got := lookup(t, props, "flag", "enum"); !bsonValuesEqual(got, bson.A{true, false}) {
+		t.Errorf("bool enum = %v", got)
+	}
+	if got := lookup(t, props, "level", "enum"); !bsonValuesEqual(got, bson.A{int64(0), int64(1)}) {
+		t.Errorf("repeated enum = %v", got)
+	}
+	if got := lookup(t, props, "mode", "enum"); !bsonValuesEqual(got, bson.A{"a", ""}) {
+		t.Errorf("enum listing the empty string = %v", got)
+	}
+	if st := lookup(t, props, "st").(bson.D); len(st) != 0 {
+		t.Errorf("enum on a self-marshaling type: %v", st)
+	}
+	if num := lookup(t, props, "num").(bson.D); has(num, "enum") || has(num, "minimum") {
+		t.Errorf("constraints on json.Number: %v", num)
+	}
+	if p := Validate(&jsEdge{Any: (*time.Time)(nil)}, s); len(p) != 1 || p[0].Field != "name" && p[0].Field != "when" {
+		// Any holds a typed nil: not zero to the driver, so only the other
+		// required/min fields complain. Mainly: no panic.
+		t.Logf("typed nil interface: %v", p)
+	}
 
 	if err := Enforce(ctx, db, EnforceOptions{Validator: ValidatorApply}); err != nil {
 		t.Fatal(err)
@@ -520,6 +547,9 @@ func TestValidatorAcceptsEveryGoodmWrite(t *testing.T) {
 	now := time.Now()
 	a := "a"
 	m := &jsEdge{
+		Any:    (*time.Time)(nil),
+		StEnum: 1,
+		Num:    "1",
 		Tags:   []*string{&a, nil},
 		Status: 1,
 		Site:   url.URL{Scheme: "https", Host: "x"},
@@ -550,11 +580,11 @@ func TestValidatorAcceptsEveryGoodmWrite(t *testing.T) {
 
 	// goodm's own checks moved to match the server.
 	m.Name = "éé"
-	if err := Create(ctx, &jsEdge{Name: "éé", When: &now}); err == nil {
+	if err := Create(ctx, &jsEdge{Name: "éé", When: &now, Any: 1}); err == nil {
 		t.Error("two characters accepted for min=3")
 	}
 	zero := time.Time{}.In(time.FixedZone("X", 3600))
-	if err := Create(ctx, &jsEdge{Name: "abc", When: &zero}); err == nil {
+	if err := Create(ctx, &jsEdge{Name: "abc", When: &zero, Any: 1}); err == nil {
 		t.Error("required *time.Time at the zero instant accepted")
 	}
 
