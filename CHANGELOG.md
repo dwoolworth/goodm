@@ -16,6 +16,8 @@ All notable changes to this project will be documented in this file.
 - `Populate` checks its arguments before looking anything up: the model must be a non-nil pointer to a struct (a slice used to be silently ignored), every target must be a non-nil pointer, and a path that can yield several ids (an array ref, or a path through a slice without an index) must have a slice target, even when the field is currently empty. `BatchPopulate` reports a ref field of an unsupported type instead of skipping it.
 
 ### Fixed
+- `SaveMany` silently ignored `UnsetFields` and `WithRetry`. It now removes the unset fields from every document (and zeroes them on the saved models), and returns an error for `WithRetry`, which it cannot honor.
+- `UnsetFields` could remove an `immutable` field, since the immutable check compares the model (which still held the value) with the stored document; unsetting an immutable field is now rejected by `Update` and `SaveMany`.
 - `goodm migrate` did not list planned index rebuilds, so they were applied without appearing in the plan or its summary; rebuilds are now shown with `~` and counted.
 
 ## [0.7.1] - 2026-10-24

@@ -980,3 +980,132 @@ func TestClassifyReplaceError_TransportIsUnknown(t *testing.T) {
 		t.Errorf("client-side error: %v server=%v", r.err, r.server)
 	}
 }
+
+func TestSaveManyUnsetFields(t *testing.T) {
+	ctx, db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	users := []*testUser{{Email: "u1@x.com", Name: "U1", Age: 1, Role: "admin"}, {Email: "u2@x.com", Name: "U2", Age: 2, Role: "admin"}}
+	for _, u := range users {
+		if err := Create(ctx, u); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := SaveMany(ctx, users, WithRetry(1)); err == nil {
+		t.Error("WithRetry accepted by SaveMany")
+	}
+	if err := SaveMany(ctx, users, UnsetFields("name")); err == nil {
+		t.Error("unsetting a required field accepted")
+	}
+	if err := SaveMany(ctx, users, UnsetFields("nope")); err == nil {
+		t.Error("unsetting an unknown field accepted")
+	}
+	if users[0].Version != 0 {
+		t.Errorf("rejected call changed version to %d", users[0].Version)
+	}
+
+	users[0].Age = 10
+	if err := SaveMany(ctx, users, UnsetFields("role")); err != nil {
+		t.Fatalf("SaveMany unset: %v", err)
+	}
+	for i, u := range users {
+		if u.Role != "" || u.Version != 1 {
+			t.Errorf("item %d: role %q version %d", i, u.Role, u.Version)
+		}
+		var raw bson.M
+		if err := db.Collection("test_users").FindOne(ctx, bson.D{{Key: "_id", Value: u.ID}}).Decode(&raw); err != nil {
+			t.Fatal(err)
+		}
+		if _, has := raw["role"]; has {
+			t.Errorf("item %d: role still stored: %v", i, raw["role"])
+		}
+		if i == 0 && raw["age"] != int32(10) {
+			t.Errorf("age not written: %v", raw["age"])
+		}
+	}
+
+	// The saved models carry a merge base that reflects the removal, so a
+	// later WithRetry merge does not resurrect the field.
+	other := &testUser{}
+	if err := FindByID(ctx, users[0].ID, other); err != nil {
+		t.Fatal(err)
+	}
+	other.Age = 11
+	if err := Update(ctx, other); err != nil {
+		t.Fatal(err)
+	}
+	users[0].Name = "U1" // unchanged; conflict on version only
+	users[0].Age = 10
+	if err := Update(ctx, users[0], WithRetry(1)); err != nil {
+		t.Fatalf("merge after unset: %v", err)
+	}
+	var stored testUser
+	if err := FindByID(ctx, users[0].ID, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Role != "" || stored.Age != 11 {
+		t.Errorf("after merge: %+v", stored)
+	}
+}
+
+// failingValue marshals with an error when Fail is set.
+type failingValue struct{ Fail bool }
+
+func (f failingValue) MarshalBSONValue() (byte, []byte, error) {
+	if f.Fail {
+		return 0, nil, errors.New("boom")
+	}
+	t, data, err := bson.MarshalValue("ok")
+	return byte(t), data, err
+}
+
+func (f *failingValue) UnmarshalBSONValue(byte, []byte) error { return nil }
+
+type testFailingModel struct {
+	Model `bson:",inline"`
+	Note  string       `bson:"note"`
+	Imm   string       `bson:"imm" goodm:"immutable"`
+	V     failingValue `bson:"v"`
+}
+
+func TestSaveManyUnsetEdgeCases(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	if err := Register(&testFailingModel{}, "test_failing"); err != nil {
+		t.Fatal(err)
+	}
+	defer Unregister(&testFailingModel{})
+
+	ms := []*testFailingModel{{Note: "a", Imm: "x"}, {Note: "b", Imm: "y"}}
+	for _, m := range ms {
+		if err := Create(ctx, m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Immutable fields cannot be unset, by Update or SaveMany.
+	if err := Update(ctx, ms[0], UnsetFields("imm")); err == nil {
+		t.Error("Update unset immutable accepted")
+	}
+	if err := SaveMany(ctx, ms, UnsetFields("imm")); err == nil {
+		t.Error("SaveMany unset immutable accepted")
+	}
+
+	// A marshal failure with unset fields is a per-item failure; the rest
+	// of the batch is saved.
+	ms[1].V.Fail = true
+	err := SaveMany(ctx, ms, UnsetFields("note"))
+	var be *BulkError
+	if !errors.As(err, &be) || len(be.Errors) != 1 || be.Errors[0].Index != 1 {
+		t.Fatalf("SaveMany with a failing item = %v", err)
+	}
+	if ms[0].Version != 1 || ms[0].Note != "" {
+		t.Errorf("item 0 not saved: %+v", ms[0])
+	}
+	if ms[1].Version != 0 || ms[1].Note != "b" {
+		t.Errorf("failed item 1 changed: %+v", ms[1])
+	}
+	var stored testFailingModel
+	if err := FindByID(ctx, ms[1].ID, &stored); err != nil || stored.Version != 0 || stored.Note != "b" {
+		t.Errorf("failed item 1 stored as %+v %v", stored, err)
+	}
+}
