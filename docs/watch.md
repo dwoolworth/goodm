@@ -16,7 +16,7 @@ for stream.Next(ctx) {
     switch ev.OperationType {
     case "insert", "update", "replace":
         var order Order
-        if err := ev.Decode(&order); err != nil {
+        if err := stream.Decode(&order); err != nil {
             return err
         }
         fmt.Println("changed:", order.ID, order.Status)
@@ -65,8 +65,8 @@ type ChangeEvent struct {
 
 Fields the server did not send are zero.
 
-- `Decode(&model)` unmarshals `FullDocument` into a model. The model becomes the merge base for a later `Update` with `WithRetry`, exactly as after `FindOne`, so a worker that reacts to an event can save its own changes without clobbering a concurrent writer. It returns `goodm.ErrNoFullDocument` for a delete, or for an update whose document was deleted before the lookup ran.
-- `DecodeBefore(&model)` unmarshals the pre-image, when the stream asked for one.
+- `stream.Decode(&model)` unmarshals the current event's `FullDocument` into a model through the collection, so the client's codecs and `BSONOptions` apply exactly as in `FindOne`. The model becomes the merge base for a later `Update` with `WithRetry`, so a worker that reacts to an event can save its own changes without clobbering a concurrent writer. It returns `goodm.ErrNoFullDocument` for a delete, or for an update whose document was deleted before the lookup ran. `stream.DecodeBefore(&model)` does the same for the pre-image.
+- `ev.Decode(&model)` and `ev.DecodeBefore(&model)` work on an event kept after the stream moved on. They use the default BSON registry, so a model that needs codecs registered on the client must be decoded through `stream.Decode` while the event is current.
 - `DecodeID(&id)` and `ObjectID()` read the `_id` from the document key. Every document event has one.
 
 Which operations produce which event types:
@@ -78,7 +78,7 @@ Which operations produce which event types:
 | `UpdateFields`, `UpdateOne`, `UpdateMany`, `FindOneAndUpdate`, `Bulk.UpdateOne/UpdateMany` | `update` |
 | `Delete`, `DeleteOne`, `DeleteMany`, `FindOneAndDelete`, `Bulk.DeleteOne/DeleteMany` | `delete` |
 
-`Update` replaces the whole document, so its events are `replace` and carry no `UpdateDescription`. `UpdateFields` events do.
+`Update` replaces the whole document, so its events are `replace` and carry no `UpdateDescription`. `UpdateFields` events do. An upsert that inserts (through `UpdateOne`, `UpdateMany`, `FindOneAndUpdate`, or `FindOneAndReplace`) produces an `insert` event.
 
 ## Full Documents and Pre-Images
 
@@ -151,7 +151,7 @@ type WatchOptions struct {
 
 The stream uses the model's `CollectionOptions` read preference and read concern. `stream.Driver()` returns the underlying `*mongo.ChangeStream` for anything the wrapper does not expose.
 
-A change stream cannot be opened inside a transaction; `Watch` returns the server's error. If the context carries a session (from `client.UseSession` or `mongo.NewSessionContext`), the stream is bound to it and fails once that session ends, so open long-lived streams with a plain context.
+A `ChangeStream` is not safe for concurrent use: read it from one goroutine. A change stream cannot be opened inside a transaction; `Watch` returns the server's error. If the context carries a session (from `client.UseSession` or `mongo.NewSessionContext`), the stream is bound to it and fails once that session ends, so open long-lived streams with a plain context.
 
 `Watch` returns an error, and no stream, when middleware returns without calling `next`; if middleware fails after the stream was opened, the stream is closed before the error is returned.
 

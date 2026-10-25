@@ -113,6 +113,17 @@ goodm.Use(func(ctx context.Context, op *goodm.OpInfo, next func(context.Context)
         }
     case goodm.OpAggregate:
         op.Pipeline = append([]bson.D{{{Key: "$match", Value: bson.D{scope}}}}, op.Pipeline...)
+    case goodm.OpWatch:
+        // Change events nest the document: scope on fullDocument (delete
+        // events carry none and are dropped unless the stream asks for
+        // pre-images and the scope also checks fullDocumentBeforeChange).
+        // The tenant field must be immutable, or a document that moves
+        // between tenants is seen by both streams.
+        match := bson.D{{Key: "$or", Value: bson.A{
+            bson.D{{Key: "fullDocument.tenant", Value: tenant}},
+            bson.D{{Key: "fullDocumentBeforeChange.tenant", Value: tenant}},
+        }}}
+        op.Pipeline = append([]bson.D{{{Key: "$match", Value: match}}}, op.Pipeline...)
     }
     return next(ctx)
 })
@@ -129,7 +140,7 @@ Which operations honor a rewritten `op.Filter`:
 | `Bulk.Execute` | Not scoped: each queued operation carries its own filter |
 | `Populate`, `BatchPopulate` | Not scoped: no middleware runs |
 
-A tenant guard therefore needs to cover the update and delete op types as well as `OpFind`, and cannot rely on middleware for `Bulk` or `Populate`.
+A tenant guard therefore needs to cover the update and delete op types, `OpAggregate`, and `OpWatch` as well as `OpFind`, and cannot rely on middleware for `Bulk` or `Populate`.
 
 ## Aborting Operations
 

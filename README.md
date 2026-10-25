@@ -252,7 +252,7 @@ for stream.Next(ctx) {
         continue
     }
     var order Order
-    if err := ev.Decode(&order); err != nil { // sets the merge base for WithRetry
+    if err := stream.Decode(&order); err != nil { // sets the merge base for WithRetry
         return err
     }
 }

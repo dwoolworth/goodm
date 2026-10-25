@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -103,6 +104,11 @@ type TruncatedArray struct {
 // Decode unmarshals the event's full document into model. The model becomes
 // the merge base for a later Update with WithRetry, as after FindOne. It
 // returns ErrNoFullDocument when the event carries none.
+//
+// An event is detached from its stream, so Decode uses the default BSON
+// registry; codecs and BSONOptions set on the client do not apply. Use
+// ChangeStream.Decode, which decodes the current event through the
+// collection, when the model needs them.
 func (e *ChangeEvent) Decode(model interface{}) error {
 	if len(e.FullDocument) == 0 {
 		return ErrNoFullDocument
@@ -118,6 +124,7 @@ func (e *ChangeEvent) Decode(model interface{}) error {
 
 // DecodeBefore unmarshals the document as it was before the change into
 // model. It returns ErrNoFullDocument when the event carries no pre-image.
+// Like Decode, it uses the default BSON registry.
 func (e *ChangeEvent) DecodeBefore(model interface{}) error {
 	if len(e.FullDocumentBeforeChange) == 0 {
 		return ErrNoFullDocument
@@ -157,7 +164,8 @@ func (e *ChangeEvent) ObjectID() (bson.ObjectID, bool) {
 }
 
 // ChangeStream delivers the change events of a model's collection. Create
-// one with Watch, read it with Next, and Close it when done.
+// one with Watch, read it with Next, and Close it when done. A ChangeStream
+// is not safe for concurrent use; read it from one goroutine.
 type ChangeStream struct {
 	cs     *mongo.ChangeStream
 	schema *Schema
@@ -182,7 +190,7 @@ type ChangeStream struct {
 //	    switch ev.OperationType {
 //	    case "insert", "update", "replace":
 //	        var order Order
-//	        if err := ev.Decode(&order); err != nil { ... }
+//	        if err := stream.Decode(&order); err != nil { ... }
 //	    case "delete":
 //	        id, _ := ev.ObjectID()
 //	    }
@@ -351,13 +359,57 @@ func (s *ChangeStream) advance(ctx context.Context, try bool) bool {
 // Event returns the event the last successful Next or TryNext produced.
 func (s *ChangeStream) Event() *ChangeEvent { return s.event }
 
-// Decode unmarshals the current event's full document into model, as
-// ChangeEvent.Decode does.
+// Decode unmarshals the current event's full document into model, through
+// the collection, so the client's codecs and BSONOptions apply exactly as
+// in FindOne. The model becomes the merge base for a later Update with
+// WithRetry. It returns ErrNoFullDocument when the event carries none.
 func (s *ChangeStream) Decode(model interface{}) error {
 	if s.event == nil {
 		return errors.New("goodm: no current change event")
 	}
-	return s.event.Decode(model)
+	if len(s.event.FullDocument) == 0 {
+		return ErrNoFullDocument
+	}
+	if err := s.decodeField(model, "fullDocument"); err != nil {
+		return err
+	}
+	if schema, ok := SchemaOf(model); ok {
+		setModelBase(schema, model, s.event.FullDocument)
+	}
+	return nil
+}
+
+// DecodeBefore unmarshals the current event's pre-image into model through
+// the collection, as Decode does for the full document.
+func (s *ChangeStream) DecodeBefore(model interface{}) error {
+	if s.event == nil {
+		return errors.New("goodm: no current change event")
+	}
+	if len(s.event.FullDocumentBeforeChange) == 0 {
+		return ErrNoFullDocument
+	}
+	return s.decodeField(model, "fullDocumentBeforeChange")
+}
+
+// decodeField decodes one document field of the current event into model
+// using the driver's own decoder, which carries the collection's registry
+// and BSON options, by wrapping the model in a struct with that one field.
+func (s *ChangeStream) decodeField(model interface{}, key string) error {
+	mv := reflect.ValueOf(model)
+	if mv.Kind() != reflect.Pointer || mv.IsNil() {
+		return fmt.Errorf("goodm: change event decode target must be a non-nil pointer, got %T", model)
+	}
+	wrapper := reflect.StructOf([]reflect.StructField{{
+		Name: "Doc",
+		Type: mv.Type(),
+		Tag:  reflect.StructTag(`bson:"` + key + `"`),
+	}})
+	w := reflect.New(wrapper)
+	w.Elem().Field(0).Set(mv)
+	if err := s.cs.Decode(w.Interface()); err != nil {
+		return fmt.Errorf("goodm: change event decode failed: %w", err)
+	}
+	return nil
 }
 
 // Err returns the error that stopped the stream, or nil if it is open or

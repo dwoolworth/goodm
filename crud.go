@@ -828,7 +828,9 @@ func prepareUpdateFields(schema *Schema, model interface{}, fields bson.M) (valu
 		}
 		if isElement {
 			errs = append(errs, validateSliceElement(v, fs, name)...)
-			if len(fs.Enum) > 0 && !v.IsZero() {
+			// Every element of an enum slice is checked, zero or not; only a
+			// nil pointer element is absent (validateEnum skips it).
+			if len(fs.Enum) > 0 {
 				if e := validateEnum(v, fs.Enum, name); e != nil {
 					errs = append(errs, *e)
 				}
