@@ -74,10 +74,13 @@ type UpdateOptions struct {
 }
 
 // UnsetFields returns UpdateOptions that will remove the specified fields from
-// the MongoDB document. Field names should be bson names (e.g. "agent_id").
-// After a successful save the fields are zeroed on the model as well. Update
-// writes the whole struct, so a later Update stores the field's zero value
-// again unless the field is tagged omitempty.
+// the MongoDB document. Field names should be bson names (e.g. "agent_id");
+// managed, required, and immutable fields cannot be unset. After a successful
+// save the fields are zeroed on the model as well. Update writes the whole
+// struct, so a later Update stores the field's zero value again unless the
+// field is tagged omitempty. The document written with unset fields is
+// marshaled with the default BSON registry, so codecs registered on the
+// client or database are not applied to that write.
 //
 // Several UpdateOptions values may be passed to one call and are combined:
 //
@@ -2441,6 +2444,9 @@ func validateUnsetFields(schema *Schema, fields []string) error {
 		}
 		if f.Required {
 			return fmt.Errorf("goodm: cannot unset required field %q", name)
+		}
+		if f.Immutable {
+			return fmt.Errorf("goodm: cannot unset immutable field %q", name)
 		}
 	}
 	return nil

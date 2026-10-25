@@ -17,6 +17,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 - `SaveMany` silently ignored `UnsetFields` and `WithRetry`. It now removes the unset fields from every document (and zeroes them on the saved models), and returns an error for `WithRetry`, which it cannot honor.
+- `UnsetFields` could remove an `immutable` field, since the immutable check compares the model (which still held the value) with the stored document; unsetting an immutable field is now rejected by `Update` and `SaveMany`.
 - `goodm migrate` did not list planned index rebuilds, so they were applied without appearing in the plan or its summary; rebuilds are now shown with `~` and counted.
 
 ## [0.7.1] - 2026-10-24

@@ -154,7 +154,7 @@ user.Age = 31
 err := goodm.Update(ctx, user)
 ```
 
-If an immutable field has changed, Update returns a `ValidationErrors` with the offending field. After a successful save with `UnsetFields`, the unset fields are zeroed on the model too. `Update` writes the whole struct, so a later `Update` stores the field's zero value again unless the field is tagged `omitempty`; use `omitempty` on fields you intend to unset.
+If an immutable field has changed, Update returns a `ValidationErrors` with the offending field. Managed, required, and immutable fields cannot be unset. After a successful save with `UnsetFields`, the unset fields are zeroed on the model too. The document written with unset fields is marshaled with the default BSON registry, so codecs registered on the client or database are not applied to that write. `Update` writes the whole struct, so a later `Update` stores the field's zero value again unless the field is tagged `omitempty`; use `omitempty` on fields you intend to unset.
 
 ## Update with WithRetry
 

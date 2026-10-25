@@ -201,8 +201,8 @@ func elemModel(v reflect.Value) interface{} {
 // stored documents (one query for the whole batch), BeforeSave runs, the
 // model is validated, and its version and UpdatedAt advance. Each document is
 // then replaced with its own request guarded by its version filter, and
-// AfterSave runs for every model that was written. Of UpdateOptions only DB
-// is used.
+// AfterSave runs for every model that was written. UnsetFields removes the
+// named fields from every document, as with Update; WithRetry is rejected.
 //
 // If any model fails its immutable check, hook, or validation, or the batch
 // contains the same _id twice, SaveMany returns before writing anything. After
@@ -317,6 +317,7 @@ func SaveMany(ctx context.Context, models interface{}, opts ...UpdateOptions) er
 		oldUpdated := make([]time.Time, n)
 		filters := make([]interface{}, n)
 		docs := make([]interface{}, n) // what is written: the model minus unset fields
+		notSent := map[int]error{}     // items whose document could not be built
 		for i, model := range items {
 			oldVersions[i], _ = getModelVersion(model)
 			oldUpdated[i] = getUpdatedAt(model)
@@ -325,16 +326,15 @@ func SaveMany(ctx context.Context, models interface{}, opts ...UpdateOptions) er
 			filters[i] = andFilter(scope, buildVersionFilter(ids[i], oldVersions[i]))
 			doc, err := buildReplacement(model, opt.Unset)
 			if err != nil {
-				for j := 0; j <= i; j++ {
-					setModelVersion(items[j], oldVersions[j])
-					setUpdatedAt(items[j], oldUpdated[j])
-				}
-				return fmt.Errorf("goodm: item %d: %w", i, err)
+				// A client-side failure for this item alone, like a marshal
+				// error without unset fields; the rest of the batch proceeds.
+				notSent[i] = fmt.Errorf("goodm: not saved: %w", err)
+				continue
 			}
 			docs[i] = doc
 		}
 
-		out := saveManyReplace(ctx, coll, schema, docs, filters)
+		out := saveManyReplace(ctx, coll, schema, docs, filters, notSent)
 		if out.aborted {
 			// The transaction is dead: nothing in this batch will commit.
 			for i := range items {
@@ -483,10 +483,14 @@ func inTransaction(ctx context.Context) bool {
 // the remaining items are reported as not attempted. Inside a transaction
 // the requests run in order on the session, and the first failure stops the
 // batch because the server has aborted the transaction.
-func saveManyReplace(ctx context.Context, coll *mongo.Collection, schema *Schema, items, filters []interface{}) saveOutcome {
+func saveManyReplace(ctx context.Context, coll *mongo.Collection, schema *Schema, items, filters []interface{}, notSent map[int]error) saveOutcome {
 	n := len(items)
 	results := make([]replaceResult, n)
 	replace := func(i int) {
+		if err, skip := notSent[i]; skip {
+			results[i] = replaceResult{err: err}
+			return
+		}
 		if err := ctx.Err(); err != nil {
 			results[i] = replaceResult{err: fmt.Errorf("%w: %w", ErrNotAttempted, err)}
 			return

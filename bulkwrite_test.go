@@ -1047,3 +1047,65 @@ func TestSaveManyUnsetFields(t *testing.T) {
 		t.Errorf("after merge: %+v", stored)
 	}
 }
+
+// failingValue marshals with an error when Fail is set.
+type failingValue struct{ Fail bool }
+
+func (f failingValue) MarshalBSONValue() (byte, []byte, error) {
+	if f.Fail {
+		return 0, nil, errors.New("boom")
+	}
+	t, data, err := bson.MarshalValue("ok")
+	return byte(t), data, err
+}
+
+func (f *failingValue) UnmarshalBSONValue(byte, []byte) error { return nil }
+
+type testFailingModel struct {
+	Model `bson:",inline"`
+	Note  string       `bson:"note"`
+	Imm   string       `bson:"imm" goodm:"immutable"`
+	V     failingValue `bson:"v"`
+}
+
+func TestSaveManyUnsetEdgeCases(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	if err := Register(&testFailingModel{}, "test_failing"); err != nil {
+		t.Fatal(err)
+	}
+	defer Unregister(&testFailingModel{})
+
+	ms := []*testFailingModel{{Note: "a", Imm: "x"}, {Note: "b", Imm: "y"}}
+	for _, m := range ms {
+		if err := Create(ctx, m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Immutable fields cannot be unset, by Update or SaveMany.
+	if err := Update(ctx, ms[0], UnsetFields("imm")); err == nil {
+		t.Error("Update unset immutable accepted")
+	}
+	if err := SaveMany(ctx, ms, UnsetFields("imm")); err == nil {
+		t.Error("SaveMany unset immutable accepted")
+	}
+
+	// A marshal failure with unset fields is a per-item failure; the rest
+	// of the batch is saved.
+	ms[1].V.Fail = true
+	err := SaveMany(ctx, ms, UnsetFields("note"))
+	var be *BulkError
+	if !errors.As(err, &be) || len(be.Errors) != 1 || be.Errors[0].Index != 1 {
+		t.Fatalf("SaveMany with a failing item = %v", err)
+	}
+	if ms[0].Version != 1 || ms[0].Note != "" {
+		t.Errorf("item 0 not saved: %+v", ms[0])
+	}
+	if ms[1].Version != 0 || ms[1].Note != "b" {
+		t.Errorf("failed item 1 changed: %+v", ms[1])
+	}
+	var stored testFailingModel
+	if err := FindByID(ctx, ms[1].ID, &stored); err != nil || stored.Version != 0 || stored.Note != "b" {
+		t.Errorf("failed item 1 stored as %+v %v", stored, err)
+	}
+}
