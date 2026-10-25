@@ -2,7 +2,9 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.8.0] - 2026-10-25
+
+This release adds the three features deferred from 0.7: change streams, collection validators derived from the schema, and population of refs inside subdocuments. Tested against MongoDB 6.0.28, 7.0.45, and 8.0.34 running as single-node replica sets, with Go 1.21, 1.22, and 1.23 in CI and Go 1.26 locally; the suite runs with the race detector on every combination.
 
 ### Added
 - **Change streams.** `Watch(ctx, &Model{})` opens a change stream on the model's collection and returns a `*ChangeStream` whose `Next`/`TryNext`/`Each` deliver `ChangeEvent` values: operation type, resume token, cluster and wall time, namespace, document key, full document, pre-image, and update description. `ChangeEvent.Decode` unmarshals the full document into a model and records it as the merge base, so a model decoded from an event can be saved with `WithRetry`; `DecodeBefore`, `DecodeID`, and `ObjectID` read the pre-image and key. `WatchOptions` covers the pipeline, full-document and pre-image modes (`FullDocument` defaults to `options.UpdateLookup`), `ResumeAfter`/`StartAfter`/`StartAtOperationTime`, batch size, max await time, collation, and expanded events. Middleware runs under the new `OpWatch` and may replace `OpInfo.Pipeline`. `ErrNoFullDocument` is returned when an event carries no document to decode. `ChangeStream.Decode` and `DecodeBefore` decode the current event through the collection, so client codecs and `BSONOptions` apply as in `FindOne`; `ChangeEvent.Decode` on a detached event uses the default registry.
