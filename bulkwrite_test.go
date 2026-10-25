@@ -980,3 +980,70 @@ func TestClassifyReplaceError_TransportIsUnknown(t *testing.T) {
 		t.Errorf("client-side error: %v server=%v", r.err, r.server)
 	}
 }
+
+func TestSaveManyUnsetFields(t *testing.T) {
+	ctx, db, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	users := []*testUser{{Email: "u1@x.com", Name: "U1", Age: 1, Role: "admin"}, {Email: "u2@x.com", Name: "U2", Age: 2, Role: "admin"}}
+	for _, u := range users {
+		if err := Create(ctx, u); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := SaveMany(ctx, users, WithRetry(1)); err == nil {
+		t.Error("WithRetry accepted by SaveMany")
+	}
+	if err := SaveMany(ctx, users, UnsetFields("name")); err == nil {
+		t.Error("unsetting a required field accepted")
+	}
+	if err := SaveMany(ctx, users, UnsetFields("nope")); err == nil {
+		t.Error("unsetting an unknown field accepted")
+	}
+	if users[0].Version != 0 {
+		t.Errorf("rejected call changed version to %d", users[0].Version)
+	}
+
+	users[0].Age = 10
+	if err := SaveMany(ctx, users, UnsetFields("role")); err != nil {
+		t.Fatalf("SaveMany unset: %v", err)
+	}
+	for i, u := range users {
+		if u.Role != "" || u.Version != 1 {
+			t.Errorf("item %d: role %q version %d", i, u.Role, u.Version)
+		}
+		var raw bson.M
+		if err := db.Collection("test_users").FindOne(ctx, bson.D{{Key: "_id", Value: u.ID}}).Decode(&raw); err != nil {
+			t.Fatal(err)
+		}
+		if _, has := raw["role"]; has {
+			t.Errorf("item %d: role still stored: %v", i, raw["role"])
+		}
+		if i == 0 && raw["age"] != int32(10) {
+			t.Errorf("age not written: %v", raw["age"])
+		}
+	}
+
+	// The saved models carry a merge base that reflects the removal, so a
+	// later WithRetry merge does not resurrect the field.
+	other := &testUser{}
+	if err := FindByID(ctx, users[0].ID, other); err != nil {
+		t.Fatal(err)
+	}
+	other.Age = 11
+	if err := Update(ctx, other); err != nil {
+		t.Fatal(err)
+	}
+	users[0].Name = "U1" // unchanged; conflict on version only
+	users[0].Age = 10
+	if err := Update(ctx, users[0], WithRetry(1)); err != nil {
+		t.Fatalf("merge after unset: %v", err)
+	}
+	var stored testUser
+	if err := FindByID(ctx, users[0].ID, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Role != "" || stored.Age != 11 {
+		t.Errorf("after merge: %+v", stored)
+	}
+}

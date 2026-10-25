@@ -253,6 +253,12 @@ func SaveMany(ctx context.Context, models interface{}, opts ...UpdateOptions) er
 	}
 
 	opt := mergeUpdateOptions(opts)
+	if opt.MaxRetries > 0 {
+		return errors.New("goodm: SaveMany does not retry version conflicts; WithRetry is only for Update")
+	}
+	if err := validateUnsetFields(schema, opt.Unset); err != nil {
+		return err
+	}
 	db, err := getDB(opt.DB)
 	if err != nil {
 		return err
@@ -310,15 +316,25 @@ func SaveMany(ctx context.Context, models interface{}, opts ...UpdateOptions) er
 		oldVersions := make([]int, n)
 		oldUpdated := make([]time.Time, n)
 		filters := make([]interface{}, n)
+		docs := make([]interface{}, n) // what is written: the model minus unset fields
 		for i, model := range items {
 			oldVersions[i], _ = getModelVersion(model)
 			oldUpdated[i] = getUpdatedAt(model)
 			setModelVersion(model, oldVersions[i]+1)
 			setUpdatedAt(model, now)
 			filters[i] = andFilter(scope, buildVersionFilter(ids[i], oldVersions[i]))
+			doc, err := buildReplacement(model, opt.Unset)
+			if err != nil {
+				for j := 0; j <= i; j++ {
+					setModelVersion(items[j], oldVersions[j])
+					setUpdatedAt(items[j], oldUpdated[j])
+				}
+				return fmt.Errorf("goodm: item %d: %w", i, err)
+			}
+			docs[i] = doc
 		}
 
-		out := saveManyReplace(ctx, coll, schema, items, filters)
+		out := saveManyReplace(ctx, coll, schema, docs, filters)
 		if out.aborted {
 			// The transaction is dead: nothing in this batch will commit.
 			for i := range items {
@@ -355,7 +371,8 @@ func SaveMany(ctx context.Context, models interface{}, opts ...UpdateOptions) er
 			if _, failed := out.failures[i]; failed {
 				continue
 			}
-			recordBaseAfterWrite(ctx, schema, model, nil)
+			zeroUnsetFields(model, opt.Unset)
+			recordBaseAfterWrite(ctx, schema, model, opt.Unset)
 			if hook, ok := model.(AfterSave); ok {
 				if err := hook.AfterSave(ctx); err != nil {
 					out.failures[i] = fmt.Errorf("goodm: saved, but AfterSave failed: %w", err)

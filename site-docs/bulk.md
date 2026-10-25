@@ -76,6 +76,8 @@ Inside a transaction, whether started by `goodm.WithTransaction` or on the sessi
 
 Of `UpdateOptions` only `DB` is used. Because replacements run on several goroutines outside a transaction, custom BSON marshalers on the model may run concurrently.
 
+`UnsetFields` works as for `Update`: the named fields are removed from every document in the batch and zeroed on the models that were saved. `WithRetry` is not supported, because a batch cannot be merged per document; passing it is an error rather than silently ignored.
+
 Middleware may replace `op.Filter` for `OpSaveMany` (it starts as an empty document); it is ANDed into every document's filter and out-of-scope documents are reported as `ErrNotFound`.
 
 ```go

@@ -63,8 +63,8 @@ type FindOptions struct {
 // the update operations of a Bulk.
 type UpdateOptions struct {
 	DB         *mongo.Database
-	Unset      []string // Update only: bson field names to remove from the document
-	MaxRetries int      // Update only: retry with 3-way merge on version conflict (0 = no retry)
+	Unset      []string // Update and SaveMany: bson field names to remove from the document
+	MaxRetries int      // Update only: retry with 3-way merge on version conflict (0 = no retry); SaveMany rejects it
 
 	// Raw operations (UpdateOne, UpdateMany, Bulk) only:
 	Upsert       bool               // insert a new document when the filter matches nothing
