@@ -83,7 +83,20 @@ func validateOneField(fv reflect.Value, fs *FieldSchema, fieldPath string) []Val
 }
 
 // validateEnum checks that fv is one of the allowed enum values.
+// For a slice or array field every element must be in the set.
 func validateEnum(fv reflect.Value, enum []string, fieldPath string) *ValidationError {
+	if isNilPointer(fv) {
+		return nil // a nil element is absent, like an unset scalar
+	}
+	fv = derefValue(fv)
+	if fv.Kind() == reflect.Slice || fv.Kind() == reflect.Array {
+		for i := 0; i < fv.Len(); i++ {
+			if err := validateEnum(fv.Index(i), enum, fmt.Sprintf("%s[%d]", fieldPath, i)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	strVal := stringValue(fv)
 	for _, allowed := range enum {
 		if strVal == allowed {

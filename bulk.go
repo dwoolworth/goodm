@@ -208,8 +208,8 @@ func elemModel(v reflect.Value) interface{} {
 // contains the same _id twice, SaveMany returns before writing anything. After
 // the write, documents that were deleted or modified by another writer are
 // reported in a *BulkError with ErrNotFound or ErrVersionConflict per index
-// (the in-memory version of a conflicting model is refreshed from the
-// database, as Update does); unique index violations appear as
+// (a conflicting model keeps its stale version, as with Update, so it must be
+// reloaded before it is saved again); unique index violations appear as
 // *DuplicateKeyError. An item whose write concern was not met, or whose
 // request failed in transport or by context cancellation, is listed with that
 // error marked "outcome unknown": the server may have applied it, so its
@@ -252,10 +252,7 @@ func SaveMany(ctx context.Context, models interface{}, opts ...UpdateOptions) er
 		return err
 	}
 
-	var opt UpdateOptions
-	if len(opts) > 0 {
-		opt = opts[0]
-	}
+	opt := mergeUpdateOptions(opts)
 	db, err := getDB(opt.DB)
 	if err != nil {
 		return err
@@ -311,12 +308,14 @@ func SaveMany(ctx context.Context, models interface{}, opts ...UpdateOptions) er
 
 		now := time.Now()
 		oldVersions := make([]int, n)
+		oldUpdated := make([]time.Time, n)
 		filters := make([]interface{}, n)
 		for i, model := range items {
 			oldVersions[i], _ = getModelVersion(model)
+			oldUpdated[i] = getUpdatedAt(model)
 			setModelVersion(model, oldVersions[i]+1)
 			setUpdatedAt(model, now)
-			filters[i] = scopedFilter(scope, buildVersionFilter(ids[i], oldVersions[i]))
+			filters[i] = andFilter(scope, buildVersionFilter(ids[i], oldVersions[i]))
 		}
 
 		out := saveManyReplace(ctx, coll, schema, items, filters)
@@ -324,6 +323,7 @@ func SaveMany(ctx context.Context, models interface{}, opts ...UpdateOptions) er
 			// The transaction is dead: nothing in this batch will commit.
 			for i := range items {
 				setModelVersion(items[i], oldVersions[i])
+				setUpdatedAt(items[i], oldUpdated[i])
 			}
 			return &BulkError{Collection: schema.Collection, Errors: out.itemErrors(), Result: &BulkResult{}, WriteConcernError: out.wcErr}
 		}
@@ -337,6 +337,7 @@ func SaveMany(ctx context.Context, models interface{}, opts ...UpdateOptions) er
 					// transient-transaction label) stay visible.
 					for i := range items {
 						setModelVersion(items[i], oldVersions[i])
+						setUpdatedAt(items[i], oldUpdated[i])
 						out.failures[i] = fmt.Errorf("goodm: not saved: transaction aborted while resolving the batch: %w", err)
 					}
 					return &BulkError{Collection: schema.Collection, Errors: out.itemErrors(), Result: &BulkResult{}, WriteConcernError: out.wcErr}
@@ -349,11 +350,12 @@ func SaveMany(ctx context.Context, models interface{}, opts ...UpdateOptions) er
 			}
 		}
 
-		rollbackVersions(items, oldVersions, out.failures)
+		rollbackVersions(items, oldVersions, oldUpdated, out.failures)
 		for i, model := range items {
 			if _, failed := out.failures[i]; failed {
 				continue
 			}
+			recordBaseAfterWrite(ctx, schema, model, nil)
 			if hook, ok := model.(AfterSave); ok {
 				if err := hook.AfterSave(ctx); err != nil {
 					out.failures[i] = fmt.Errorf("goodm: saved, but AfterSave failed: %w", err)
@@ -601,8 +603,8 @@ func classifyReplaceError(err error, schema *Schema) replaceResult {
 }
 
 // resolveUnmatched classifies items whose replacement matched no document:
-// a document that still exists within scope is a version conflict (and the
-// model's version is refreshed from it); anything else is not found. The
+// a document that still exists within scope is a version conflict; anything
+// else is not found. The
 // read goes to the primary so it cannot observe a stale secondary, and the
 // documents are decoded into the model type so their _id values compare
 // with the models' through the same Go type.
@@ -613,7 +615,7 @@ func resolveUnmatched(ctx context.Context, coll *mongo.Collection, schema *Schem
 	}
 	primary := coll.Database().Collection(coll.Name(), options.Collection().SetReadPreference(readpref.Primary()))
 	cursor, err := primary.Find(ctx,
-		scopedFilter(scope, bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: lookup}}}}),
+		andFilter(scope, bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: lookup}}}}),
 		options.Find().SetProjection(bson.D{{Key: "_id", Value: 1}, {Key: "__v", Value: 1}}))
 	if err != nil {
 		return fmt.Errorf("goodm: failed to resolve unmatched documents: %w", err)
@@ -638,41 +640,26 @@ func resolveUnmatched(ctx context.Context, coll *mongo.Collection, schema *Schem
 	}
 
 	for _, i := range unresolved {
-		v, exists := versions[idKey(ids[i])]
-		if !exists {
+		if _, exists := versions[idKey(ids[i])]; !exists {
 			failures[i] = ErrNotFound
 			continue
 		}
-		setModelVersion(items[i], v)
 		failures[i] = ErrVersionConflict
 	}
 	return nil
 }
 
-// rollbackVersions restores the pre-save version on failed items. Items whose
-// failure is a version conflict keep the version resolveUnmatched refreshed
-// from the database.
-func rollbackVersions(items []interface{}, oldVersions []int, failures map[int]error) {
+// rollbackVersions restores the pre-save version and UpdatedAt on every
+// failed item, so a conflicting model keeps its stale version and a further
+// save conflicts again until the caller reloads it.
+func rollbackVersions(items []interface{}, oldVersions []int, oldUpdated []time.Time, failures map[int]error) {
 	for i, model := range items {
-		if failure, failed := failures[i]; failed && !errors.Is(failure, ErrVersionConflict) {
-			setModelVersion(model, oldVersions[i])
+		if _, failed := failures[i]; !failed {
+			continue
 		}
+		setModelVersion(model, oldVersions[i])
+		setUpdatedAt(model, oldUpdated[i])
 	}
-}
-
-// scopedFilter ANDs a middleware-supplied scope into a filter. A nil or
-// empty scope leaves the filter unchanged.
-func scopedFilter(scope interface{}, filter bson.D) interface{} {
-	if scope == nil {
-		return filter
-	}
-	if d, ok := scope.(bson.D); ok && len(d) == 0 {
-		return filter
-	}
-	if m, ok := scope.(bson.M); ok && len(m) == 0 {
-		return filter
-	}
-	return bson.D{{Key: "$and", Value: bson.A{scope, filter}}}
 }
 
 // checkImmutableFieldsBatch loads the stored documents for all items in one
@@ -683,7 +670,7 @@ func checkImmutableFieldsBatch(ctx context.Context, coll *mongo.Collection, sche
 	if !hasImmutableFields(schema) {
 		return nil
 	}
-	cursor, err := coll.Find(ctx, scopedFilter(scope, bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}}))
+	cursor, err := coll.Find(ctx, andFilter(scope, bson.D{{Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}}))
 	if err != nil {
 		return fmt.Errorf("goodm: failed to fetch existing documents: %w", err)
 	}
@@ -743,10 +730,7 @@ func UpdateMany(ctx context.Context, filter, update interface{}, model interface
 		return nil, err
 	}
 
-	var opt UpdateOptions
-	if len(opts) > 0 {
-		opt = opts[0]
-	}
+	opt := mergeUpdateOptions(opts)
 	db, err := getDB(opt.DB)
 	if err != nil {
 		return nil, err

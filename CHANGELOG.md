@@ -2,9 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.1] - 2026-10-24
+
+### Fixed
+- **`Update` with `WithRetry` lost the caller's changes.** The merge base was taken from the model at the moment `Update` was called, which already held the caller's edits, so the 3-way diff found nothing to apply: on a version conflict the retry wrote the database copy back and returned nil, and a genuine same-field conflict never produced a `MergeConflictError`. `goodm.Model` now remembers the document as last loaded or saved through goodm (`FindOne`, `FindByID`, `Find`, `FindOneAndUpdate`, `FindOneAndReplace`, `Create`, `Update`, `UpdateFields`, `SaveMany`) and the merge diffs against that. A model with no such base (built by hand, loaded through `FindCursor`, or without an embedded `goodm.Model`) gets `ErrVersionConflict` on conflict instead of a merge. The base is normalized through the model type, so stored documents that differ from the struct in missing or extra fields, integer width, or map key order do not look like changes, and it advances after each merge round so later rounds of `WithRetry(n)` work. The merged document is applied over zeroed BSON fields, so map keys and `omitempty` values another writer removed are not resurrected from the model while fields tagged `-`, unexported fields, and pointer identities are kept; `UpdateFields` advances the base by the fields it wrote rather than by the whole model, so unsaved in-memory edits still count as changes; fields named in `UnsetFields` count as the caller's removals, so a concurrent change to one of them is a conflict instead of being deleted; and a NaN field no longer causes a false conflict on every merge. `Find` decodes documents one at a time to record them, and each loaded model keeps a copy of its stored form.
+- `enum` on a slice or array field compared the whole slice's string form against the allowed values, so every non-empty value was rejected; each element is now checked (nil pointer elements are skipped) and an offending one is reported as `field[i]`. `UpdateFields` applies `enum` to an element path such as `tags.1` as well.
+- `GenerateModel` with `EmbedModel: false` emitted code that did not import goodm although its `init()` calls `goodm.Register`.
+- `Update` and `SaveMany` left a failed model's `UpdatedAt` at the attempted time while restoring its version; `UpdatedAt` is restored too.
+- `goodm discover` typed date fields as `interface{}` because BSON dates decode as `bson.DateTime`; they are now `time.Time`.
+- A snapshot session passed to `WithTransaction` is documented to return an error.
+- Several `UpdateOptions` values passed to one call are now combined (`UnsetFields(...)` with `WithRetry(n)`); previously only the first was used. After a successful save with `UnsetFields` the unset fields are zeroed on the model; a later `Update` writes their zero value unless they are tagged `omitempty`.
+
+### Changed
+- **Behavior change: `ErrVersionConflict` no longer refreshes the model's version.** The refresh added in 0.5.0 let the next plain `Update` match the version filter and overwrite the other writer's changes. A conflicting model now keeps its stale version (in `Update` and `SaveMany`), so saving it again conflicts until it is reloaded or saved with `WithRetry`. Writes inside a transaction record no merge base, and a base is used only when it describes the same document at the model's current version, so neither a write from a transaction that later aborted nor a model refreshed by a cursor decode or raw unmarshal is merged against a stale base; such conflicts return `ErrVersionConflict`. The merge re-reads from the primary.
+- The two internal filter-scoping helpers added by #8 and #9 are merged into one.
+
 ## [0.7.0] - 2026-10-24
 
 This release closes the main MongoDB feature gaps found in a review of 0.6.1 and fixes several correctness bugs. It contains breaking changes; see the end of this entry.
+
+Tested against MongoDB 6.0.28, 7.0.45, and 8.0.34 running as single-node replica sets, with Go 1.21, 1.22, and 1.23 in CI and Go 1.26 locally; the suite runs with the race detector on every combination.
 
 ### Added
 - **Index types and options.** Field tags: `index=-1`, `index=hashed`, `index=text`, `index=2dsphere`, `sparse`, and `ttl=<duration|seconds>`. `CompoundIndex` gained `Sparse`, `Name`, `ExpireAfterSeconds` (with the `TTL(time.Duration)` helper), `PartialFilter`, and `Collation`, and its `Fields` entries accept `-field`, `field:text`, `field:hashed`, and `field:2dsphere` markers. Index tags inside subdocuments now create dotted-path indexes (see Changed). `Enforce` detects mismatches in sparseness, TTL, partial filter, and collation as well as keys and uniqueness; the fields of a compound text index are compared as a set.

@@ -1523,3 +1523,763 @@ func TestRegister_RejectsInlineOnNonStructFields(t *testing.T) {
 	}
 	Unregister(&ok{})
 }
+
+// --- 0.7.1 follow-ups ---
+
+type testEnumSlice struct {
+	Model `bson:",inline"`
+	Tags  []string `bson:"tags" goodm:"enum=a|b|c"`
+}
+
+func TestValidate_EnumOnSliceChecksEachElement(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testEnumSlice{}, "test_enum_slice", "")
+	if err := Create(ctx, &testEnumSlice{Tags: []string{"a", "c"}}); err != nil {
+		t.Fatalf("valid elements must pass: %v", err)
+	}
+	var ve ValidationErrors
+	err := Create(ctx, &testEnumSlice{Tags: []string{"a", "zzz"}})
+	if !errors.As(err, &ve) || !hasFieldError(ve, "tags[1]") {
+		t.Fatalf("an offending element must be reported by index, got %v", err)
+	}
+	if err := Create(ctx, &testEnumSlice{}); err != nil {
+		t.Fatalf("an empty slice is unset and passes: %v", err)
+	}
+}
+
+func TestUpdatedAt_RestoredOnFailedSave(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	users := seedUsers(t, ctx, 2)
+	before0, before1 := users[0].UpdatedAt, users[1].UpdatedAt
+
+	other := *users[0]
+	other.Age = 99
+	if err := Update(ctx, &other); err != nil {
+		t.Fatal(err)
+	}
+	users[0].Age = 1
+	if err := Update(ctx, users[0]); !errors.Is(err, ErrVersionConflict) {
+		t.Fatalf("expected a conflict, got %v", err)
+	}
+	if !users[0].UpdatedAt.Equal(before0) {
+		t.Errorf("Update must restore UpdatedAt on failure: %v != %v", users[0].UpdatedAt, before0)
+	}
+
+	stale := *users[1]
+	if err := Update(ctx, &stale); err != nil {
+		t.Fatal(err)
+	}
+	users[1].Age = 2
+	err := SaveMany(ctx, []*testUser{users[1]})
+	if !errors.Is(err, ErrVersionConflict) {
+		t.Fatalf("expected a conflict, got %v", err)
+	}
+	if !users[1].UpdatedAt.Equal(before1) {
+		t.Errorf("SaveMany must restore UpdatedAt on a failed item: %v != %v", users[1].UpdatedAt, before1)
+	}
+}
+
+func TestDiscover_DatesAreTimeTime(t *testing.T) {
+	ctx, db, cleanup := setupTestDB(t)
+	defer cleanup()
+	if _, err := db.Collection("disc5").InsertOne(ctx, bson.D{{Key: "when", Value: fixedTime}}); err != nil {
+		t.Fatal(err)
+	}
+	found, err := Discover(ctx, db, DiscoverOptions{Collections: []string{"disc5"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range found[0].Fields {
+		if f.BSONName == "when" && f.GoType != "time.Time" {
+			t.Errorf("date field typed %q, want time.Time", f.GoType)
+		}
+	}
+}
+
+// --- 0.7.1: WithRetry merge base ---
+
+func TestWithRetry_MergesDisjointChangesFromLoadedBase(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	seed := seedUsers(t, ctx, 1)[0]
+
+	var mine testUser
+	if err := FindByID(ctx, seed.ID, &mine); err != nil {
+		t.Fatal(err)
+	}
+	// Another writer changes a different field.
+	var theirs testUser
+	if err := FindByID(ctx, seed.ID, &theirs); err != nil {
+		t.Fatal(err)
+	}
+	theirs.Role = "admin"
+	if err := Update(ctx, &theirs); err != nil {
+		t.Fatal(err)
+	}
+
+	mine.Age = 42
+	if err := Update(ctx, &mine, WithRetry(2)); err != nil {
+		t.Fatalf("disjoint changes must merge: %v", err)
+	}
+	var fresh testUser
+	if err := FindByID(ctx, seed.ID, &fresh); err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Age != 42 || fresh.Role != "admin" || fresh.Version != 2 {
+		t.Fatalf("merged document must carry both changes: %+v", fresh)
+	}
+	if mine.Age != 42 || mine.Role != "admin" || mine.Version != 2 {
+		t.Errorf("model must reflect the merge: %+v", mine)
+	}
+
+	// The base moved with the save: a second retry round still works.
+	if err := FindByID(ctx, seed.ID, &theirs); err != nil {
+		t.Fatal(err)
+	}
+	theirs.Name = "Renamed-not-allowed" // immutable, so use a mutable field
+	theirs.Name = fresh.Name
+	theirs.Role = "user"
+	if err := Update(ctx, &theirs); err != nil {
+		t.Fatal(err)
+	}
+	mine.Age = 43
+	if err := Update(ctx, &mine, WithRetry(2)); err != nil {
+		t.Fatalf("second merge round: %v", err)
+	}
+	if err := FindByID(ctx, seed.ID, &fresh); err != nil || fresh.Age != 43 || fresh.Role != "user" {
+		t.Fatalf("second merge result: %+v %v", fresh, err)
+	}
+
+	// Same-field changes conflict.
+	if err := FindByID(ctx, seed.ID, &theirs); err != nil {
+		t.Fatal(err)
+	}
+	theirs.Age = 100
+	if err := Update(ctx, &theirs); err != nil {
+		t.Fatal(err)
+	}
+	mine.Age = 44
+	var mce *MergeConflictError
+	if err := Update(ctx, &mine, WithRetry(2)); !errors.As(err, &mce) || len(mce.Fields) != 1 || mce.Fields[0] != "age" {
+		t.Fatalf("same-field change must be a MergeConflictError on age, got %v", err)
+	}
+	if err := FindByID(ctx, seed.ID, &fresh); err != nil || fresh.Age != 100 {
+		t.Fatalf("the other writer's value must stand: %+v %v", fresh, err)
+	}
+}
+
+func TestWithRetry_WithoutBase_IsAConflict(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	seed := seedUsers(t, ctx, 1)[0]
+	other := *seed
+	other.Role = "admin"
+	if err := Update(ctx, &other); err != nil {
+		t.Fatal(err)
+	}
+
+	// A model assembled by hand has no loaded base to diff against.
+	hand := &testUser{Email: seed.Email, Name: seed.Name, Age: 5}
+	hand.ID = seed.ID
+	hand.CreatedAt = seed.CreatedAt
+	if err := Update(ctx, hand, WithRetry(3)); !errors.Is(err, ErrVersionConflict) {
+		t.Fatalf("no base must mean no merge: %v", err)
+	}
+	var fresh testUser
+	if err := FindByID(ctx, seed.ID, &fresh); err != nil || fresh.Role != "admin" || fresh.Age != seed.Age {
+		t.Fatalf("nothing may have been overwritten: %+v %v", fresh, err)
+	}
+}
+
+func TestBase_RecordedByFindAndMovesWithCopies(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	seedUsers(t, ctx, 3)
+	var users []testUser
+	if err := Find(ctx, bson.D{}, &users); err != nil {
+		t.Fatal(err)
+	}
+	schema, _ := SchemaOf(&testUser{})
+	for i := range users {
+		if modelBase(schema, &users[i]) == nil {
+			t.Fatalf("Find must record a base for element %d", i)
+		}
+	}
+	var ptrs []*testUser
+	if err := Find(ctx, bson.D{}, &ptrs); err != nil || len(ptrs) != 3 || modelBase(schema, ptrs[0]) == nil {
+		t.Fatalf("Find into pointer slice: %v", err)
+	}
+	cp := users[0]
+	if modelBase(schema, &cp) == nil {
+		t.Error("a struct copy must keep the base")
+	}
+	fresh := &testUser{Email: "x@test.com", Name: "X"}
+	if err := Create(ctx, fresh); err != nil {
+		t.Fatal(err)
+	}
+	if modelBase(schema, fresh) == nil {
+		t.Error("Create must record a base")
+	}
+}
+
+func TestUpdateFields_EnumOnElementPath(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testEnumSlice{}, "test_enum_slice", "")
+	m := &testEnumSlice{Tags: []string{"a", "b"}}
+	if err := Create(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	var ve ValidationErrors
+	if err := UpdateFields(ctx, m, bson.M{"tags.1": "zzz"}); !errors.As(err, &ve) {
+		t.Fatalf("enum must apply to an element path, got %v", err)
+	}
+	if err := UpdateFields(ctx, m, bson.M{"tags.1": "c"}); err != nil || m.Tags[1] != "c" {
+		t.Fatalf("valid element: %v", err)
+	}
+}
+
+func TestValidate_EnumSkipsNilPointerElements(t *testing.T) {
+	type model struct {
+		Model `bson:",inline"`
+		Ptrs  []*string `bson:"ptrs" goodm:"enum=a|b"`
+	}
+	schema := &Schema{Fields: parseFields(modelType(&model{}), nil)}
+	a := "a"
+	if errs := Validate(&model{Ptrs: []*string{&a, nil}}, schema); len(errs) != 0 {
+		t.Errorf("nil elements must be skipped: %v", errs)
+	}
+	z := "z"
+	if errs := Validate(&model{Ptrs: []*string{&a, &z}}, schema); !hasFieldError(errs, "ptrs[1]") {
+		t.Errorf("offending pointer element must be reported: %v", errs)
+	}
+}
+
+func TestGenerateModel_WithoutEmbedImportsGoodm(t *testing.T) {
+	src, err := GenerateModel(DiscoveredCollection{Name: "things", Fields: []DiscoveredField{{BSONName: "name", GoType: "string"}}}, GenerateOptions{PackageName: "models", EmbedModel: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(src), `"github.com/dwoolworth/goodm"`) {
+		t.Errorf("generated code must import goodm for Register:\n%s", src)
+	}
+}
+
+type testMergeShape struct {
+	Model `bson:",inline"`
+	Name  string            `bson:"name"`
+	Note  string            `bson:"note"`
+	Count int64             `bson:"count"`
+	Attrs map[string]string `bson:"attrs"`
+}
+
+func TestWithRetry_ToleratesStoredShapeDifferences(t *testing.T) {
+	ctx, db, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testMergeShape{}, "test_merge_shape", "")
+	// A document written by another application: no "note", an extra
+	// "legacy" field, and an int32 where the struct has int64.
+	id := bson.NewObjectID()
+	if _, err := db.Collection("test_merge_shape").InsertOne(ctx, bson.D{
+		{Key: "_id", Value: id}, {Key: "name", Value: "n"}, {Key: "count", Value: int32(3)},
+		{Key: "legacy", Value: true}, {Key: "attrs", Value: bson.D{{Key: "a", Value: "1"}, {Key: "b", Value: "2"}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for round := 0; round < 10; round++ {
+		var mine, theirs testMergeShape
+		if err := FindByID(ctx, id, &mine); err != nil {
+			t.Fatal(err)
+		}
+		if err := FindByID(ctx, id, &theirs); err != nil {
+			t.Fatal(err)
+		}
+		theirs.Name = fmt.Sprintf("other-%d", round)
+		if err := Update(ctx, &theirs); err != nil {
+			t.Fatal(err)
+		}
+		mine.Note = fmt.Sprintf("mine-%d", round)
+		if err := Update(ctx, &mine, WithRetry(2)); err != nil {
+			t.Fatalf("round %d: shape differences must not block the merge: %v", round, err)
+		}
+		var fresh testMergeShape
+		if err := FindByID(ctx, id, &fresh); err != nil || fresh.Name != theirs.Name || fresh.Note != mine.Note {
+			t.Fatalf("round %d: both changes must land: %+v %v", round, fresh, err)
+		}
+	}
+}
+
+func TestWithRetry_SecondConflictInOneCall(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testMergeShape{}, "test_merge_shape", "")
+	m := &testMergeShape{Name: "n"}
+	if err := Create(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	var mine testMergeShape
+	if err := FindByID(ctx, m.ID, &mine); err != nil {
+		t.Fatal(err)
+	}
+	// Drive the retry loop's two rounds by hand so a second writer can land
+	// between the first merge and the retry.
+	var a testMergeShape
+	if err := FindByID(ctx, m.ID, &a); err != nil {
+		t.Fatal(err)
+	}
+	a.Name = "A"
+	if err := Update(ctx, &a); err != nil {
+		t.Fatal(err)
+	}
+	mine.Note = "mine"
+	coll := DB().Collection("test_merge_shape")
+	schema, _ := SchemaOf(&testMergeShape{})
+	base, err := normalizeBase(schema, modelBase(schema, &mine))
+	if err != nil {
+		t.Fatal(err)
+	}
+	theirs, err := mergeFromDB(ctx, coll, schema, &mine, base, m.ID, nil, nil)
+	if err != nil {
+		t.Fatalf("first merge round: %v", err)
+	}
+	var b testMergeShape
+	if err := FindByID(ctx, m.ID, &b); err != nil {
+		t.Fatal(err)
+	}
+	b.Count = 9
+	if err := Update(ctx, &b); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mergeFromDB(ctx, coll, schema, &mine, theirs, m.ID, nil, nil); err != nil {
+		t.Fatalf("second merge round with the advanced base must succeed: %v", err)
+	}
+	if mine.Name != "A" || mine.Count != 9 || mine.Note != "mine" {
+		t.Errorf("merged model must carry all three changes: %+v", mine)
+	}
+}
+
+func TestFindOneAndUpdate_ReturnOriginalClearsBase(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	users := seedUsers(t, ctx, 2)
+	var m testUser
+	if err := FindByID(ctx, users[0].ID, &m); err != nil {
+		t.Fatal(err)
+	}
+	schema, _ := SchemaOf(&testUser{})
+	err := FindOneAndUpdate(ctx, bson.D{{Key: "_id", Value: users[1].ID}}, bson.M{"$set": bson.M{"age": 1}}, &m, FindOneAndUpdateOptions{ReturnOriginal: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.ID != users[1].ID || modelBase(schema, &m) != nil {
+		t.Errorf("ReturnOriginal must leave no base from an unrelated document: id=%v base=%v", m.ID, modelBase(schema, &m) != nil)
+	}
+}
+
+type testMergeClear struct {
+	Model `bson:",inline"`
+	Note  string            `bson:"note"`
+	Opt   string            `bson:"opt,omitempty"`
+	Attrs map[string]string `bson:"attrs"`
+	F     float64           `bson:"f"`
+}
+
+func TestWithRetry_DoesNotResurrectRemovedValues(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testMergeClear{}, "test_merge_clear", "")
+	m := &testMergeClear{Opt: "x", Attrs: map[string]string{"a": "1", "b": "2"}, F: math.NaN()}
+	if err := Create(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	var mine, other testMergeClear
+	if err := FindByID(ctx, m.ID, &mine); err != nil {
+		t.Fatal(err)
+	}
+	if err := FindByID(ctx, m.ID, &other); err != nil {
+		t.Fatal(err)
+	}
+	delete(other.Attrs, "b")
+	other.Opt = ""
+	if err := Update(ctx, &other); err != nil {
+		t.Fatal(err)
+	}
+	mine.Note = "mine"
+	if err := Update(ctx, &mine, WithRetry(2)); err != nil {
+		t.Fatalf("merge with a NaN field and removed values: %v", err)
+	}
+	var fresh testMergeClear
+	if err := FindByID(ctx, m.ID, &fresh); err != nil {
+		t.Fatal(err)
+	}
+	if _, kept := fresh.Attrs["b"]; kept || fresh.Opt != "" || fresh.Note != "mine" {
+		t.Errorf("the other writer's removals must survive the merge: %+v", fresh)
+	}
+	if _, kept := mine.Attrs["b"]; kept || mine.Opt != "" {
+		t.Errorf("the model must reflect the merged state: %+v", mine)
+	}
+}
+
+func TestUpdateFields_BaseAdvancesOnlyByWrittenFields(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testMergeShape{}, "test_merge_shape", "")
+	m := &testMergeShape{Name: "n"}
+	if err := Create(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	var mine testMergeShape
+	if err := FindByID(ctx, m.ID, &mine); err != nil {
+		t.Fatal(err)
+	}
+	mine.Note = "local-unsaved"
+	if err := UpdateFields(ctx, &mine, bson.M{"name": "uf"}); err != nil {
+		t.Fatal(err)
+	}
+	var other testMergeShape
+	if err := FindByID(ctx, m.ID, &other); err != nil {
+		t.Fatal(err)
+	}
+	other.Count = 7
+	if err := Update(ctx, &other); err != nil {
+		t.Fatal(err)
+	}
+	if err := Update(ctx, &mine, WithRetry(2)); err != nil {
+		t.Fatalf("merge after UpdateFields: %v", err)
+	}
+	var fresh testMergeShape
+	if err := FindByID(ctx, m.ID, &fresh); err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Note != "local-unsaved" || fresh.Count != 7 || fresh.Name != "uf" {
+		t.Errorf("the unsaved edit must still count as ours: %+v", fresh)
+	}
+}
+
+type testMergeTransient struct {
+	Model     `bson:",inline"`
+	Note      string `bson:"note"`
+	Count     int    `bson:"count"`
+	Transient string `bson:"-"`
+	cache     string
+}
+
+func TestWithRetry_UnsetIsOurRemoval_AndTransientFieldsSurvive(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testMergeTransient{}, "test_merge_transient", "")
+	m := &testMergeTransient{Count: 1}
+	if err := Create(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	var a, b testMergeTransient
+	if err := FindByID(ctx, m.ID, &a); err != nil {
+		t.Fatal(err)
+	}
+	if err := FindByID(ctx, m.ID, &b); err != nil {
+		t.Fatal(err)
+	}
+	b.Count = 99
+	if err := Update(ctx, &b); err != nil {
+		t.Fatal(err)
+	}
+	a.Note = "mine"
+	a.Transient, a.cache = "keep", "cached"
+	var mce *MergeConflictError
+	opts := UnsetFields("count")
+	opts.MaxRetries = 1
+	if err := Update(ctx, &a, opts); !errors.As(err, &mce) || mce.Fields[0] != "count" {
+		t.Fatalf("unsetting a field another writer changed must conflict, got %v", err)
+	}
+	var fresh testMergeTransient
+	if err := FindByID(ctx, m.ID, &fresh); err != nil || fresh.Count != 99 {
+		t.Fatalf("the other writer's value must stand: %+v %v", fresh, err)
+	}
+
+	// A merge that succeeds keeps non-persisted fields and pointer identity.
+	if err := FindByID(ctx, m.ID, &a); err != nil {
+		t.Fatal(err)
+	}
+	if err := FindByID(ctx, m.ID, &b); err != nil {
+		t.Fatal(err)
+	}
+	b.Count = 100
+	if err := Update(ctx, &b); err != nil {
+		t.Fatal(err)
+	}
+	a.Note = "again"
+	a.Transient, a.cache = "keep", "cached"
+	held := &a.Model
+	if err := Update(ctx, &a, WithRetry(2)); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if a.Transient != "keep" || a.cache != "cached" {
+		t.Errorf("non-persisted fields must survive a merge: %q %q", a.Transient, a.cache)
+	}
+	if held != &a.Model || held.Version != a.Version {
+		t.Error("struct identity must be preserved through a merge")
+	}
+	if a.Count != 100 || a.Note != "again" {
+		t.Errorf("merged content: %+v", a)
+	}
+
+	// After an Unset save the base lacks the field, so a later merge sees a
+	// re-added value as ours.
+	if err := FindByID(ctx, m.ID, &a); err != nil {
+		t.Fatal(err)
+	}
+	if err := Update(ctx, &a, UnsetFields("count")); err != nil {
+		t.Fatal(err)
+	}
+	schema, _ := SchemaOf(&testMergeTransient{})
+	var baseDoc bson.M
+	if err := bson.Unmarshal(modelBase(schema, &a), &baseDoc); err != nil {
+		t.Fatal(err)
+	}
+	if _, has := baseDoc["count"]; has {
+		t.Error("the base after an Unset save must not contain the unset field")
+	}
+}
+
+func TestUpdateFields_BaseClearedWhenNotReconstructible(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testEnumSlice{}, "test_enum_slice", "")
+	m := &testEnumSlice{Tags: []string{"a"}}
+	if err := Create(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	m.Tags = append(m.Tags, "b", "c") // in memory only
+	if err := UpdateFields(ctx, m, bson.M{"tags.2": "c"}); err != nil {
+		t.Fatal(err)
+	}
+	schema, _ := SchemaOf(&testEnumSlice{})
+	if modelBase(schema, m) != nil {
+		t.Error("a base that cannot be reconstructed must be dropped, not left behind the database")
+	}
+}
+
+func TestWithRetry_BaseFromAbortedTransactionIsRejected(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testMergeShape{}, "test_merge_shape", "")
+	m := &testMergeShape{Name: "t0"}
+	if err := Create(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	var mine testMergeShape
+	if err := FindByID(ctx, m.ID, &mine); err != nil {
+		t.Fatal(err)
+	}
+	// First attempt writes inside a transaction that then aborts.
+	_ = WithTransaction(ctx, func(ctx context.Context) error {
+		mine.Name = "mine"
+		if err := Update(ctx, &mine, WithRetry(3)); err != nil {
+			return err
+		}
+		return errors.New("abort")
+	})
+	// Second attempt: the base recorded inside the aborted transaction is
+	// newer than the stored document and must not be merged against.
+	mine.Name = "mine"
+	err := Update(ctx, &mine, WithRetry(3))
+	if !errors.Is(err, ErrVersionConflict) {
+		t.Fatalf("a base from a rolled-back write must be rejected, got %v", err)
+	}
+	var fresh testMergeShape
+	if err := FindByID(ctx, m.ID, &fresh); err != nil || fresh.Name != "t0" || fresh.Version != 0 {
+		t.Fatalf("nothing may have been written: %+v %v", fresh, err)
+	}
+	// Reloading recovers.
+	if err := FindByID(ctx, m.ID, &mine); err != nil {
+		t.Fatal(err)
+	}
+	mine.Name = "mine"
+	if err := Update(ctx, &mine, WithRetry(3)); err != nil {
+		t.Fatalf("after reload: %v", err)
+	}
+}
+
+func TestVersionConflict_DoesNotEnableOverwrite(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testMergeShape{}, "test_merge_shape", "")
+	m := &testMergeShape{Name: "n", Note: "orig"}
+	if err := Create(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	var mine, other testMergeShape
+	if err := FindByID(ctx, m.ID, &mine); err != nil {
+		t.Fatal(err)
+	}
+	if err := FindByID(ctx, m.ID, &other); err != nil {
+		t.Fatal(err)
+	}
+	other.Note = "theirs"
+	if err := Update(ctx, &other); err != nil {
+		t.Fatal(err)
+	}
+	mine.Count = 5
+	if err := Update(ctx, &mine); !errors.Is(err, ErrVersionConflict) {
+		t.Fatalf("expected a conflict, got %v", err)
+	}
+	// A plain retry must conflict again, not overwrite "theirs".
+	if err := Update(ctx, &mine); !errors.Is(err, ErrVersionConflict) {
+		t.Fatalf("a second plain Update must still conflict, got %v", err)
+	}
+	// A WithRetry save merges from the loaded base and keeps "theirs".
+	if err := Update(ctx, &mine, WithRetry(1)); err != nil {
+		t.Fatalf("merge after conflict: %v", err)
+	}
+	var fresh testMergeShape
+	if err := FindByID(ctx, m.ID, &fresh); err != nil || fresh.Note != "theirs" || fresh.Count != 5 {
+		t.Fatalf("merge must keep the other writer's change: %+v %v", fresh, err)
+	}
+}
+
+func TestUpdate_CombinesOptionsAndZeroesUnset(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testMergeShape{}, "test_merge_shape", "")
+	m := &testMergeShape{Name: "n", Note: "note", Count: 3}
+	if err := Create(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	var mine, other testMergeShape
+	if err := FindByID(ctx, m.ID, &mine); err != nil {
+		t.Fatal(err)
+	}
+	if err := FindByID(ctx, m.ID, &other); err != nil {
+		t.Fatal(err)
+	}
+	other.Name = "renamed"
+	if err := Update(ctx, &other); err != nil {
+		t.Fatal(err)
+	}
+	// Two option values: both must apply (merge AND unset).
+	if err := Update(ctx, &mine, WithRetry(1), UnsetFields("note")); err != nil {
+		t.Fatalf("combined options: %v", err)
+	}
+	if mine.Note != "" {
+		t.Errorf("unset field must be zeroed on the model, got %q", mine.Note)
+	}
+	var raw bson.Raw
+	if err := DB().Collection("test_merge_shape").FindOne(ctx, bson.D{{Key: "_id", Value: m.ID}}).Decode(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.LookupErr("note"); err == nil {
+		t.Error("note must be unset in the document")
+	}
+	if v, _ := raw.LookupErr("name"); v.StringValue() != "renamed" {
+		t.Error("the merge must keep the other writer's rename")
+	}
+	// A later plain Update writes the struct, so a non-omitempty field comes
+	// back as its zero value, never as the old value.
+	mine.Count = 4
+	if err := Update(ctx, &mine); err != nil {
+		t.Fatal(err)
+	}
+	if err := DB().Collection("test_merge_shape").FindOne(ctx, bson.D{{Key: "_id", Value: m.ID}}).Decode(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := raw.LookupErr("note"); err == nil && v.StringValue() != "" {
+		t.Errorf("note must not come back with its old value, got %q", v.StringValue())
+	}
+}
+
+func TestWithRetry_StaleBaseFromRawDecodeIsIgnored(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testMergeShape{}, "test_merge_shape", "")
+	m := &testMergeShape{Note: "queued"}
+	if err := Create(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	var mine testMergeShape
+	if err := FindByID(ctx, m.ID, &mine); err != nil { // base at v0
+		t.Fatal(err)
+	}
+	var other testMergeShape
+	if err := FindByID(ctx, m.ID, &other); err != nil {
+		t.Fatal(err)
+	}
+	other.Note = "running"
+	if err := Update(ctx, &other); err != nil { // v1
+		t.Fatal(err)
+	}
+	// Refresh mine by a cursor decode: model at v1, base still v0.
+	cur, err := FindCursor(ctx, bson.D{{Key: "_id", Value: m.ID}}, &testMergeShape{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cur.Next(ctx) || cur.Decode(&mine) != nil {
+		t.Fatal("cursor decode")
+	}
+	_ = cur.Close(ctx)
+	other.Note = "queued"
+	if err := Update(ctx, &other); err != nil { // v2
+		t.Fatal(err)
+	}
+	mine.Count = 7
+	if err := Update(ctx, &mine, WithRetry(1)); !errors.Is(err, ErrVersionConflict) {
+		t.Fatalf("a stale base must not be merged against, got %v", err)
+	}
+	var fresh testMergeShape
+	if err := FindByID(ctx, m.ID, &fresh); err != nil || fresh.Note != "queued" || fresh.Count != 0 {
+		t.Fatalf("the other writer's re-queue must stand: %+v %v", fresh, err)
+	}
+}
+
+func TestWritesInTransaction_RecordNoBase(t *testing.T) {
+	ctx, _, cleanup := setupTestDB(t)
+	defer cleanup()
+	registerModel(t, &testMergeShape{}, "test_merge_shape", "")
+	m := &testMergeShape{Name: "t0"}
+	if err := Create(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	schema, _ := SchemaOf(&testMergeShape{})
+	var mine testMergeShape
+	if err := FindByID(ctx, m.ID, &mine); err != nil {
+		t.Fatal(err)
+	}
+	_ = WithTransaction(ctx, func(ctx context.Context) error {
+		mine.Name = "mine"
+		if err := Update(ctx, &mine); err != nil {
+			return err
+		}
+		if modelBase(schema, &mine) != nil {
+			t.Error("an Update inside a transaction must not record a base")
+		}
+		return errors.New("abort")
+	})
+	// Two other writers commit after the abort.
+	for i, name := range []string{"w1", "w2"} {
+		var w testMergeShape
+		if err := FindByID(ctx, m.ID, &w); err != nil {
+			t.Fatal(err)
+		}
+		w.Note = name
+		if err := Update(ctx, &w); err != nil {
+			t.Fatalf("writer %d: %v", i, err)
+		}
+	}
+	mine.Name = "mine"
+	if err := Update(ctx, &mine, WithRetry(3)); !errors.Is(err, ErrVersionConflict) {
+		t.Fatalf("no base after an aborted transaction means a conflict, got %v", err)
+	}
+	var fresh testMergeShape
+	if err := FindByID(ctx, m.ID, &fresh); err != nil || fresh.Name != "t0" || fresh.Note != "w2" {
+		t.Fatalf("nothing of ours may have landed: %+v %v", fresh, err)
+	}
+	// Created inside a committed transaction: no base either, by design.
+	c := &testMergeShape{Name: "c"}
+	if err := WithTransaction(ctx, func(ctx context.Context) error { return Create(ctx, c) }); err != nil {
+		t.Fatal(err)
+	}
+	if modelBase(schema, c) != nil {
+		t.Error("Create inside a transaction must not record a base")
+	}
+}

@@ -932,10 +932,9 @@ func TestUpdate_VersionConflict_RollsBack(t *testing.T) {
 	u2.Age = 27
 	_ = Update(ctx, u2)
 
-	// u2's version should be refreshed to the current DB version (1) so
-	// subsequent Update() calls don't cascade-fail.
-	if u2.Version != 1 {
-		t.Fatalf("expected version refreshed to 1, got %d", u2.Version)
+	// A conflicting model keeps its stale version so a retry conflicts again.
+	if u2.Version != 0 {
+		t.Fatalf("a conflicting model keeps its stale version so a retry conflicts again, got %d", u2.Version)
 	}
 }
 

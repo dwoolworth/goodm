@@ -284,7 +284,7 @@ func inferGoType(v interface{}) string {
 		return "bool"
 	case bson.ObjectID:
 		return "bson.ObjectID"
-	case time.Time:
+	case time.Time, bson.DateTime:
 		return "time.Time"
 	case bson.D:
 		return "bson.M"

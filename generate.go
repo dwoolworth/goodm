@@ -199,7 +199,7 @@ func GenerateModel(coll DiscoveredCollection, opts GenerateOptions) ([]byte, err
 		IndexEntries:   indexEntries,
 		NeedsTime:      needsTime,
 		NeedsBSON:      needsBSON,
-		NeedsGoodm:     opts.EmbedModel || len(indexEntries) > 0,
+		NeedsGoodm:     true, // init() always calls goodm.Register
 	}
 
 	var buf bytes.Buffer

@@ -75,12 +75,40 @@ type UpdateOptions struct {
 
 // UnsetFields returns UpdateOptions that will remove the specified fields from
 // the MongoDB document. Field names should be bson names (e.g. "agent_id").
+// After a successful save the fields are zeroed on the model as well. Update
+// writes the whole struct, so a later Update stores the field's zero value
+// again unless the field is tagged omitempty.
 //
-// Example:
+// Several UpdateOptions values may be passed to one call and are combined:
 //
-//	goodm.Update(ctx, &server, goodm.UnsetFields("agent_id"))
+//	goodm.Update(ctx, &server, goodm.UnsetFields("agent_id"), goodm.WithRetry(2))
 func UnsetFields(fields ...string) UpdateOptions {
 	return UpdateOptions{Unset: fields}
+}
+
+// mergeUpdateOptions combines several UpdateOptions values: the first DB,
+// Hint, and Collation set win, Unset lists and ArrayFilters are concatenated,
+// MaxRetries is the largest given, and Upsert is set if any value sets it.
+func mergeUpdateOptions(opts []UpdateOptions) UpdateOptions {
+	var out UpdateOptions
+	for _, o := range opts {
+		if out.DB == nil {
+			out.DB = o.DB
+		}
+		if out.Hint == nil {
+			out.Hint = o.Hint
+		}
+		if out.Collation == nil {
+			out.Collation = o.Collation
+		}
+		out.Unset = append(out.Unset, o.Unset...)
+		out.ArrayFilters = append(out.ArrayFilters, o.ArrayFilters...)
+		if o.MaxRetries > out.MaxRetries {
+			out.MaxRetries = o.MaxRetries
+		}
+		out.Upsert = out.Upsert || o.Upsert
+	}
+	return out
 }
 
 // WithRetry returns UpdateOptions that will automatically retry on version
@@ -88,6 +116,13 @@ func UnsetFields(fields ...string) UpdateOptions {
 // from the database, and the caller's changed fields are merged onto the fresh
 // state — but only if no other writer modified the same fields. If both sides
 // changed the same field, a *MergeConflictError is returned.
+//
+// The caller's changes are those that differ from the document as it was last
+// loaded or saved through goodm (FindOne, FindByID, Find, FindOneAndUpdate,
+// FindOneAndReplace, Create, Update, UpdateFields, SaveMany), which goodm.Model
+// remembers. A model built by hand, loaded through FindCursor, or without an
+// embedded goodm.Model has no such base; a conflict then returns
+// ErrVersionConflict without merging.
 //
 // Example:
 //
@@ -159,6 +194,7 @@ func Create(ctx context.Context, model interface{}, opts ...CreateOptions) error
 		if _, err := coll.InsertOne(ctx, model); err != nil {
 			return translateWriteError(err, schema, "insert failed")
 		}
+		recordBaseAfterWrite(ctx, schema, model, nil)
 
 		// AfterCreate hook
 		if hook, ok := model.(AfterCreate); ok {
@@ -221,11 +257,15 @@ func FindOne(ctx context.Context, filter interface{}, result interface{}, opts .
 		}
 
 		coll := getCollection(db, schema)
-		if err := coll.FindOne(ctx, info.Filter, findOneOptions(opt)).Decode(result); err != nil {
+		res := coll.FindOne(ctx, info.Filter, findOneOptions(opt))
+		if err := res.Decode(result); err != nil {
 			if errors.Is(err, mongo.ErrNoDocuments) {
 				return ErrNotFound
 			}
 			return fmt.Errorf("goodm: find one failed: %w", err)
+		}
+		if raw, err := res.Raw(); err == nil {
+			setModelBase(schema, result, raw)
 		}
 
 		return nil
@@ -282,12 +322,37 @@ func Find(ctx context.Context, filter interface{}, results interface{}, opts ...
 		}
 		defer func() { _ = cursor.Close(ctx) }()
 
-		if err := cursor.All(ctx, results); err != nil {
+		return decodeAll(ctx, cursor, schema, rv.Elem())
+	})
+}
+
+// decodeAll decodes every document of a cursor into the slice value (of
+// element type T or *T), recording each document's raw form as the model's
+// merge base.
+func decodeAll(ctx context.Context, cursor *mongo.Cursor, schema *Schema, slice reflect.Value) error {
+	elemType := slice.Type().Elem()
+	isPtr := elemType.Kind() == reflect.Pointer
+	if isPtr {
+		elemType = elemType.Elem()
+	}
+	out := reflect.MakeSlice(slice.Type(), 0, 0)
+	for cursor.Next(ctx) {
+		elem := reflect.New(elemType)
+		if err := cursor.Decode(elem.Interface()); err != nil {
 			return fmt.Errorf("goodm: cursor decode failed: %w", err)
 		}
-
-		return nil
-	})
+		setModelBase(schema, elem.Interface(), copyRaw(cursor.Current))
+		if isPtr {
+			out = reflect.Append(out, elem)
+		} else {
+			out = reflect.Append(out, elem.Elem())
+		}
+	}
+	if err := cursor.Err(); err != nil {
+		return fmt.Errorf("goodm: cursor failed: %w", err)
+	}
+	slice.Set(out)
+	return nil
 }
 
 // FindCursor returns a raw *mongo.Cursor for streaming large result sets.
@@ -461,10 +526,7 @@ func Update(ctx context.Context, model interface{}, opts ...UpdateOptions) error
 		return fmt.Errorf("goodm: cannot update document with zero ID")
 	}
 
-	var opt UpdateOptions
-	if len(opts) > 0 {
-		opt = opts[0]
-	}
+	opt := mergeUpdateOptions(opts)
 
 	// Validate unset fields against the schema before proceeding.
 	if err := validateUnsetFields(schema, opt.Unset); err != nil {
@@ -507,6 +569,13 @@ func Update(ctx context.Context, model interface{}, opts ...UpdateOptions) error
 		if err := saveWithRetry(ctx, coll, schema, model, opt, id, scope); err != nil {
 			return err
 		}
+		if len(opt.Unset) > 0 {
+			// The stored document lacks the unset fields: zero them on the
+			// model (a later Update then writes their zero value, or omits
+			// them if they are omitempty).
+			zeroUnsetFields(model, opt.Unset)
+		}
+		recordBaseAfterWrite(ctx, schema, model, opt.Unset)
 
 		// AfterSave hook
 		if hook, ok := model.(AfterSave); ok {
@@ -645,11 +714,7 @@ func UpdateFields(ctx context.Context, model interface{}, fields bson.M, opts ..
 		ModelName: schema.ModelName, Model: model, Filter: base,
 	}
 	return runMiddleware(ctx, info, func(ctx context.Context) error {
-		var optDB *mongo.Database
-		if len(opts) > 0 {
-			optDB = opts[0].DB
-		}
-		db, err := getDB(optDB)
+		db, err := getDB(mergeUpdateOptions(opts).DB)
 		if err != nil {
 			return err
 		}
@@ -680,9 +745,45 @@ func UpdateFields(ctx context.Context, model interface{}, fields bson.M, opts ..
 		setUpdatedAt(model, now)
 		setModelVersion(model, oldVersion+1)
 		applyFieldsToModel(model, values)
+		if inTransaction(ctx) {
+			setModelBase(schema, model, nil)
+		} else {
+			advanceBaseAfterUpdateFields(schema, model, values, now, oldVersion+1)
+		}
 
 		return nil
 	})
+}
+
+// advanceBaseAfterUpdateFields moves the model's merge base forward by the
+// fields UpdateFields wrote, starting from the old base rather than from the
+// model, so edits the caller made in memory but did not save are still seen
+// as changes by a later WithRetry merge. A model with no base keeps none.
+func advanceBaseAfterUpdateFields(schema *Schema, model interface{}, values map[string]reflect.Value, now time.Time, version int) {
+	old := modelBase(schema, model)
+	if old == nil {
+		return
+	}
+	stored := reflect.New(schema.Type)
+	if err := bson.Unmarshal(old, stored.Interface()); err != nil {
+		setModelBase(schema, model, nil)
+		return
+	}
+	if !applyFieldsToModel(stored.Interface(), values) {
+		// The stored document was shaped differently (e.g. the caller wrote
+		// through an index its stored copy did not have): the base can no
+		// longer be reconstructed, so drop it rather than keep a wrong one.
+		setModelBase(schema, model, nil)
+		return
+	}
+	setUpdatedAt(stored.Interface(), now)
+	setModelVersion(stored.Interface(), version)
+	raw, err := bson.Marshal(stored.Interface())
+	if err != nil {
+		setModelBase(schema, model, nil)
+		return
+	}
+	setModelBase(schema, model, raw)
 }
 
 // prepareUpdateFields checks that every key in fields is a known, mutable,
@@ -724,6 +825,11 @@ func prepareUpdateFields(schema *Schema, model interface{}, fields bson.M) (valu
 		}
 		if isElement {
 			errs = append(errs, validateSliceElement(v, fs, name)...)
+			if len(fs.Enum) > 0 && !v.IsZero() {
+				if e := validateEnum(v, fs.Enum, name); e != nil {
+					errs = append(errs, *e)
+				}
+			}
 		} else {
 			errs = append(errs, validateOneField(v, fs, name)...)
 		}
@@ -1242,7 +1348,9 @@ func convertArray(rv reflect.Value, t reflect.Type) (reflect.Value, error) {
 }
 
 // validateSliceElement validates one element of a slice field: a subdocument
-// element is validated by its inner fields; scalar elements have no rules.
+// element is validated by its inner fields. Scalar elements are subject only
+// to enum, which the caller applies; min and max are length rules for the
+// whole slice.
 func validateSliceElement(v reflect.Value, fs *FieldSchema, path string) []ValidationError {
 	if len(fs.SubFields) == 0 {
 		return nil
@@ -1309,12 +1417,13 @@ func isSliceField(fs *FieldSchema) bool {
 // caller sees the updated state without a re-read. Dotted paths are followed
 // through nested structs, pointers, and slice indices; a path that cannot be
 // reached on the current model (e.g. an index past the end of a slice) is
-// skipped.
-func applyFieldsToModel(model interface{}, values map[string]reflect.Value) {
+// skipped, and the result reports whether every path was applied.
+func applyFieldsToModel(model interface{}, values map[string]reflect.Value) bool {
 	root := reflect.ValueOf(model)
 	if root.Kind() == reflect.Pointer {
 		root = root.Elem()
 	}
+	all := true
 	for path, val := range values {
 		target := root
 		ok := true
@@ -1325,10 +1434,12 @@ func applyFieldsToModel(model interface{}, values map[string]reflect.Value) {
 			}
 		}
 		if !ok || !target.CanSet() || !val.Type().AssignableTo(target.Type()) {
+			all = false
 			continue
 		}
 		target.Set(val)
 	}
+	return all
 }
 
 // stepIntoAlloc is stepInto for a write that has already happened: a nil
@@ -1477,10 +1588,7 @@ func UpdateOne(ctx context.Context, filter interface{}, update interface{}, mode
 		ModelName: schema.ModelName, Model: model, Filter: filter,
 	}
 	return runMiddleware(ctx, info, func(ctx context.Context) error {
-		var opt UpdateOptions
-		if len(opts) > 0 {
-			opt = opts[0]
-		}
+		opt := mergeUpdateOptions(opts)
 		db, err := getDB(opt.DB)
 		if err != nil {
 			return err
@@ -1552,12 +1660,17 @@ func FindOneAndUpdate(ctx context.Context, filter interface{}, update interface{
 
 		coll := getCollection(db, schema)
 		managed := withManagedUpdate(update, time.Now(), opt.Upsert)
-		err = coll.FindOneAndUpdate(ctx, info.Filter, managed, fo).Decode(result)
-		if err != nil {
+		res := coll.FindOneAndUpdate(ctx, info.Filter, managed, fo)
+		if err := res.Decode(result); err != nil {
 			if errors.Is(err, mongo.ErrNoDocuments) {
 				return ErrNotFound
 			}
 			return translateWriteError(err, schema, "find one and update failed")
+		}
+		if opt.ReturnOriginal {
+			setModelBase(schema, result, nil) // pre-update content is not a merge base
+		} else if raw, err := res.Raw(); err == nil {
+			setModelBase(schema, result, raw)
 		}
 		return nil
 	})
@@ -1615,12 +1728,17 @@ func FindOneAndReplace(ctx context.Context, filter interface{}, replacement inte
 		}
 
 		coll := getCollection(db, schema)
-		err = coll.FindOneAndReplace(ctx, info.Filter, replacement, fo).Decode(result)
-		if err != nil {
+		res := coll.FindOneAndReplace(ctx, info.Filter, replacement, fo)
+		if err := res.Decode(result); err != nil {
 			if errors.Is(err, mongo.ErrNoDocuments) {
 				return ErrNotFound
 			}
 			return translateWriteError(err, schema, "find one and replace failed")
+		}
+		if opt.ReturnOriginal {
+			setModelBase(schema, result, nil)
+		} else if raw, err := res.Raw(); err == nil {
+			setModelBase(schema, result, raw)
 		}
 		return nil
 	})
@@ -2102,6 +2220,105 @@ func setTimestamps(model interface{}, now time.Time) {
 	setUpdatedAt(model, now)
 }
 
+// embeddedModel returns the model's embedded goodm.Model, allocating a nil
+// pointer embed, or nil if the struct has none.
+func embeddedModel(schema *Schema, model interface{}) *Model {
+	if schema == nil || schema.modelPath == nil {
+		return nil
+	}
+	v := reflect.ValueOf(model)
+	if v.Kind() != reflect.Pointer || v.IsNil() {
+		return nil
+	}
+	cur := v.Elem()
+	for _, i := range schema.modelPath {
+		if cur.Kind() == reflect.Pointer {
+			if cur.IsNil() {
+				if !cur.CanSet() {
+					return nil
+				}
+				cur.Set(reflect.New(cur.Type().Elem()))
+			}
+			cur = cur.Elem()
+		}
+		cur = cur.Field(i)
+	}
+	if cur.Kind() == reflect.Pointer {
+		if cur.IsNil() {
+			if !cur.CanSet() {
+				return nil
+			}
+			cur.Set(reflect.New(cur.Type().Elem()))
+		}
+		return cur.Interface().(*Model)
+	}
+	if !cur.CanAddr() {
+		return nil
+	}
+	return cur.Addr().Interface().(*Model)
+}
+
+// recordBaseAfterWrite records the written document as the model's merge
+// base, unless the write ran inside a transaction: until that commits the
+// write is not stored state, and a base from a transaction that later aborts
+// would be merged against as if it were. Inside a transaction the base is
+// cleared instead, so a later conflict reports ErrVersionConflict.
+func recordBaseAfterWrite(ctx context.Context, schema *Schema, model interface{}, unset []string) {
+	if inTransaction(ctx) {
+		setModelBase(schema, model, nil)
+		return
+	}
+	if len(unset) == 0 {
+		setModelBaseFromModel(schema, model)
+		return
+	}
+	if written, err := buildReplacement(model, unset); err == nil {
+		if raw, err := bson.Marshal(written); err == nil {
+			setModelBase(schema, model, raw)
+		}
+	}
+}
+
+// setModelBase records raw as the model's last known stored state.
+func setModelBase(schema *Schema, model interface{}, raw bson.Raw) {
+	if m := embeddedModel(schema, model); m != nil {
+		m.setBase(raw)
+	}
+}
+
+// setModelBaseFromModel records the model's current state as its last known
+// stored state, after a successful write.
+func setModelBaseFromModel(schema *Schema, model interface{}) {
+	m := embeddedModel(schema, model)
+	if m == nil {
+		return
+	}
+	if raw, err := bson.Marshal(model); err == nil {
+		m.setBase(raw)
+	}
+}
+
+// modelBase returns the model's last known stored state, or nil.
+func modelBase(schema *Schema, model interface{}) bson.Raw {
+	if m := embeddedModel(schema, model); m != nil {
+		return m.baseSnapshot()
+	}
+	return nil
+}
+
+// copyRaw returns an owned copy of a cursor's current document.
+func copyRaw(raw bson.Raw) bson.Raw {
+	return append(bson.Raw(nil), raw...)
+}
+
+// getUpdatedAt returns a model's updated_at, or the zero time if it has none.
+func getUpdatedAt(model interface{}) time.Time {
+	if f := managedField(model, "updated_at", "UpdatedAt"); f.IsValid() && f.Type() == reflect.TypeOf(time.Time{}) {
+		return f.Interface().(time.Time)
+	}
+	return time.Time{}
+}
+
 // setUpdatedAt sets only updated_at on a model.
 func setUpdatedAt(model interface{}, now time.Time) {
 	if f := managedField(model, "updated_at", "UpdatedAt"); f.IsValid() && f.CanSet() && f.Type() == reflect.TypeOf(time.Time{}) {
@@ -2183,6 +2400,20 @@ func setModelVersion(model interface{}, version int) {
 // managedFields are internal fields that must not be unset or set directly.
 var managedFields = map[string]bool{
 	"_id": true, "created_at": true, "updated_at": true, "__v": true,
+}
+
+// zeroUnsetFields sets the fields stored under the given bson names to their
+// zero values on the model.
+func zeroUnsetFields(model interface{}, unset []string) {
+	v := reflect.ValueOf(model)
+	if v.Kind() == reflect.Pointer {
+		v = v.Elem()
+	}
+	for _, name := range unset {
+		if f := fieldByBSONName(v, name, false); f.IsValid() && f.CanSet() {
+			f.Set(reflect.Zero(f.Type()))
+		}
+	}
 }
 
 // validateUnsetFields checks that unset field names are valid schema fields,

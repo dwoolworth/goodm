@@ -63,7 +63,7 @@ If any model fails its immutable check, `BeforeSave` hook, or validation, or the
 
 | Item error | Meaning |
 |-----------|---------|
-| `ErrVersionConflict` | Another writer changed the document first. The model's in-memory version is refreshed from the database, as `Update` does. |
+| `ErrVersionConflict` | Another writer changed the document first. The model keeps its stale version, as with `Update`, so reload it before saving it again. |
 | `ErrNotFound` | The document was deleted (or is outside the middleware scope). |
 | `*DuplicateKeyError` | The replacement violated a unique index. |
 | error marked "outcome unknown" | The write concern was not met, or the request failed in transport or by context cancellation. The server may have applied it, so the model's version is rolled back and `AfterSave` is skipped; a later save of that model then reports a conflict rather than losing anything. `BulkError.WriteConcernError` is set when a write concern error was involved. |
