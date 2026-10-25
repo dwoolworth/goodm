@@ -58,7 +58,7 @@ If the context already carries a session with a transaction in progress, a neste
 
 ## Models After an Aborted Transaction
 
-A write inside a transaction advances the model in memory (version, timestamps) before the transaction commits. If the transaction aborts, goodm cannot roll the model back, so a model saved inside an aborted transaction must be reloaded before it is saved again; otherwise its version may match a document another writer has since committed. goodm does not record a `WithRetry` merge base for writes made inside a transaction, so a conflict on such a model is reported as `ErrVersionConflict` rather than merged against uncommitted state.
+A write inside a transaction advances the model in memory (version, timestamps) before the transaction commits, and a read inside it can see the transaction's own uncommitted writes. If the transaction aborts, goodm cannot roll the model back, so a model loaded or saved inside an aborted transaction must be reloaded before it is saved again; otherwise its version may match a document another writer has since committed. goodm does not record a `WithRetry` merge base for writes made inside a transaction, so a conflict on such a model is reported as `ErrVersionConflict` rather than merged against uncommitted state.
 
 ## Batch Operations
 
