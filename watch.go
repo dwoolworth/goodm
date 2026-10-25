@@ -220,6 +220,10 @@ func Watch(ctx context.Context, model interface{}, opts ...WatchOptions) (*Chang
 		if err != nil {
 			return fmt.Errorf("goodm: watch failed: %w", err)
 		}
+		if stream != nil {
+			// A middleware called next twice; keep only the last stream.
+			closeStream(stream)
+		}
 		stream = &ChangeStream{cs: cs, schema: schema}
 		return nil
 	})
@@ -227,14 +231,25 @@ func Watch(ctx context.Context, model interface{}, opts ...WatchOptions) (*Chang
 		if stream != nil {
 			// A middleware failed after the stream was opened; do not leak
 			// the server cursor.
-			_ = stream.Close(ctx)
+			closeStream(stream)
 		}
 		return nil, err
 	}
 	if stream == nil {
-		return nil, errors.New("goodm: watch was skipped by middleware")
+		return nil, errors.New("goodm: watch was skipped by middleware or returned no stream")
 	}
 	return stream, nil
+}
+
+// closeTimeout bounds the cursor kill on a stream Watch is discarding, which
+// must not depend on the caller's context still being alive.
+const closeTimeout = 10 * time.Second
+
+// closeStream releases a stream Watch is not going to return.
+func closeStream(s *ChangeStream) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), closeTimeout)
+	defer cancel()
+	_ = s.Close(ctx)
 }
 
 func (o WatchOptions) validate() error {

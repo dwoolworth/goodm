@@ -440,6 +440,7 @@ func TestWatchErrors(t *testing.T) {
 func TestWatchMiddlewareOutcomes(t *testing.T) {
 	ctx, db, cleanup := setupTestDB(t)
 	defer cleanup()
+	defer ClearMiddleware()
 
 	// Middleware that skips the operation: an error, not a nil stream.
 	Use(func(ctx context.Context, op *OpInfo, next func(context.Context) error) error {
@@ -472,6 +473,52 @@ func TestWatchMiddlewareOutcomes(t *testing.T) {
 	ClearMiddleware()
 	if after := openCursors(t, ctx, db); after != before {
 		t.Errorf("open cursors on the namespace: %d before, %d after", before, after)
+	}
+
+	// The same, with the caller's context already cancelled by the time
+	// the middleware fails: the cursor is still released.
+	Use(func(ctx context.Context, op *OpInfo, next func(context.Context) error) error {
+		if err := next(ctx); err != nil {
+			return err
+		}
+		if op.Operation == OpWatch {
+			return context.Canceled
+		}
+		return nil
+	})
+	cancelled, cancel := context.WithCancel(ctx)
+	Use(func(ctx context.Context, op *OpInfo, next func(context.Context) error) error {
+		err := next(ctx)
+		cancel()
+		return err
+	})
+	s, err = Watch(cancelled, &testUser{})
+	if !errors.Is(err, context.Canceled) || s != nil {
+		t.Fatalf("cancelled watch = %v, %v", s, err)
+	}
+	ClearMiddleware()
+	if after := openCursors(t, ctx, db); after != before {
+		t.Errorf("open cursors after cancelled close: %d before, %d after", before, after)
+	}
+
+	// Middleware that calls next twice keeps one stream and releases the other.
+	Use(func(ctx context.Context, op *OpInfo, next func(context.Context) error) error {
+		if err := next(ctx); err != nil {
+			return err
+		}
+		return next(ctx)
+	})
+	s, err = Watch(ctx, &testUser{})
+	if err != nil || s == nil {
+		t.Fatalf("double next = %v, %v", s, err)
+	}
+	ClearMiddleware()
+	if open := openCursors(t, ctx, db); open != before+1 {
+		t.Errorf("open cursors with one stream: %d before, %d now", before, open)
+	}
+	_ = s.Close(ctx)
+	if after := openCursors(t, ctx, db); after != before {
+		t.Errorf("open cursors after close: %d before, %d after", before, after)
 	}
 }
 
