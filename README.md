@@ -132,7 +132,7 @@ func main() {
 | **Hooks** | `BeforeCreate`, `AfterCreate`, `BeforeSave`, `AfterSave`, `BeforeDelete`, `AfterDelete` |
 | **Validation** | Automatic on Create/Update: required, enum, min/max, immutable enforcement; `Enforce` can install the same rules as a `$jsonSchema` collection validator |
 | **Middleware** | Global and per-model chains wrapping all operations; may rewrite filters and pipelines |
-| **Population** | Resolve `ref=` fields by fetching referenced documents |
+| **Population** | Resolve `ref=` fields, including refs inside subdocuments and slices, by fetching referenced documents |
 | **Aggregation** | Fluent pipeline builder with `Match`, `Group`, `Sort`, `Lookup`, and more |
 | **Bulk** | `CreateMany` and `SaveMany` with hooks/validation, `NewBulk` builder, `UpdateMany`/`DeleteMany` passthrough |
 | **Transactions** | `WithTransaction` wraps operations in a MongoDB session transaction |
