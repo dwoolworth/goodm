@@ -117,6 +117,8 @@ goodm.Use(func(ctx context.Context, op *goodm.OpInfo, next func(context.Context)
         // Change events nest the document: scope on fullDocument (delete
         // events carry none and are dropped unless the stream asks for
         // pre-images and the scope also checks fullDocumentBeforeChange).
+        // The tenant field must be immutable, or a document that moves
+        // between tenants is seen by both streams.
         match := bson.D{{Key: "$or", Value: bson.A{
             bson.D{{Key: "fullDocument.tenant", Value: tenant}},
             bson.D{{Key: "fullDocumentBeforeChange.tenant", Value: tenant}},

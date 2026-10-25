@@ -190,7 +190,7 @@ type ChangeStream struct {
 //	    switch ev.OperationType {
 //	    case "insert", "update", "replace":
 //	        var order Order
-//	        if err := ev.Decode(&order); err != nil { ... }
+//	        if err := stream.Decode(&order); err != nil { ... }
 //	    case "delete":
 //	        id, _ := ev.ObjectID()
 //	    }

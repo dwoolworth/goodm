@@ -16,7 +16,7 @@ for stream.Next(ctx) {
     switch ev.OperationType {
     case "insert", "update", "replace":
         var order Order
-        if err := ev.Decode(&order); err != nil {
+        if err := stream.Decode(&order); err != nil {
             return err
         }
         fmt.Println("changed:", order.ID, order.Status)
