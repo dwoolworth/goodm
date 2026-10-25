@@ -136,6 +136,7 @@ func main() {
 | **Aggregation** | Fluent pipeline builder with `Match`, `Group`, `Sort`, `Lookup`, and more |
 | **Bulk** | `CreateMany` and `SaveMany` with hooks/validation, `NewBulk` builder, `UpdateMany`/`DeleteMany` passthrough |
 | **Transactions** | `WithTransaction` wraps operations in a MongoDB session transaction |
+| **Change Streams** | `Watch` delivers typed change events with resume tokens, filtering, and pre-images |
 | **CLI** | `goodm discover` (introspect DB), `goodm migrate` (sync indexes), `goodm inspect` (view schemas) |
 
 ## Documentation
@@ -152,6 +153,7 @@ Detailed guides are in the [`docs/`](docs/) directory:
 - [Aggregation](docs/pipeline.md) - Fluent pipeline builder
 - [Bulk Operations](docs/bulk.md) - Batch insert, update, delete
 - [Transactions](docs/transactions.md) - Multi-document ACID transactions
+- [Change Streams](docs/watch.md) - Watching a collection for changes
 - [CLI](docs/cli.md) - discover, migrate, inspect commands
 
 ## Schema Tags
@@ -232,6 +234,28 @@ res, err := goodm.NewBulk(&User{}).
     DeleteMany(bson.D{{Key: "role", Value: "guest"}}).
     Unordered().
     Execute(ctx)
+```
+
+## Change Streams
+
+```go
+stream, err := goodm.Watch(ctx, &Order{})
+if err != nil {
+    return err
+}
+defer stream.Close(ctx)
+for stream.Next(ctx) {
+    ev := stream.Event()
+    if ev.OperationType == "delete" {
+        id, _ := ev.ObjectID()
+        log.Println("deleted", id)
+        continue
+    }
+    var order Order
+    if err := ev.Decode(&order); err != nil { // sets the merge base for WithRetry
+        return err
+    }
+}
 ```
 
 ## Transactions

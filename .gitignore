@@ -7,3 +7,6 @@
 reddit_post_draft.md
 show_hn.md
 site/
+
+# Claude Code review worktrees and local settings
+.claude/
