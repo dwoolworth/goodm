@@ -73,7 +73,7 @@ type OpInfo struct {
     ModelName  string      // Go struct name
     Model      interface{} // The model instance (may be nil for filter-based ops)
     Filter     interface{} // The query filter (may be nil for Create)
-    Pipeline   []bson.D    // The aggregation stages (OpAggregate only)
+    Pipeline   []bson.D    // The aggregation stages (OpAggregate) or change stream stages (OpWatch)
 }
 ```
 
@@ -91,6 +91,7 @@ type OpInfo struct {
 | `OpDeleteMany` | `DeleteMany` |
 | `OpAggregate` | `Pipeline.Execute`, `Pipeline.Cursor` |
 | `OpBulkWrite` | `Bulk.Execute` |
+| `OpWatch` | `Watch` |
 
 ## Modifying Filters and Pipelines
 
@@ -124,6 +125,7 @@ Which operations honor a rewritten `op.Filter`:
 | `Find`, `FindOne`, `FindByID`, `FindCursor`, `Count`, `Exists`, `Distinct`, `UpdateOne`, `UpdateMany`, `DeleteOne`, `DeleteMany`, `FindOneAndUpdate`, `FindOneAndReplace`, `FindOneAndDelete` | Use `op.Filter` as the query |
 | `Update`, `UpdateFields`, `Delete`, `SaveMany` | AND `op.Filter` with their `_id` (and version) filters; an out-of-scope document is reported as `ErrNotFound` |
 | `Pipeline.Execute`, `Pipeline.Cursor` | Use `op.Pipeline` |
+| `Watch` | Use `op.Pipeline` as the change stream's stages; a `$match` on `fullDocument.*` drops delete events, which carry no document |
 | `Bulk.Execute` | Not scoped: each queued operation carries its own filter |
 | `Populate`, `BatchPopulate` | Not scoped: no middleware runs |
 

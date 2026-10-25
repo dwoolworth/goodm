@@ -21,6 +21,7 @@ const (
 	OpSaveMany   OpType = "save_many"
 	OpAggregate  OpType = "aggregate"
 	OpBulkWrite  OpType = "bulk_write"
+	OpWatch      OpType = "watch"
 )
 
 // OpInfo provides context about the current operation to middleware.
@@ -36,7 +37,7 @@ type OpInfo struct {
 	ModelName  string
 	Model      interface{} // the model being operated on, or nil
 	Filter     interface{} // the query filter, if applicable
-	Pipeline   []bson.D    // the aggregation stages, for OpAggregate
+	Pipeline   []bson.D    // the aggregation stages for OpAggregate, or the change stream stages for OpWatch
 }
 
 // MiddlewareFunc is a function that wraps a CRUD operation.

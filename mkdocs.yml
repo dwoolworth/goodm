@@ -55,6 +55,7 @@ nav:
     - Aggregation: pipeline.md
     - Bulk Operations: bulk.md
     - Transactions: transactions.md
+    - Change Streams: watch.md
   - CLI:
     - Commands: cli.md
   - Design Decisions: design-decisions.md
